@@ -1,0 +1,33 @@
+# Explicit top-level packages and deterministic virtual-dependency providers.
+xdg-desktop-portal-gtk-dummy
+noto-fonts
+jack2
+
+# Desktop stack:
+sway
+xorg-xwayland
+swaybg
+waybar
+swaync
+foot
+fuzzel
+nwg-look
+qt5-wayland
+
+# Top-level terminal file manager:
+yazi
+
+# Appearance:
+gsettings-desktop-schemas
+adw-gtk-theme
+papirus-icon-theme
+adwaita-cursors
+ttf-sarasa-gothic
+maplemono-nf-cn-unhinted
+# Maple Mono contains Nerd Font glyphs, but its AUR package does not declare
+# the ttf-font-nerd virtual provider required by Arch's yazi package.
+ttf-nerd-fonts-symbols-mono
+noto-fonts-emoji
+
+# WSLg clipboard integration:
+wl-clipboard

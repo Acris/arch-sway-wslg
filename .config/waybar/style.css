@@ -1,0 +1,192 @@
+/* =============================================================================
+ * Waybar / Catppuccin Mocha
+ * UI: Sarasa UI SC | Nerd glyph fallback: Maple Mono NF CN
+ * ============================================================================= */
+
+@define-color rosewater #f5e0dc;
+@define-color flamingo  #f2cdcd;
+@define-color pink      #f5c2e7;
+@define-color mauve     #cba6f7;
+@define-color red       #f38ba8;
+@define-color maroon    #eba0ac;
+@define-color peach     #fab387;
+@define-color yellow    #f9e2af;
+@define-color green     #a6e3a1;
+@define-color teal      #94e2d5;
+@define-color sky       #89dceb;
+@define-color sapphire  #74c7ec;
+@define-color blue      #89b4fa;
+@define-color lavender  #b4befe;
+@define-color text      #cdd6f4;
+@define-color subtext1  #bac2de;
+@define-color subtext0  #a6adc8;
+@define-color overlay2  #9399b2;
+@define-color overlay1  #7f849c;
+@define-color overlay0  #6c7086;
+@define-color surface2  #585b70;
+@define-color surface1  #45475a;
+@define-color surface0  #313244;
+@define-color base      #1e1e2e;
+@define-color mantle    #181825;
+@define-color crust     #11111b;
+
+* {
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+    font-family: "Sarasa UI SC", "Maple Mono NF CN", "Noto Color Emoji";
+    font-size: 13px;
+    font-weight: 500;
+    text-shadow: none;
+}
+
+window#waybar {
+    background: transparent;
+    color: @text;
+}
+
+tooltip {
+    background: @crust;
+    border: 1px solid @surface1;
+    border-radius: 12px;
+}
+
+tooltip label {
+    color: @text;
+    padding: 7px 9px;
+}
+
+#workspaces {
+    background: @mantle;
+    margin: 5px 0 5px 8px;
+    padding: 2px 4px;
+    border: 1px solid rgba(88, 91, 112, 0.30);
+    border-radius: 14px;
+}
+
+#workspaces button {
+    min-width: 26px;
+    padding: 0 8px;
+    color: @overlay1;
+    background: transparent;
+    border-radius: 10px;
+    box-shadow: none;
+}
+
+#workspaces button.empty {
+    color: @overlay0;
+}
+
+#workspaces button:hover {
+    color: @text;
+    background: @surface0;
+    box-shadow: none;
+}
+
+#workspaces button.focused,
+#workspaces button.active {
+    color: @crust;
+    background: @mauve;
+    font-weight: 700;
+}
+
+#workspaces button.urgent {
+    color: @crust;
+    background: @red;
+    font-weight: 700;
+}
+
+#workspaces button.visible:not(.focused) {
+    color: @lavender;
+}
+
+#mode {
+    color: @crust;
+    background: @peach;
+    margin: 5px 0 5px 6px;
+    padding: 0 12px;
+    border-radius: 14px;
+}
+
+#scratchpad {
+    color: @pink;
+    background: @mantle;
+    margin: 5px 0 5px 6px;
+    padding: 0 12px;
+    border: 1px solid rgba(245, 194, 231, 0.30);
+    border-radius: 14px;
+}
+
+#window {
+    color: @text;
+    background: @mantle;
+    margin: 5px 0;
+    padding: 0 16px;
+    border: 1px solid rgba(88, 91, 112, 0.30);
+    border-radius: 14px;
+}
+
+/* Prevent an empty rounded pill when the workspace has no focused window. */
+window#waybar.empty #window {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    border: none;
+}
+
+#pulseaudio,
+#tray,
+#custom-notification,
+#clock {
+    background: @mantle;
+    margin-top: 5px;
+    margin-bottom: 5px;
+    margin-left: 6px;
+    padding: 0 12px;
+    border: 1px solid rgba(88, 91, 112, 0.30);
+    border-radius: 14px;
+}
+
+#pulseaudio {
+    color: @green;
+}
+
+#pulseaudio:hover {
+    color: @crust;
+    background: @green;
+}
+
+#pulseaudio.muted {
+    color: @overlay0;
+}
+
+#tray {
+    color: @subtext1;
+    padding-left: 10px;
+    padding-right: 10px;
+}
+
+#tray > .needs-attention {
+    background: @red;
+    border-radius: 8px;
+}
+
+#custom-notification {
+    color: @mauve;
+}
+
+#custom-notification:hover {
+    color: @crust;
+    background: @mauve;
+}
+
+#clock {
+    color: @blue;
+    margin-right: 8px;
+}
+
+#clock:hover {
+    color: @crust;
+    background: @blue;
+}

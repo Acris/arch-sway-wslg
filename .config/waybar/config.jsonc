@@ -1,0 +1,104 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 40,
+    "spacing": 0,
+    "fixed-center": false,
+    "modules-left": [
+        "sway/workspaces",
+        "sway/mode",
+        "sway/scratchpad"
+    ],
+    "modules-center": [
+        "sway/window"
+    ],
+    "modules-right": [
+        "pulseaudio",
+        "tray",
+        "custom/notification",
+        "clock"
+    ],
+    "sway/workspaces": {
+        "all-outputs": false,
+        "disable-scroll": true,
+        "disable-click": false,
+        "disable-auto-back-and-forth": true,
+        "format": "{name}"
+    },
+    "sway/mode": {
+        "format": "󰩨  {}",
+        "tooltip": false
+    },
+    "sway/scratchpad": {
+        "format": "  {count}",
+        "show-empty": false,
+        "tooltip": true,
+        "tooltip-format": "{app}: {title}"
+    },
+    "sway/window": {
+        "format": "{title}",
+        "max-length": 48,
+        "tooltip": false
+    },
+    "pulseaudio": {
+        "scroll-step": 5,
+        "format": "{icon}  {volume}%",
+        "format-muted": "󰖁  muted",
+        "format-icons": {
+            "headphone": "󰋋",
+            "headset": "󰋎",
+            "default": [
+                "󰕿",
+                "󰖀",
+                "󰕾"
+            ]
+        },
+        "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+        "tooltip": true,
+        "tooltip-format": "{desc}\nVolume: {volume}%"
+    },
+    "tray": {
+        "icon-size": 17,
+        "spacing": 8,
+        "show-passive-items": false
+    },
+    "custom/notification": {
+        "tooltip": true,
+        "format": "<span size='16pt'>{icon}</span>",
+        "format-icons": {
+            "notification": "󱅫",
+            "none": "󰂜",
+            "dnd-notification": "󰂠",
+            "dnd-none": "󰪓",
+            "inhibited-notification": "󰂛",
+            "inhibited-none": "󰪑",
+            "dnd-inhibited-notification": "󰂛",
+            "dnd-inhibited-none": "󰪑"
+        },
+        "return-type": "json",
+        "exec-if": "command -v swaync-client >/dev/null 2>&1",
+        "exec": "swaync-client -swb",
+        "on-click": "swaync-client -t -sw",
+        "on-click-right": "swaync-client -d -sw",
+        "escape": true
+    },
+    "clock": {
+        "interval": 60,
+        "format": "󰥔  {:%H:%M}",
+        "format-alt": "󰃭  {:%Y-%m-%d  %a}",
+        "tooltip": true,
+        "tooltip-format": "<big><b>{:%Y %B}</b></big>\n<tt><small>{calendar}</small></tt>",
+        "calendar": {
+            "mode": "month",
+            "weeks-pos": "right",
+            "on-scroll": 1,
+            "format": {
+                "months": "<span color='#cba6f7'><b>{}</b></span>",
+                "days": "<span color='#cdd6f4'>{}</span>",
+                "weeks": "<span color='#6c7086'>W{}</span>",
+                "weekdays": "<span color='#89b4fa'><b>{}</b></span>",
+                "today": "<span color='#11111b' background='#cba6f7'><b>{}</b></span>"
+            }
+        }
+    }
+}

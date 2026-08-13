@@ -1,0 +1,1202 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+NAME="arch-sway-wslg"
+VERSION="2026.8.1"
+SELF="$(readlink -f "$0")"
+UID_NUM="$(id -u)"
+USER_NAME="$(id -un)"
+LOCAL_PREFIX="$(dirname -- "$(dirname -- "$SELF")")"
+LIBEXEC_DIR="$LOCAL_PREFIX/libexec/$NAME"
+
+if [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+    CONFIG_HOME="$XDG_CONFIG_HOME"
+else
+    CONFIG_HOME="$HOME/.config"
+    unset XDG_CONFIG_HOME
+fi
+if [[ "${XDG_STATE_HOME:-}" == /* ]]; then
+    STATE_BASE="$XDG_STATE_HOME"
+else
+    STATE_BASE="$HOME/.local/state"
+    unset XDG_STATE_HOME
+fi
+# Invalid relative XDG home paths must be ignored by implementations. Remove
+# them once here so every child process sees the same standards-compliant view.
+[[ -z "${XDG_DATA_HOME:-}" || "${XDG_DATA_HOME:-}" == /* ]] || unset XDG_DATA_HOME
+[[ -z "${XDG_CACHE_HOME:-}" || "${XDG_CACHE_HOME:-}" == /* ]] || unset XDG_CACHE_HOME
+STATE_DIR="$STATE_BASE/$NAME"
+
+# Use an existing standards-compliant user runtime directory when possible.
+# WSLg without systemd commonly exposes /mnt/wslg/runtime-dir (mode 0777),
+# which intentionally is not suitable as XDG_RUNTIME_DIR for desktop clients.
+runtime_dir_usable() {
+    local path="$1" meta
+    [[ -n "$path" && "$path" == /* && -d "$path" && -w "$path" ]] || return 1
+    meta="$(stat -Lc '%u %a' "$path" 2>/dev/null || true)"
+    [[ "$meta" == "$UID_NUM 700" ]]
+}
+
+clear_wlroots_overrides() {
+    # Parent-shell wlroots tuning is unsafe for this nested WSLg compositor.
+    # Clear the whole namespace so newly-added wlroots overrides cannot leak
+    # in later, then let WAYLAND_DISPLAY drive backend auto-selection.
+    local variable
+    for variable in "${!WLR_@}"; do
+        unset "$variable"
+    done
+}
+
+runtime_candidate="${XDG_RUNTIME_DIR:-}"
+if runtime_dir_usable "$runtime_candidate"; then
+    RUNTIME_BASE="$runtime_candidate"
+    SESSION_RUNTIME_DIR="$runtime_candidate"
+elif runtime_dir_usable "/run/user/$UID_NUM"; then
+    # An inherited WSLg runtime may be unsuitable even when systemd has already
+    # created the correct per-user runtime. Prefer the standards-compliant one.
+    RUNTIME_BASE="/run/user/$UID_NUM"
+    SESSION_RUNTIME_DIR="$RUNTIME_BASE"
+else
+    # No systemd user runtime is available. Keep the fallback private and
+    # deterministic so separate launcher invocations can share IPC state.
+    RUNTIME_BASE="$HOME/.local/run"
+    SESSION_RUNTIME_DIR="$RUNTIME_BASE/$NAME"
+fi
+unset runtime_candidate
+RUNTIME_DIR="$RUNTIME_BASE/$NAME"
+
+PID_FILE="$STATE_DIR/runner.pid"
+LOG_FILE="$STATE_DIR/sway.log"
+LOCK_FILE="$STATE_DIR/control.lock"
+SWAYSOCK_PATH="$RUNTIME_DIR/sway-ipc.sock"
+WSLG_SOCKET="/mnt/wslg/runtime-dir/wayland-0"
+WSLG_PULSE="/mnt/wslg/PulseServer"
+X11_SOCKET_DIR="/tmp/.X11-unix"
+X11_PRIVATE_DIR="$RUNTIME_DIR/x11-unix"
+WINDOWS_POWERSHELL="${WINDOWS_POWERSHELL:-}"
+WINDOWS_POWERSHELL_FALLBACK="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+CLIPBOARD_PID_FILE="$STATE_DIR/clipboard.pid"
+CLIPBOARD_LOCK_FILE="$STATE_DIR/clipboard.lock"
+CLIPBOARD_EVENT_LOCK_FILE="$RUNTIME_DIR/clipboard-event.lock"
+CLIPBOARD_SETTER_FIFO="$RUNTIME_DIR/windows-clipboard-setter.fifo"
+CLIPBOARD_SETTER_ACK_FIFO="$RUNTIME_DIR/windows-clipboard-setter-ack.fifo"
+CLIPBOARD_TO_WIN_HISTORY="$RUNTIME_DIR/clipboard-to-windows.history"
+WIN_TO_CLIPBOARD_HISTORY="$RUNTIME_DIR/windows-to-clipboard.history"
+CLIPBOARD_WINDOWS_READY_FILE="$RUNTIME_DIR/windows-clipboard-initialized"
+CLIPBOARD_ECHO_TTL=5
+CLIPBOARD_POLL_MS=75
+CLIPBOARD_INITIAL_SYNC_TIMEOUT=5
+CLIPBOARD_PROTOCOL_LIB="$LIBEXEC_DIR/clipboard-protocol.sh"
+WINDOWS_CLIPBOARD_SETTER_SCRIPT="$LIBEXEC_DIR/windows-clipboard-setter.ps1"
+WINDOWS_CLIPBOARD_WATCHER_SCRIPT="$LIBEXEC_DIR/windows-clipboard-watcher.ps1"
+SWAY_CONFIG="$CONFIG_HOME/sway/config"
+START_TIMEOUT=8
+STOP_TIMEOUT=5
+
+note() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+CLIPBOARD_PROTOCOL_LOADED=0
+SUDO_AUTHORIZED=0
+
+load_clipboard_protocol() {
+    (( CLIPBOARD_PROTOCOL_LOADED )) && return 0
+    [[ -r "$CLIPBOARD_PROTOCOL_LIB" ]] || \
+        die "private clipboard helper is missing: $CLIPBOARD_PROTOCOL_LIB"
+    # shellcheck disable=SC1090
+    source "$CLIPBOARD_PROTOCOL_LIB"
+    CLIPBOARD_PROTOCOL_LOADED=1
+}
+
+sh_single_quote() {
+    local value="$1"
+    printf "'"
+    while [[ "$value" == *\'* ]]; do
+        printf "%s'\\\\''" "${value%%\'*}"
+        value="${value#*\'}"
+    done
+    printf "%s'" "$value"
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+session_requirements() {
+    local command
+    for command in sway Xwayland swaymsg flock timeout dbus-send \
+                   dbus-run-session sudo unshare mount runuser env readlink mktemp; do
+        need "$command"
+    done
+}
+
+background_requirements() {
+    session_requirements
+    need setsid
+}
+
+authorize_x11_namespace() {
+    (( SUDO_AUTHORIZED )) && return 0
+
+    note "Sudo is required only to create a private X11 mount namespace for this Sway start."
+    note "Sway and all desktop applications will still run as your normal user; no global WSLg files are changed."
+    sudo -v || die "sudo authorization failed; Sway was not started"
+    SUDO_AUTHORIZED=1
+}
+
+resolve_windows_powershell() {
+    local candidate
+
+    # Prefer an explicit override, then Windows PATH as projected by WSL. The
+    # fixed /mnt/c path remains only as a compatibility fallback for systems
+    # using the default WSL automount layout.
+    if [[ -n "$WINDOWS_POWERSHELL" ]]; then
+        [[ -x "$WINDOWS_POWERSHELL" ]] || return 1
+        return 0
+    fi
+
+    candidate="$(command -v powershell.exe 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        WINDOWS_POWERSHELL="$candidate"
+        return 0
+    fi
+    if [[ -x "$WINDOWS_POWERSHELL_FALLBACK" ]]; then
+        WINDOWS_POWERSHELL="$WINDOWS_POWERSHELL_FALLBACK"
+        return 0
+    fi
+    return 1
+}
+
+ensure_dirs() {
+    mkdir -p "$STATE_DIR" "$RUNTIME_DIR"
+    chmod 700 "$STATE_DIR" "$RUNTIME_DIR"
+}
+
+runner_pid() {
+    [[ -r "$PID_FILE" ]] || return 1
+    local pid
+    IFS= read -r pid < "$PID_FILE" || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+runner_alive() {
+    local pid cmdline
+    pid="$(runner_pid 2>/dev/null || true)"
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+
+    [[ "$cmdline" == *"$SELF __run"* ]]
+}
+
+ipc_ready() {
+    [[ -S "$SWAYSOCK_PATH" ]] || return 1
+    swaymsg -s "$SWAYSOCK_PATH" -t get_version >/dev/null 2>&1
+}
+
+sway_exec_helper() {
+    local action="$1" quoted_self quoted_action
+    # Sway evaluates exec with POSIX sh, so do not use Bash-specific %q output.
+    quoted_self="$(sh_single_quote "$SELF")"
+    quoted_action="$(sh_single_quote "$action")"
+    swaymsg -s "$SWAYSOCK_PATH" exec "$quoted_self $quoted_action" >/dev/null 2>&1
+}
+
+cleanup_stale_state() {
+    if [[ -e "$PID_FILE" ]] && ! runner_alive; then
+        rm -f "$PID_FILE"
+    fi
+    if [[ -e "$CLIPBOARD_PID_FILE" ]] && ! clipboard_alive; then
+        rm -f "$CLIPBOARD_PID_FILE"
+    fi
+    if ! runner_alive && ! ipc_ready; then
+        rm -f "$SWAYSOCK_PATH"
+        rm -rf -- "$X11_PRIVATE_DIR"
+    fi
+}
+
+check_wslg() {
+    [[ -S "$WSLG_SOCKET" ]] || die "WSLg Wayland socket not found: $WSLG_SOCKET"
+    [[ -d "$X11_SOCKET_DIR" ]] || \
+        die "X11 socket directory not found: $X11_SOCKET_DIR"
+}
+
+clipboard_pid() {
+    [[ -r "$CLIPBOARD_PID_FILE" ]] || return 1
+    local pid
+    IFS= read -r pid < "$CLIPBOARD_PID_FILE" || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+clipboard_alive() {
+    local pid cmdline
+    pid="$(clipboard_pid 2>/dev/null || true)"
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *"$SELF __clipboard"* ]]
+}
+
+clipboard_requirements_ok() {
+    command -v wl-copy >/dev/null 2>&1 || return 1
+    command -v wl-paste >/dev/null 2>&1 || return 1
+    command -v base64 >/dev/null 2>&1 || return 1
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    command -v mkfifo >/dev/null 2>&1 || return 1
+    command -v cat >/dev/null 2>&1 || return 1
+    command -v sed >/dev/null 2>&1 || return 1
+    [[ -r "$CLIPBOARD_PROTOCOL_LIB" ]] || return 1
+    [[ -r "$WINDOWS_CLIPBOARD_SETTER_SCRIPT" ]] || return 1
+    [[ -r "$WINDOWS_CLIPBOARD_WATCHER_SCRIPT" ]] || return 1
+    resolve_windows_powershell || return 1
+}
+
+clipboard_hash() {
+    local encoded="$1" digest hash
+    # Canonicalize CRLF to LF for echo detection only. GTK3 can expose CRLF on
+    # Wayland while the Windows watcher intentionally normalizes it to LF;
+    # hashing the canonical text prevents a needless reflected clipboard event.
+    # Keep the decoder in the checked pipeline: a process substitution would
+    # hide base64 failures and could accidentally accept malformed payloads.
+    digest="$(
+        printf '%s' "$encoded" | base64 --decode 2>/dev/null | \
+            sed 's/\r$//' | sha256sum
+    )" || return 1
+    hash="${digest%% *}"
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$hash"
+}
+
+clipboard_to_windows() {
+    load_clipboard_protocol
+    # --watch also invokes the helper for an empty/nil selection. Do not erase
+    # a useful Windows clipboard merely because a Wayland selection owner went
+    # away. A genuine zero-length text copy still arrives as CLIPBOARD_STATE=data.
+    case "${CLIPBOARD_STATE:-data}" in
+        nil|clear) return 0 ;;
+        sensitive)
+            [[ "${ARCH_SWAY_WSLG_SYNC_SENSITIVE:-0}" == 1 ]] || return 0
+            ;;
+    esac
+
+    # wl-paste --watch starts one helper per Wayland selection change. Serialize
+    # both directions so the echo history is committed before a reflected event
+    # can race back through the bridge.
+    exec 7>"$CLIPBOARD_EVENT_LOCK_FILE"
+    flock 7
+
+    local encoded hash attempt ack_rc
+    encoded="$(base64 -w 0)"
+    hash="$(clipboard_hash "$encoded")" || return 1
+
+    if clipboard_history_consume "$WIN_TO_CLIPBOARD_HISTORY" "$hash"; then
+        return 0
+    fi
+
+    # The persistent setter acknowledges the actual Set-Clipboard result. A
+    # successful FIFO write alone is not enough: Windows may keep the clipboard
+    # busy after the payload has already been queued. Keep the event lock until
+    # ACK so a reflected Windows event cannot beat the outgoing history entry.
+    for attempt in 1 2 3; do
+        if ! printf 'B:%s:%s\n' "$hash" "$encoded" | \
+            timeout 2s sh -c 'cat > "$1"' _ "$CLIPBOARD_SETTER_FIFO"; then
+            warn "clipboard: Windows setter is unavailable"
+            return 1
+        fi
+
+        set +e
+        clipboard_wait_for_setter_ack "$hash"
+        ack_rc=$?
+        set -e
+        if (( ack_rc == 0 )); then
+            clipboard_history_remember "$CLIPBOARD_TO_WIN_HISTORY" "$hash"
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    warn "clipboard: Windows clipboard write failed after $attempt attempts"
+    return 1
+}
+
+windows_clipboard_setter() {
+    # Pass the private script as a command string because Windows PowerShell
+    # cannot resolve an arbitrary Linux /home path supplied to -File.
+    exec "$WINDOWS_POWERSHELL" -NoProfile -NonInteractive -STA \
+        -Command "$(<"$WINDOWS_CLIPBOARD_SETTER_SCRIPT")"
+}
+
+watch_windows_clipboard() {
+    # GetClipboardSequenceNumber avoids repeatedly marshaling clipboard content.
+    # Crucially, $last advances only after a text change has been handled. If a
+    # Windows process holds the clipboard briefly, Get-Clipboard is retried and
+    # the event remains pending instead of being lost forever.
+    ARCH_SWAY_WSLG_CLIPBOARD_POLL_MS="$CLIPBOARD_POLL_MS" \
+        exec "$WINDOWS_POWERSHELL" -NoProfile -NonInteractive -STA \
+        -Command "$(<"$WINDOWS_CLIPBOARD_WATCHER_SCRIPT")"
+}
+
+clipboard_from_windows() {
+    while IFS= read -r message; do
+        clipboard_protocol_normalize_line "$message"
+        message="$REPLY"
+        if [[ "$message" == N: ]]; then
+            : > "$CLIPBOARD_WINDOWS_READY_FILE"
+            continue
+        fi
+        [[ "$message" == B:* ]] || continue
+        local encoded="${message#B:}" hash
+        hash="$(clipboard_hash "$encoded")" || continue
+
+        exec 7>"$CLIPBOARD_EVENT_LOCK_FILE"
+        flock 7
+
+        if clipboard_history_consume "$CLIPBOARD_TO_WIN_HISTORY" "$hash"; then
+            : > "$CLIPBOARD_WINDOWS_READY_FILE"
+            flock -u 7
+            continue
+        fi
+
+        clipboard_history_remember "$WIN_TO_CLIPBOARD_HISTORY" "$hash"
+        if ! printf '%s' "$encoded" | base64 --decode 2>/dev/null | \
+            wl-copy --type 'text/plain;charset=utf-8'; then
+            clipboard_history_forget "$WIN_TO_CLIPBOARD_HISTORY" "$hash"
+            warn "clipboard: failed to publish Windows text to Sway"
+        else
+            : > "$CLIPBOARD_WINDOWS_READY_FILE"
+        fi
+        flock -u 7
+    done
+}
+
+clipboard_stop_workers() {
+    local pid alive
+    local -a pids=()
+    for pid in "${CLIPBOARD_SWAY_TO_WIN_PID:-}" \
+               "${CLIPBOARD_WIN_TO_SWAY_PID:-}" \
+               "${CLIPBOARD_WINDOWS_WATCHER_PID:-}" \
+               "${CLIPBOARD_WINDOWS_SETTER_PID:-}"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] && pids+=("$pid")
+    done
+    if (( ${#pids[@]} )); then
+        kill "${pids[@]}" 2>/dev/null || true
+
+        # Windows interop processes do not always disappear synchronously when
+        # their WSL-side process receives TERM. Bound the shutdown wait so a
+        # stuck worker cannot wedge the bridge supervisor itself.
+        for _ in {1..20}; do
+            alive=0
+            for pid in "${pids[@]}"; do
+                kill -0 "$pid" 2>/dev/null && alive=1
+            done
+            (( alive )) || break
+            sleep 0.05
+        done
+        for pid in "${pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+        done
+        wait "${pids[@]}" 2>/dev/null || true
+    fi
+    CLIPBOARD_SWAY_TO_WIN_PID=""
+    CLIPBOARD_WIN_TO_SWAY_PID=""
+    CLIPBOARD_WINDOWS_WATCHER_PID=""
+    CLIPBOARD_WINDOWS_SETTER_PID=""
+}
+
+clipboard_start_workers() {
+    local coproc_read_fd coproc_write_fd windows_watcher_fd
+    local initial_deadline=$((SECONDS + CLIPBOARD_INITIAL_SYNC_TIMEOUT))
+
+    # Open both FIFOs read/write before starting PowerShell. O_RDWR never
+    # blocks on a FIFO and keeps both endpoints alive between individual
+    # clipboard events/acknowledgements.
+    if [[ ! "${CLIPBOARD_FIFO_KEEPER_FD:-}" =~ ^[0-9]+$ ]]; then
+        exec {CLIPBOARD_FIFO_KEEPER_FD}<>"$CLIPBOARD_SETTER_FIFO"
+    fi
+    if [[ ! "${CLIPBOARD_ACK_KEEPER_FD:-}" =~ ^[0-9]+$ ]]; then
+        exec {CLIPBOARD_ACK_KEEPER_FD}<>"$CLIPBOARD_SETTER_ACK_FIFO"
+    fi
+
+    windows_clipboard_setter < "$CLIPBOARD_SETTER_FIFO" \
+        > "$CLIPBOARD_SETTER_ACK_FIFO" &
+    CLIPBOARD_WINDOWS_SETTER_PID=$!
+
+    # Seed the fresh Wayland session from persistent Windows clipboard state
+    # before observing Sway. Otherwise wl-paste's initial callback can race the
+    # Windows watcher and overwrite the host clipboard with stale guest text.
+    rm -f "$CLIPBOARD_WINDOWS_READY_FILE"
+    unset WINDOWS_CLIPBOARD_WATCHER WINDOWS_CLIPBOARD_WATCHER_PID 2>/dev/null || true
+    coproc WINDOWS_CLIPBOARD_WATCHER { watch_windows_clipboard; }
+    CLIPBOARD_WINDOWS_WATCHER_PID="$WINDOWS_CLIPBOARD_WATCHER_PID"
+    coproc_read_fd="${WINDOWS_CLIPBOARD_WATCHER[0]}"
+    coproc_write_fd="${WINDOWS_CLIPBOARD_WATCHER[1]}"
+
+    # Bash marks its coprocess descriptors specially. Duplicate the read end
+    # before handing it to a background reader, then close the unused copies.
+    exec {windows_watcher_fd}<&"$coproc_read_fd"
+    exec {coproc_read_fd}<&-
+    exec {coproc_write_fd}>&-
+    clipboard_from_windows <&"$windows_watcher_fd" &
+    CLIPBOARD_WIN_TO_SWAY_PID=$!
+    exec {windows_watcher_fd}<&-
+
+    while (( SECONDS < initial_deadline )); do
+        [[ -e "$CLIPBOARD_WINDOWS_READY_FILE" ]] && break
+        kill -0 "$CLIPBOARD_WINDOWS_WATCHER_PID" 2>/dev/null || return 1
+        kill -0 "$CLIPBOARD_WIN_TO_SWAY_PID" 2>/dev/null || return 1
+        sleep 0.05
+    done
+    if [[ ! -e "$CLIPBOARD_WINDOWS_READY_FILE" ]]; then
+        warn "clipboard: Windows initial state timed out; retrying bridge workers"
+        return 1
+    fi
+
+    wl-paste --type text --watch "$SELF" __clipboard_to_windows &
+    CLIPBOARD_SWAY_TO_WIN_PID=$!
+}
+
+clipboard_workers_alive() {
+    local pid
+    for pid in "$CLIPBOARD_SWAY_TO_WIN_PID" \
+               "$CLIPBOARD_WIN_TO_SWAY_PID" \
+               "$CLIPBOARD_WINDOWS_WATCHER_PID" \
+               "$CLIPBOARD_WINDOWS_SETTER_PID"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+        kill -0 "$pid" 2>/dev/null || return 1
+    done
+}
+
+clipboard_bridge() {
+    ensure_dirs
+    load_clipboard_protocol
+    clipboard_requirements_ok || {
+        warn "clipboard bridge unavailable; install wl-clipboard and ensure Windows interop is enabled"
+        exit 1
+    }
+
+    exec 8>"$CLIPBOARD_LOCK_FILE"
+    flock -n 8 || exit 0
+
+    printf '%s\n' "$$" > "$CLIPBOARD_PID_FILE.tmp"
+    mv -f "$CLIPBOARD_PID_FILE.tmp" "$CLIPBOARD_PID_FILE"
+    rm -f "$CLIPBOARD_SETTER_FIFO" "$CLIPBOARD_SETTER_ACK_FIFO" \
+        "$CLIPBOARD_TO_WIN_HISTORY" "$WIN_TO_CLIPBOARD_HISTORY" \
+        "$CLIPBOARD_WINDOWS_READY_FILE"
+    mkfifo -m 600 "$CLIPBOARD_SETTER_FIFO" "$CLIPBOARD_SETTER_ACK_FIFO"
+
+    CLIPBOARD_SWAY_TO_WIN_PID=""
+    CLIPBOARD_WIN_TO_SWAY_PID=""
+    CLIPBOARD_WINDOWS_WATCHER_PID=""
+    CLIPBOARD_WINDOWS_SETTER_PID=""
+    CLIPBOARD_FIFO_KEEPER_FD=""
+    CLIPBOARD_ACK_KEEPER_FD=""
+    CLIPBOARD_CLEANUP_DONE=0
+
+    cleanup_clipboard() {
+        (( CLIPBOARD_CLEANUP_DONE )) && return 0
+        CLIPBOARD_CLEANUP_DONE=1
+
+        clipboard_stop_workers
+        if [[ "$CLIPBOARD_FIFO_KEEPER_FD" =~ ^[0-9]+$ ]]; then
+            exec {CLIPBOARD_FIFO_KEEPER_FD}>&-
+            CLIPBOARD_FIFO_KEEPER_FD=""
+        fi
+        if [[ "$CLIPBOARD_ACK_KEEPER_FD" =~ ^[0-9]+$ ]]; then
+            exec {CLIPBOARD_ACK_KEEPER_FD}>&-
+            CLIPBOARD_ACK_KEEPER_FD=""
+        fi
+        if [[ "$(clipboard_pid 2>/dev/null || true)" == "$$" ]]; then
+            rm -f "$CLIPBOARD_PID_FILE"
+        fi
+        rm -f "$CLIPBOARD_SETTER_FIFO" "$CLIPBOARD_SETTER_ACK_FIFO" \
+            "$CLIPBOARD_TO_WIN_HISTORY" "$WIN_TO_CLIPBOARD_HISTORY" \
+            "$CLIPBOARD_WINDOWS_READY_FILE"
+    }
+    trap cleanup_clipboard EXIT
+    trap 'cleanup_clipboard; exit 0' INT TERM HUP
+
+    note "Clipboard bridge: Sway <-> Windows"
+    while ipc_ready; do
+        if ! clipboard_start_workers; then
+            clipboard_stop_workers
+            ipc_ready || break
+            sleep 1
+            continue
+        fi
+
+        while clipboard_workers_alive; do
+            ipc_ready || break 2
+            sleep 0.5
+        done
+
+        clipboard_stop_workers
+        ipc_ready || break
+        warn "clipboard worker exited; restarting bridge workers"
+        sleep 1
+    done
+}
+
+start_clipboard_bridge() {
+    if ! clipboard_requirements_ok; then
+        warn "clipboard bridge disabled: install 'wl-clipboard' and keep Windows interop enabled"
+        return 0
+    fi
+
+    if clipboard_alive; then
+        return 0
+    fi
+
+    # Ask Sway itself to exec the bridge. That is important: the child then
+    # inherits Sway's own WAYLAND_DISPLAY (the nested compositor socket), not
+    # the parent WSLg WAYLAND_DISPLAY used to launch the compositor.
+    sway_exec_helper __clipboard || {
+        warn "failed to request clipboard bridge startup"
+        return 1
+    }
+
+    local deadline=$((SECONDS + 2))
+    while (( SECONDS < deadline )); do
+        clipboard_alive && return 0
+        sleep 0.05
+    done
+    warn "clipboard bridge did not become ready"
+    return 1
+}
+
+stop_clipboard_bridge() {
+    local pid
+    pid="$(clipboard_pid 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && clipboard_alive; then
+        kill -TERM "$pid" 2>/dev/null || true
+        local deadline=$((SECONDS + 2))
+        while (( SECONDS < deadline )); do
+            clipboard_alive || break
+            sleep 0.1
+        done
+        if clipboard_alive; then
+            warn "clipboard bridge did not stop after TERM; sending SIGKILL"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$CLIPBOARD_PID_FILE" "$CLIPBOARD_SETTER_FIFO" \
+        "$CLIPBOARD_SETTER_ACK_FIFO" "$CLIPBOARD_TO_WIN_HISTORY" \
+        "$WIN_TO_CLIPBOARD_HISTORY" "$CLIPBOARD_WINDOWS_READY_FILE"
+}
+
+session_bus_usable() {
+    local address="${1:-${DBUS_SESSION_BUS_ADDRESS:-}}"
+    [[ -n "$address" ]] || return 1
+    command -v dbus-send >/dev/null 2>&1 || return 1
+
+    # Do not trust DBUS_SESSION_BUS_ADDRESS merely because it is set. Probe
+    # org.freedesktop.DBus so stale/nonexistent Unix socket addresses are
+    # rejected before applications such as dconf/gsettings inherit them.
+    timeout 2s env DBUS_SESSION_BUS_ADDRESS="$address" \
+        dbus-send --session --type=method_call --print-reply \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.ListNames >/dev/null 2>&1
+}
+
+finalize_stopped_session() {
+    rm -f "$PID_FILE" "$SWAYSOCK_PATH"
+    rm -rf -- "$X11_PRIVATE_DIR"
+    note "Sway stopped."
+}
+
+sway_validate() {
+    # sway --validate initializes XWayland as well as a wlroots backend. Give
+    # it the same writable, private X11 view as the real session so validation
+    # does not emit a false error for WSLg's protected global socket mapping.
+    local target validation_x11 rc=0
+    target="$(readlink -f -- "$X11_SOCKET_DIR")"
+    [[ -d "$target" ]] || return 1
+    validation_x11="$(mktemp -d "$RUNTIME_DIR/.x11-validate.XXXXXX")" || return 1
+    chmod 1777 "$validation_x11"
+
+    if ! sudo -n -- unshare --mount --propagation private -- \
+        sh -c 'mount --bind "$1" "$2" && exec runuser -u "$3" -- "$4" __validate "$5" "$6" "$7"' \
+        _ "$validation_x11" "$target" "$USER_NAME" "$SELF" \
+        "$SWAY_CONFIG" "$RUNTIME_DIR" "$WSLG_SOCKET"; then
+        rc=1
+    fi
+    rm -rf -- "$validation_x11"
+    return "$rc"
+}
+
+validate_in_namespace() {
+    (( EUID != 0 )) || die "internal validation must run as the normal user"
+    local config="${2:-}" runtime="${3:-}" parent_wayland="${4:-}"
+    [[ -r "$config" && -d "$runtime" && -S "$parent_wayland" ]] || \
+        die "invalid internal Sway validation arguments"
+
+    unset WAYLAND_SOCKET DISPLAY SWAYSOCK I3SOCK
+    clear_wlroots_overrides
+    export XDG_RUNTIME_DIR="$runtime"
+    export WAYLAND_DISPLAY="$parent_wayland"
+    exec sway --validate -c "$config"
+}
+
+validate_config() {
+    need sway
+    [[ -r "$SWAY_CONFIG" ]] || die "Sway config not readable: $SWAY_CONFIG"
+    ensure_dirs
+    check_wslg
+    authorize_x11_namespace
+    sway_validate >/dev/null || \
+        die "Sway config validation failed: $SWAY_CONFIG"
+}
+
+prepare_environment() {
+    ensure_dirs
+    check_wslg
+
+    # Preserve the real per-user XDG runtime directory when it is safe. On
+    # no-systemd WSLg, use the private fallback instead of exporting WSLg's
+    # shared 0777 runtime directory. The parent connection uses an absolute
+    # socket path, so it does not depend on either choice.
+    export XDG_RUNTIME_DIR="$SESSION_RUNTIME_DIR"
+    export WAYLAND_DISPLAY="$WSLG_SOCKET"
+    unset WAYLAND_SOCKET
+    unset DISPLAY
+    unset I3SOCK
+
+    export SWAYSOCK="$SWAYSOCK_PATH"
+
+    export XDG_SESSION_TYPE="wayland"
+    export XDG_SESSION_DESKTOP="sway"
+    export XDG_CURRENT_DESKTOP="sway"
+    export TERMINAL="foot"
+
+    # Drop inherited overrides that would defeat deterministic nested-Wayland
+    # backend selection. With DISPLAY unset and the parent WAYLAND_DISPLAY set
+    # explicitly, wlroots can auto-select its Wayland backend without WLR_*
+    # tuning leaking into Sway children.
+    clear_wlroots_overrides
+
+    # Drop inherited toolkit overrides that are redundant or obsolete here.
+    # GTK auto-selects an available backend, SDL3 prefers Wayland, Firefox
+    # auto-selects its native backend, and Electron no longer supports
+    # ELECTRON_OZONE_PLATFORM_HINT.
+    unset GDK_BACKEND SDL_VIDEO_DRIVER MOZ_ENABLE_WAYLAND
+    unset ELECTRON_OZONE_PLATFORM_HINT
+
+    # Keep only toolkit overrides that still change useful defaults in this
+    # mixed Wayland/XWayland session.
+    export QT_QPA_PLATFORM="wayland;xcb"
+    export QT_WAYLAND_DISABLE_WINDOWDECORATION="1"
+    export SDL_VIDEODRIVER="wayland,x11"
+
+    # Cursor theme/size are configured by `seat * xcursor_theme` in sway/config.
+    # Sway exports XCURSOR_THEME/XCURSOR_SIZE to its children itself.
+
+    # The WSL-specific portal dummy deliberately disables portal appearance
+    # lookup so libadwaita follows the GTK/GSettings preference instead.
+    export ADW_DISABLE_PORTAL="1"
+
+    # Do not leak the terminal that launched this graphical session into it.
+    unset TERM_PROGRAM
+    unset TERM_PROGRAM_VERSION
+
+    # This launcher is WSLg-specific, so prefer WSLg's known PulseAudio
+    # endpoint even if the parent shell inherited a stale PULSE_SERVER.
+    if [[ -S "$WSLG_PULSE" ]]; then
+        export PULSE_SERVER="unix:$WSLG_PULSE"
+    fi
+
+    # Prefer a working systemd user bus. If it is unavailable, keep a working
+    # inherited session bus. Never keep a stale DBUS_SESSION_BUS_ADDRESS just
+    # because the variable is non-empty: dconf/gsettings would then fail with
+    # "Could not connect: No such file or directory". If no usable bus exists,
+    # run_session starts a private one with dbus-run-session.
+    local user_bus="unix:path=/run/user/$UID_NUM/bus"
+    local inherited_bus="${DBUS_SESSION_BUS_ADDRESS:-}"
+    if [[ -S "/run/user/$UID_NUM/bus" ]] && session_bus_usable "$user_bus"; then
+        export DBUS_SESSION_BUS_ADDRESS="$user_bus"
+    elif session_bus_usable "$inherited_bus"; then
+        export DBUS_SESSION_BUS_ADDRESS="$inherited_bus"
+    else
+        unset DBUS_SESSION_BUS_ADDRESS
+    fi
+}
+
+launch_session_in_namespace() {
+    local target
+    target="$(readlink -f -- "$X11_SOCKET_DIR")"
+    [[ -d "$target" ]] || die "X11 socket directory target not found: $target"
+
+    rm -rf -- "$X11_PRIVATE_DIR"
+    mkdir -p "$X11_PRIVATE_DIR"
+    chmod 1777 "$X11_PRIVATE_DIR"
+
+    if ! env -0 | sudo -n -- unshare --mount --propagation private -- \
+        sh -c 'mount --bind "$1" "$2" && exec runuser -u "$3" -- "$4" __run_from_env' \
+        _ "$X11_PRIVATE_DIR" "$target" "$USER_NAME" "$SELF" \
+        9>&- >>"$LOG_FILE" 2>&1; then
+        rm -rf -- "$X11_PRIVATE_DIR"
+        die "failed to create the private X11 mount namespace; see $LOG_FILE"
+    fi
+}
+
+run_from_environment() {
+    (( EUID != 0 )) || die "internal session handoff must run as the normal user"
+    local entry
+    local -a environment=()
+
+    while IFS= read -r -d '' entry; do
+        environment+=("$entry")
+    done
+    ((${#environment[@]})) || die "session environment handoff was empty"
+
+    exec env -i -- "${environment[@]}" setsid -f -- "$SELF" __run </dev/null
+}
+
+run_session() {
+    need sway
+    need Xwayland
+    ensure_dirs
+
+    printf '%s\n' "$$" > "$PID_FILE.tmp"
+    mv -f "$PID_FILE.tmp" "$PID_FILE"
+
+    cleanup_runner() {
+        stop_clipboard_bridge
+        if [[ "$(runner_pid 2>/dev/null || true)" == "$$" ]]; then
+            rm -f "$PID_FILE" "$SWAYSOCK_PATH"
+            rm -rf -- "$X11_PRIVATE_DIR"
+        fi
+    }
+    trap cleanup_runner EXIT
+
+    prepare_environment
+
+    printf '\n=== Sway WSLg session: %s ===\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
+    printf 'Runner PID:      %s\n' "$$"
+    printf 'Parent display:  %s\n' "$WAYLAND_DISPLAY"
+    printf 'Runtime dir:     %s\n' "$XDG_RUNTIME_DIR"
+    printf 'IPC socket:      %s\n' "$SWAYSOCK"
+    printf 'X11 sockets:     private mount namespace\n'
+
+    if session_bus_usable "${DBUS_SESSION_BUS_ADDRESS:-}"; then
+        printf 'D-Bus:           %s\n' "$DBUS_SESSION_BUS_ADDRESS"
+        sway -c "$SWAY_CONFIG"
+    else
+        unset DBUS_SESSION_BUS_ADDRESS
+        printf 'D-Bus:           private dbus-run-session\n'
+        dbus-run-session -- sway -c "$SWAY_CONFIG"
+    fi
+}
+
+wait_for_start() {
+    local deadline=$((SECONDS + START_TIMEOUT))
+
+    while (( SECONDS < deadline )); do
+        ipc_ready && return 0
+        if [[ -e "$PID_FILE" ]] && ! runner_alive; then
+            return 1
+        fi
+        sleep 0.1
+    done
+    return 2
+}
+
+start_session() {
+    background_requirements
+    ensure_dirs
+    exec 9>"$LOCK_FILE"
+    flock 9
+
+    cleanup_stale_state
+
+    if ipc_ready; then
+        note "Sway is already running."
+        if runner_alive; then
+            note "Runner PID: $(runner_pid)"
+        else
+            note "Runner: unavailable (IPC is healthy)"
+        fi
+        note "IPC: $SWAYSOCK_PATH"
+        note "XWayland: configured (lazy)"
+        start_clipboard_bridge || true
+        return 0
+    fi
+
+    # A live runner without IPC means the previous session is still starting
+    # or is wedged. Never create a second compositor on top of it.
+    if runner_alive; then
+        die "Sway runner is alive but IPC is not ready; use '$SELF status', '$SELF logs', or '$SELF stop'"
+    fi
+
+    validate_config
+    rm -f "$SWAYSOCK_PATH"
+    : > "$LOG_FILE"
+
+    note "Starting Sway in background..."
+    launch_session_in_namespace
+
+    local rc
+    set +e
+    wait_for_start
+    rc=$?
+    set -e
+
+    case "$rc" in
+        0)
+            note "Sway started successfully."
+            note "Runner PID: $(runner_pid)"
+            note "IPC: $SWAYSOCK_PATH"
+            note "XWayland: configured (lazy; runtime errors are logged)"
+            start_clipboard_bridge || true
+            if clipboard_alive; then
+                note "Clipboard: Windows <-> Sway bridge running"
+            elif clipboard_requirements_ok; then
+                warn "Clipboard bridge requirements are present, but the bridge is not running"
+            fi
+            note "Log: $LOG_FILE"
+            ;;
+        1)
+            printf '\nSway failed to start. Last log lines:\n\n' >&2
+            tail -n 40 "$LOG_FILE" >&2 || true
+            return 1
+            ;;
+        2)
+            warn "Sway IPC did not become ready within ${START_TIMEOUT}s."
+            note "Check: $SELF status"
+            note "Logs:  $SELF logs"
+            return 1
+            ;;
+    esac
+}
+
+stop_session() {
+    need swaymsg
+    need flock
+    ensure_dirs
+    exec 9>"$LOCK_FILE"
+    flock 9
+
+    cleanup_stale_state
+    stop_clipboard_bridge
+
+    if ! runner_alive; then
+        if ipc_ready; then
+            note "Stopping Sway through recovered IPC state..."
+            swaymsg -s "$SWAYSOCK_PATH" exit >/dev/null 2>&1 || true
+
+            local recovered_deadline=$((SECONDS + STOP_TIMEOUT))
+            while (( SECONDS < recovered_deadline )); do
+                if ! ipc_ready; then
+                    finalize_stopped_session
+                    return 0
+                fi
+                sleep 0.1
+            done
+
+            die "Sway IPC is still responsive after ${STOP_TIMEOUT}s; refusing to report a false stop"
+        else
+            note "Sway is not running."
+        fi
+        return 0
+    fi
+
+    local pid deadline
+    pid="$(runner_pid)"
+    note "Stopping Sway..."
+
+    if ipc_ready; then
+        swaymsg -s "$SWAYSOCK_PATH" exit >/dev/null 2>&1 || true
+    fi
+
+    deadline=$((SECONDS + STOP_TIMEOUT))
+    while (( SECONDS < deadline )); do
+        if ! runner_alive; then
+            finalize_stopped_session
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    need ps
+    local sid pgid
+    sid="$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$sid" == "$pid" && "$pgid" == "$pid" ]] || \
+        die "runner PID $pid is not its own session/process-group leader; refusing group termination"
+
+    warn "Sway did not exit cleanly; terminating its detached process group."
+    kill -TERM -- "-$pid" 2>/dev/null || true
+
+    deadline=$((SECONDS + 2))
+    while (( SECONDS < deadline )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            finalize_stopped_session
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    warn "Process group still alive; sending SIGKILL."
+    kill -KILL -- "-$pid" 2>/dev/null || true
+
+    deadline=$((SECONDS + 2))
+    while (( SECONDS < deadline )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            finalize_stopped_session
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    die "runner PID $pid is still alive after SIGKILL"
+}
+
+status_session() {
+    need swaymsg
+    ensure_dirs
+    cleanup_stale_state
+
+    if runner_alive || ipc_ready; then
+        note "Sway: running"
+        if runner_alive; then
+            note "Runner PID: $(runner_pid)"
+        else
+            note "Runner: unavailable"
+        fi
+        if ipc_ready; then
+            note "IPC: ready ($SWAYSOCK_PATH)"
+        else
+            note "IPC: not ready ($SWAYSOCK_PATH)"
+        fi
+        note "XWayland: configured (lazy; see logs for runtime errors)"
+        if clipboard_alive; then
+            note "Clipboard: running (PID $(clipboard_pid))"
+        elif clipboard_requirements_ok; then
+            note "Clipboard: not running"
+        else
+            note "Clipboard: unavailable (wl-clipboard or Windows interop missing)"
+        fi
+        note "Log: $LOG_FILE"
+        return 0
+    fi
+
+    note "Sway: stopped"
+    return 1
+}
+
+restart_session() {
+    background_requirements
+    need ps
+    validate_config
+    stop_session
+    start_session
+}
+
+show_logs() {
+    ensure_dirs
+    touch "$LOG_FILE"
+    exec tail -F "$LOG_FILE"
+}
+
+doctor() {
+    local failed=0
+    ensure_dirs
+    note "Sway WSLg launcher diagnostics"
+    note "-----------------------------"
+
+    local path_launcher
+    path_launcher="$(command -v "$NAME" 2>/dev/null || true)"
+    if [[ -n "$path_launcher" ]] && \
+       [[ "$(readlink -f "$path_launcher")" == "$SELF" ]]; then
+        note "OK   launcher in PATH: $path_launcher"
+    elif [[ -n "$path_launcher" ]]; then
+        note "FAIL PATH resolves $NAME to a different file: $path_launcher"
+        failed=1
+    else
+        note "FAIL launcher not found in PATH: $NAME"
+        failed=1
+    fi
+
+    for cmd in bash sway swaymsg Xwayland swaybg swaynag setsid sudo unshare mount runuser env readlink \
+               flock timeout dbus-run-session dbus-send waybar swaync swaync-client \
+               foot fuzzel nwg-look yazi pactl playerctl fc-match wl-copy wl-paste \
+               base64 sha256sum mkfifo cat sed ps; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            note "OK   command: $cmd"
+        else
+            note "FAIL command: $cmd"
+            failed=1
+        fi
+    done
+
+    local private_helper
+    for private_helper in "$CLIPBOARD_PROTOCOL_LIB" "$WINDOWS_CLIPBOARD_SETTER_SCRIPT" \
+                          "$WINDOWS_CLIPBOARD_WATCHER_SCRIPT"; do
+        if [[ -r "$private_helper" ]]; then
+            note "OK   private helper: $private_helper"
+        else
+            note "FAIL private helper missing: $private_helper"
+            failed=1
+        fi
+    done
+
+    if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+        note "OK   WSL kernel"
+    else
+        note "FAIL WSL kernel not detected"
+        failed=1
+    fi
+
+    if locale -a 2>/dev/null | grep -Eiq '^en_US[.]utf-?8$'; then
+        note "OK   locale generated: en_US.UTF-8"
+    else
+        note "FAIL locale not generated: en_US.UTF-8"
+        failed=1
+    fi
+
+    if [[ "$(locale charmap 2>/dev/null || true)" == "UTF-8" ]]; then
+        note "OK   current locale charmap: UTF-8"
+    else
+        note "FAIL current locale is not UTF-8"
+        failed=1
+    fi
+
+    if [[ -S "$WSLG_SOCKET" ]]; then
+        note "OK   WSLg socket: $WSLG_SOCKET"
+    else
+        note "FAIL WSLg socket: $WSLG_SOCKET"
+        failed=1
+    fi
+
+    if [[ -d "$X11_SOCKET_DIR" ]]; then
+        note "OK   X11 socket directory: $X11_SOCKET_DIR"
+    else
+        note "FAIL X11 socket directory: $X11_SOCKET_DIR"
+        failed=1
+    fi
+    if [[ -S "$X11_SOCKET_DIR/X0" ]]; then
+        note "OK   WSLg parent X11 display socket: $X11_SOCKET_DIR/X0"
+    else
+        note "INFO WSLg parent X11 :0 socket not found"
+    fi
+
+    if [[ -r "$SWAY_CONFIG" ]]; then
+        note "OK   Sway config file: $SWAY_CONFIG"
+    else
+        note "FAIL Sway config file: $SWAY_CONFIG"
+        failed=1
+    fi
+
+    if grep -Eq '^[[:space:]]*xwayland[[:space:]]+enable([[:space:]]|$)' "$SWAY_CONFIG" 2>/dev/null; then
+        note "OK   XWayland lazy mode: enable"
+    else
+        note "FAIL xwayland enable not found in main config"
+        failed=1
+    fi
+
+    local configured_scale
+    configured_scale="$(awk '$1 == "scale" { print $2; exit }' "$SWAY_CONFIG" 2>/dev/null || true)"
+    if [[ "$configured_scale" =~ ^[0-9]+([.][0-9]+)?$ ]] && \
+       awk -v scale="$configured_scale" 'BEGIN { exit !(scale > 0) }'; then
+        note "OK   output scale: $configured_scale"
+    else
+        note "FAIL positive output scale not found in main config"
+        failed=1
+    fi
+
+    if command -v foot >/dev/null 2>&1 && foot -C >/dev/null 2>&1; then
+        note "OK   Foot config"
+    else
+        note "FAIL Foot config"
+        failed=1
+    fi
+
+    if command -v fuzzel >/dev/null 2>&1 && fuzzel --check-config >/dev/null 2>&1; then
+        note "OK   Fuzzel config"
+    else
+        note "FAIL Fuzzel config"
+        failed=1
+    fi
+
+    check_font() {
+        local wanted="$1" matched
+        matched="$(fc-match -f '%{family}\n' "$wanted" 2>/dev/null | head -n 1 || true)"
+        if [[ "$matched" == *"$wanted"* ]]; then
+            note "OK   font: $wanted"
+        else
+            note "FAIL font: $wanted (matched: ${matched:-none})"
+            failed=1
+        fi
+    }
+
+    if command -v fc-match >/dev/null 2>&1; then
+        check_font "Sarasa UI SC"
+        check_font "Maple Mono NF CN"
+        check_font "Noto Color Emoji"
+    fi
+
+    if [[ -S "$WSLG_PULSE" ]]; then
+        note "OK   WSLg Pulse socket: $WSLG_PULSE"
+        if command -v pactl >/dev/null 2>&1 && \
+           timeout 2s env PULSE_SERVER="unix:$WSLG_PULSE" pactl info >/dev/null 2>&1; then
+            note "OK   WSLg PulseAudio connection"
+        else
+            note "FAIL WSLg PulseAudio connection"
+            failed=1
+        fi
+    else
+        note "FAIL WSLg Pulse socket not detected: $WSLG_PULSE"
+        failed=1
+    fi
+
+    if command -v wl-copy >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1; then
+        note "OK   clipboard tools: wl-copy, wl-paste"
+    else
+        note "FAIL clipboard tools: install wl-clipboard"
+        failed=1
+    fi
+    if resolve_windows_powershell && \
+       timeout 3s "$WINDOWS_POWERSHELL" -NoProfile -NonInteractive -STA \
+           -Command 'Get-Command Get-Clipboard,Set-Clipboard -ErrorAction Stop | Out-Null' \
+           >/dev/null 2>&1; then
+        note "OK   Windows clipboard interop: $WINDOWS_POWERSHELL"
+    else
+        note "FAIL Windows clipboard interop or PowerShell 5.1 not found"
+        failed=1
+    fi
+
+    note "INFO WSLg parent display: $WSLG_SOCKET"
+    note "INFO runtime:             $RUNTIME_DIR"
+    note "INFO IPC:                 $SWAYSOCK_PATH"
+    return "$failed"
+}
+usage() {
+    cat <<EOF2
+Usage: $SELF {start|stop|restart|status|logs|doctor|version}
+EOF2
+}
+
+(( EUID != 0 )) || die "run this launcher as your normal Arch user, not as root"
+
+case "${1:-start}" in
+    start) start_session ;;
+    stop) stop_session ;;
+    restart) restart_session ;;
+    status) status_session ;;
+    logs|log) show_logs ;;
+    doctor) doctor ;;
+    __run) run_session ;;
+    __run_from_env) run_from_environment "$@" ;;
+    __validate) validate_in_namespace "$@" ;;
+    __clipboard) clipboard_bridge ;;
+    __clipboard_to_windows) clipboard_to_windows ;;
+    --version|version) printf '%s %s\n' "$NAME" "$VERSION" ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac
