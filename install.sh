@@ -33,6 +33,8 @@ PACKAGE_MANIFEST="$ROOT/packages.conf"
 MANAGED_CONFIG_DIRS=(sway waybar swaync swaynag foot fuzzel yazi)
 BOOTSTRAP_PACKAGES=()
 MAIN_PACKAGES=()
+YAZI_INTEGRATION_PACKAGES=(fd ripgrep fzf zoxide jq 7zip)
+YAZI_PREVIEW_PACKAGES=(ffmpeg poppler resvg imagemagick)
 
 note() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -554,6 +556,22 @@ show_path_hint() {
     esac
 }
 
+print_paru_command() {
+    local package
+    printf '  paru -S --needed'
+    for package in "$@"; do
+        printf ' %s' "$package"
+    done
+    printf '\n'
+}
+
+show_yazi_recommendations() {
+    note "Recommended optional Yazi integrations:"
+    print_paru_command "${YAZI_INTEGRATION_PACKAGES[@]}"
+    note "Optional Yazi rich previews:"
+    print_paru_command "${YAZI_PREVIEW_PACKAGES[@]}"
+}
+
 main() {
     case "${1:-}" in
         '') ;;
@@ -603,6 +621,12 @@ Sway output scale:       $sway_scale
 
 GTK appearance:           $APPEARANCE_SUMMARY
 Run nwg-look inside Sway if you want to review or change the appearance.
+EOF2
+
+    note ""
+    show_yazi_recommendations
+
+    cat <<EOF2
 
 Next:
   1. Run: $NAME doctor

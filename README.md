@@ -126,18 +126,10 @@ pacman.
 - `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through WSLg
   PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
   providers conflict.
-- `qt5-wayland` provides native Wayland support for Qt 5. Qt 6 clients obtain their Wayland platform plugin from
-  `qt6-base`, so `qt6-wayland` is not needed.
-- `dbus`, `libpulse`, and `playerctl` are intentionally not repeated in the manifest. A standard Arch base installation
-  supplies D-Bus, while Waybar currently depends on `libpulse` and `playerctl`. The launcher doctor still checks the
-  required `dbus-*`, `pactl`, and `playerctl` commands so a future dependency change is reported clearly.
-- `maplemono-nf-cn-unhinted` is the AUR package used for Maple Mono NF CN. The upstream-recommended ArchLinuxCN
-  equivalent is
-  `ttf-maplemono-nf-cn-unhinted`, but this project does not modify pacman repository configuration.
-- Maple Mono NF CN already contains Nerd Font glyphs. Its AUR package does not, however, declare Arch's `ttf-font-nerd`
-  virtual provider, which the official Yazi package requires. The small `ttf-nerd-fonts-symbols-mono` package satisfies
-  that dependency deterministically and keeps fallback icons aligned to terminal cells; it does not replace the terminal
-  font.
+- `qt5-wayland` provides native Wayland support for Qt 5 applications.
+- `maplemono-nf-cn-unhinted` supplies Maple Mono NF CN for Foot.
+- `ttf-nerd-fonts-symbols-mono` satisfies Yazi's Nerd Font requirement and keeps fallback icons aligned to terminal
+  cells; it does not replace the terminal font.
 
 ## Yazi
 
@@ -164,8 +156,9 @@ Useful default Yazi bindings:
 See the [Yazi quick-start keybindings](https://yazi-rs.github.io/docs/quick-start/#keybindings)
 for the complete default map.
 
-The installer intentionally installs only Yazi. For its recommended search, navigation, JSON, and archive integrations,
-install:
+The [official Yazi installation guide](https://yazi-rs.github.io/docs/installation/) recommends the tools below. The
+installer already includes Yazi, its Nerd Font provider, and Wayland clipboard support. For the remaining search,
+navigation, JSON, and archive integrations, install:
 
 ```bash
 paru -S --needed fd ripgrep fzf zoxide jq 7zip
