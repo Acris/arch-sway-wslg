@@ -255,9 +255,21 @@ backup_existing_files() {
 }
 
 install_packages() {
-    note "Updating Arch and installing ${#PACKAGES[@]} explicit packages..."
+    local package
+    local -a selected_packages=()
+
+    if paru -Qq pipewire-jack >/dev/null 2>&1; then
+        for package in "${PACKAGES[@]}"; do
+            [[ "$package" == jack2 ]] || selected_packages+=("$package")
+        done
+        note "pipewire-jack is already installed; skipping the conflicting jack2 fallback."
+    else
+        selected_packages=("${PACKAGES[@]}")
+    fi
+
+    note "Updating Arch and installing ${#selected_packages[@]} explicit packages..."
     note "Paru may request sudo to update the system and install the packages listed in packages.txt."
-    paru -Syu --needed "${PACKAGES[@]}"
+    paru -Syu --needed "${selected_packages[@]}"
 }
 
 TRANSACTION_TARGETS=()

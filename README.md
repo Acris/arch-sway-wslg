@@ -121,7 +121,9 @@ providers, not every dependency resolved by pacman.
 
 - `xdg-desktop-portal-gtk-dummy` satisfies Arch GTK requirements without installing a guest portal stack that is
   unnecessary for this WSLg session.
-- `jack2` satisfies Waybar's JACK provider requirement but is not started; audio continues through WSLg PulseAudio.
+- `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through
+  WSLg PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
+  providers conflict.
 - `qt5-wayland` provides native Wayland support for Qt 5. Qt 6 clients obtain their Wayland platform plugin from
   `qt6-base`, so `qt6-wayland` is not needed.
 - `dbus`, `libpulse`, and `playerctl` are intentionally not repeated in the manifest. A standard Arch base installation

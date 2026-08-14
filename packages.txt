@@ -1,6 +1,7 @@
 # Explicit top-level packages and deterministic virtual-dependency providers.
 xdg-desktop-portal-gtk-dummy
 noto-fonts
+# Default JACK provider; install.sh skips it when pipewire-jack is installed.
 jack2
 
 # Desktop stack:
@@ -18,10 +19,8 @@ qt5-wayland
 yazi
 
 # Appearance:
-gsettings-desktop-schemas
 adw-gtk-theme
 papirus-icon-theme
-adwaita-cursors
 ttf-sarasa-gothic
 maplemono-nf-cn-unhinted
 # Maple Mono contains Nerd Font glyphs, but its AUR package does not declare
