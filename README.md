@@ -1,9 +1,11 @@
 # arch-sway-wslg
 
+[English](README.md) | [简体中文](README_CN.md)
+
 `arch-sway-wslg` installs and runs a polished, Wayland-first Sway session inside Microsoft WSL2/WSLg. It targets Arch
 Linux on WSL and is not intended to be a general bare-metal Sway distribution.
 
-<img width="3840" height="2160" alt="Sway" src="https://github.com/user-attachments/assets/7bbac63f-4e80-4c44-9ff2-a9dc18fccefc" />
+<img alt="Sway" src="https://github.com/user-attachments/assets/7bbac63f-4e80-4c44-9ff2-a9dc18fccefc" style="max-width: 1200px; width: 100%;" />
 
 ## Features
 
@@ -27,8 +29,9 @@ first. The installer expects:
 
 1. Arch Linux running under WSL2 with WSLg enabled.
 2. A normal user configured as the default WSL user, with working `sudo` access.
-3. The `en_US.UTF-8` locale generated and an active UTF-8 locale.
-4. WSLg hardware acceleration already configured.
+3. Locale configured according to the [ArchWiki locale instructions](https://wiki.archlinux.org/title/Locale), with an
+   active UTF-8 locale.
+4. WSLg hardware acceleration configured. Keep Windows and the host GPU driver up to date.
 5. `base-devel`, Git, and `paru` installed for the normal user.
 6. Windows interoperability enabled so `powershell.exe` can run from WSL.
 
@@ -41,6 +44,17 @@ wsl --shutdown
 
 Systemd is optional. The launcher reuses a working user D-Bus session when available and otherwise starts a private
 `dbus-run-session`; it does not modify the global D-Bus or systemd activation environment.
+
+Hardware acceleration is recommended for a smooth nested compositor. If rendering is unstable, first update Windows, run
+`wsl --update`, and install the latest driver for your host GPU. If problems continue, try the software-rendering
+fallback below before starting Sway:
+
+```bash
+export LIBGL_ALWAYS_SOFTWARE=1
+arch-sway-wslg start
+```
+
+Software rendering is slower. Unset the variable (or open a new shell) to return to accelerated rendering.
 
 ## Quick Start
 
@@ -65,7 +79,8 @@ Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer th
 - rolls back already-replaced paths if any deployment step fails;
 - installs the public launcher into `~/.local/bin` and private helpers into
   `~/.local/libexec/arch-sway-wslg`;
-- applies the recommended GTK appearance defaults with `gsettings`.
+- applies the recommended GTK appearance defaults with `gsettings`;
+- prints optional Yazi integration and rich-preview `paru` commands after installation.
 
 The installer explains its sudo request before validating Sway: root permission is used only to create a temporary,
 private X11 mount namespace. The validation itself runs as the normal user and leaves WSLg's global X11 mapping
@@ -84,6 +99,18 @@ Open the session log if startup does not complete:
 ```bash
 arch-sway-wslg logs
 ```
+
+## Resize and Maximize the WSLg Window
+
+These shortcuts operate on the outer Windows/WSLg window, not on Sway containers:
+
+- `Win+Up` maximizes the WSLg window.
+- `Win+Shift+Left/Right` moves it to another monitor.
+- If the window does not fill the target screen, press `Win+Left` or `Win+Right` first, then `Win+Up`.
+
+To use the full height of the display, enable automatic hiding for the Windows taskbar. Alternatively, keep the taskbar
+on a less important primary display and place the WSLg window on another monitor. Windows owns these shortcuts, so they
+do not need Sway key bindings.
 
 ## Installation and Updates
 
@@ -113,23 +140,6 @@ git pull --ff-only
 
 Desktop-entry masks contain only `Hidden=true`; they hide helper applications from Fuzzel without uninstalling them.
 Declining the prompt never deletes or modifies an existing same-named desktop file.
-
-## Package Notes
-
-`packages.conf` is the installer's only package manifest. Its `[bootstrap]` section is installed first and contains the
-portal, font, Nerd Font, and JACK providers needed by later packages. After that transaction succeeds, the `[main]`
-section installs the desktop stack and applications. The manifest does not repeat ordinary dependencies resolved by
-pacman.
-
-- `xdg-desktop-portal-gtk-dummy` satisfies Arch GTK requirements without installing a guest portal stack that is
-  unnecessary for this WSLg session.
-- `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through WSLg
-  PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
-  providers conflict.
-- `qt5-wayland` provides native Wayland support for Qt 5 applications.
-- `maplemono-nf-cn-unhinted` supplies Maple Mono NF CN for Foot.
-- `ttf-nerd-fonts-symbols-mono` satisfies Yazi's Nerd Font requirement and keeps fallback icons aligned to terminal
-  cells; it does not replace the terminal font.
 
 ## Yazi
 
@@ -267,6 +277,56 @@ arch-sway-wslg start
 This is not recommended for password-manager content. `WINDOWS_POWERSHELL` may be exported to override PowerShell
 discovery when Windows is mounted somewhere other than the default `/mnt/c` layout.
 
+## Troubleshooting
+
+Run diagnostics first:
+
+```bash
+arch-sway-wslg doctor
+```
+
+If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run the following from Windows before trying
+again:
+
+```powershell
+wsl --shutdown
+```
+
+For rendering errors, update Windows, WSL, and the host GPU driver first. If accelerated rendering remains unstable, try
+the `LIBGL_ALWAYS_SOFTWARE=1` fallback from the prerequisites section; it trades performance for compatibility.
+
+`doctor` checks prerequisites without requesting sudo or changing mount state. The real private-namespace and Sway
+configuration validation happens during `start`. Inside a Foot terminal launched by Sway, `echo "$DISPLAY"` should print
+the nested display reserved by Sway even before the first X11 application starts. An empty value means XWayland
+initialization failed; inspect `arch-sway-wslg logs`. Sway selects the nested display number, so it does not need to
+match WSLg's parent `:0`.
+
+To exercise the X11 path explicitly with a bundled application, run this inside Sway:
+
+```bash
+GDK_BACKEND=x11 nwg-look
+```
+
+If Sway is already running but its launcher state was interrupted, use
+`arch-sway-wslg stop`; the fixed IPC socket supports recovery. Do not manually delete `/tmp/.X11-unix`.
+
+## Package Notes
+
+`packages.conf` is the installer's only package manifest. Its `[bootstrap]` section is installed first and contains the
+portal, font, Nerd Font, and JACK providers needed by later packages. After that transaction succeeds, the `[main]`
+section installs the desktop stack and applications. The manifest does not repeat ordinary dependencies resolved by
+pacman.
+
+- `xdg-desktop-portal-gtk-dummy` satisfies Arch GTK requirements without installing a guest portal stack that is
+  unnecessary for this WSLg session.
+- `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through WSLg
+  PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
+  providers conflict.
+- `qt5-wayland` provides native Wayland support for Qt 5 applications.
+- `maplemono-nf-cn-unhinted` supplies Maple Mono NF CN for Foot.
+- `ttf-nerd-fonts-symbols-mono` satisfies Yazi's Nerd Font requirement and keeps fallback icons aligned to terminal
+  cells; it does not replace the terminal font.
+
 ## Runtime Design and Limitations
 
 Sway connects directly to WSLg's absolute parent Wayland socket at
@@ -284,36 +344,6 @@ Wayland applications.
 
 The bundle creates one nested Sway output. Multi-output emulation and multiple independent WSLg windows are outside its
 default scope.
-
-## Troubleshooting
-
-Run diagnostics first:
-
-```bash
-arch-sway-wslg doctor
-```
-
-If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run the following from Windows before trying
-again:
-
-```powershell
-wsl --shutdown
-```
-
-`doctor` checks prerequisites without requesting sudo or changing mount state. The real private-namespace and Sway
-configuration validation happens during `start`. Inside a Foot terminal launched by Sway, `echo "$DISPLAY"` should print
-the nested display reserved by Sway even before the first X11 application starts. An empty value means XWayland
-initialization failed; inspect `arch-sway-wslg logs`. Sway selects the nested display number, so it does not need to
-match WSLg's parent `:0`.
-
-To exercise the X11 path explicitly with a bundled application, run this inside Sway:
-
-```bash
-GDK_BACKEND=x11 nwg-look
-```
-
-If Sway is already running but its launcher state was interrupted, use
-`arch-sway-wslg stop`; the fixed IPC socket supports recovery. Do not manually delete `/tmp/.X11-unix`.
 
 ## Credits
 

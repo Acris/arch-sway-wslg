@@ -292,10 +292,12 @@ install_packages() {
         selected_bootstrap=("${BOOTSTRAP_PACKAGES[@]}")
     fi
 
+    note ""
     note "Updating Arch and installing ${#selected_bootstrap[@]} bootstrap packages..."
     note "Paru may request sudo to update the system and install the packages listed in packages.conf."
     paru -Syu --needed "${selected_bootstrap[@]}"
 
+    note ""
     note "Installing ${#MAIN_PACKAGES[@]} remaining packages..."
     paru -S --needed "${MAIN_PACKAGES[@]}"
 }
@@ -419,6 +421,8 @@ install_payload() {
     local config_name source_file basename sway_config
     local config_stage local_stage data_stage
 
+    note ""
+    note "Staging and validating the configuration payload before installation..."
     mkdir -p "$CONFIG_HOME" "$HOME/.local" "$LOCAL_BIN_DIR" "$HOME/.local/libexec"
     (( include_desktop_overrides )) && mkdir -p "$APPLICATIONS_DIR"
     config_stage="$(mktemp -d "$CONFIG_HOME/.${NAME}.config.XXXXXX")" || \
@@ -568,6 +572,7 @@ print_paru_command() {
 show_yazi_recommendations() {
     note "Recommended optional Yazi integrations:"
     print_paru_command "${YAZI_INTEGRATION_PACKAGES[@]}"
+    note ""
     note "Optional Yazi rich previews:"
     print_paru_command "${YAZI_PREVIEW_PACKAGES[@]}"
 }
@@ -589,9 +594,11 @@ main() {
         warn "managed configuration directories will be replaced without a backup"
     fi
     list_desktop_overrides
+    note ""
     if prompt_yes_no "Install the desktop-entry overrides listed above?" yes; then
         install_desktop_overrides=1
     fi
+    note ""
     sway_scale="$(prompt_scale)"
 
     protect_active_session
