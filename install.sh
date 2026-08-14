@@ -28,10 +28,11 @@ BACKUP_BASE="$STATE_HOME/$NAME/backups"
 CONTROL_LOCK_FILE="$STATE_HOME/$NAME/control.lock"
 DESKTOP_OVERRIDES_DIR="$ROOT/extras/desktop-overrides"
 LIBEXEC_PAYLOAD_DIR="$ROOT/.local/libexec/$NAME"
-PACKAGE_MANIFEST="$ROOT/packages.txt"
+PACKAGE_MANIFEST="$ROOT/packages.conf"
 
 MANAGED_CONFIG_DIRS=(sway waybar swaync swaynag foot fuzzel yazi)
-PACKAGES=()
+BOOTSTRAP_PACKAGES=()
+MAIN_PACKAGES=()
 
 note() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -160,23 +161,45 @@ preflight() {
 }
 
 load_packages() {
-    local line package
+    local line package section=""
     local -A seen=()
-    PACKAGES=()
+    BOOTSTRAP_PACKAGES=()
+    MAIN_PACKAGES=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -n "$line" && "$line" != \#* ]] || continue
+
+        case "$line" in
+            "[bootstrap]")
+                [[ -z "$section" ]] || die "invalid or repeated [bootstrap] section"
+                section="bootstrap"
+                continue
+                ;;
+            "[main]")
+                [[ "$section" == "bootstrap" ]] || die "[main] must follow [bootstrap]"
+                section="main"
+                continue
+                ;;
+            \[*\]) die "unknown package manifest section: $line" ;;
+        esac
+
+        [[ -n "$section" ]] || die "package appears before a manifest section: $line"
         [[ "$line" =~ ^[a-zA-Z0-9@._+:-]+$ ]] || \
             die "invalid package manifest line: $line"
         package="$line"
         [[ -z "${seen[$package]:-}" ]] || die "duplicate package in manifest: $package"
         seen[$package]=1
-        PACKAGES+=("$package")
+        if [[ "$section" == "bootstrap" ]]; then
+            BOOTSTRAP_PACKAGES+=("$package")
+        else
+            MAIN_PACKAGES+=("$package")
+        fi
     done < "$PACKAGE_MANIFEST"
 
-    (( ${#PACKAGES[@]} > 0 )) || die "package manifest contains no packages"
+    ((${#BOOTSTRAP_PACKAGES[@]})) || die "package manifest contains no bootstrap packages"
+    ((${#MAIN_PACKAGES[@]})) || die "package manifest contains no main packages"
 }
 
 protect_active_session() {
@@ -256,20 +279,23 @@ backup_existing_files() {
 
 install_packages() {
     local package
-    local -a selected_packages=()
+    local -a selected_bootstrap=()
 
     if paru -Qq pipewire-jack >/dev/null 2>&1; then
-        for package in "${PACKAGES[@]}"; do
-            [[ "$package" == jack2 ]] || selected_packages+=("$package")
+        for package in "${BOOTSTRAP_PACKAGES[@]}"; do
+            [[ "$package" == jack2 ]] || selected_bootstrap+=("$package")
         done
         note "pipewire-jack is already installed; skipping the conflicting jack2 fallback."
     else
-        selected_packages=("${PACKAGES[@]}")
+        selected_bootstrap=("${BOOTSTRAP_PACKAGES[@]}")
     fi
 
-    note "Updating Arch and installing ${#selected_packages[@]} explicit packages..."
-    note "Paru may request sudo to update the system and install the packages listed in packages.txt."
-    paru -Syu --needed "${selected_packages[@]}"
+    note "Updating Arch and installing ${#selected_bootstrap[@]} bootstrap packages..."
+    note "Paru may request sudo to update the system and install the packages listed in packages.conf."
+    paru -Syu --needed "${selected_bootstrap[@]}"
+
+    note "Installing ${#MAIN_PACKAGES[@]} remaining packages..."
+    paru -S --needed "${MAIN_PACKAGES[@]}"
 }
 
 TRANSACTION_TARGETS=()

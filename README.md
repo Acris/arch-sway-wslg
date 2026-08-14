@@ -59,7 +59,7 @@ Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer th
 - lists every optional desktop-entry mask and asks whether to install them;
 - asks for the nested Sway output scale, defaulting to `1`;
 - detects a running managed Sway session and asks to stop it before updating;
-- updates Arch and installs the explicit package list from `packages.txt`;
+- updates Arch and installs the bootstrap providers from `packages.conf`, then installs the remaining desktop packages;
 - stages the complete payload, applies the selected scale, and validates the final Shell, Sway, Foot, and Fuzzel
   configuration before replacing anything;
 - rolls back already-replaced paths if any deployment step fails;
@@ -116,13 +116,15 @@ Declining the prompt never deletes or modifies an existing same-named desktop fi
 
 ## Package Notes
 
-`packages.txt` is the installer's only package manifest. It lists selected top-level applications and deterministic
-providers, not every dependency resolved by pacman.
+`packages.conf` is the installer's only package manifest. Its `[bootstrap]` section is installed first and contains the
+portal, font, Nerd Font, and JACK providers needed by later packages. After that transaction succeeds, the `[main]`
+section installs the desktop stack and applications. The manifest does not repeat ordinary dependencies resolved by
+pacman.
 
 - `xdg-desktop-portal-gtk-dummy` satisfies Arch GTK requirements without installing a guest portal stack that is
   unnecessary for this WSLg session.
-- `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through
-  WSLg PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
+- `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through WSLg
+  PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
   providers conflict.
 - `qt5-wayland` provides native Wayland support for Qt 5. Qt 6 clients obtain their Wayland platform plugin from
   `qt6-base`, so `qt6-wayland` is not needed.
