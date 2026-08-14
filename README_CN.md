@@ -233,7 +233,9 @@ Foot 通过内置 Sixel 支持 Yazi 图像预览。若希望 shell 在退出 Yaz
 - 光标：`Adwaita`，大小 `28`
 
 Sway、Waybar、SwayNC、Fuzzel、Foot、swaynag 和 Yazi 已内置 Catppuccin Mocha。GTK 使用 Adwaita Dark，因为历史上的 Catppuccin GTK
-移植版已经归档。进入 Sway 后运行 `nwg-look`，可以查看或修改 GTK、图标、字体和光标设置。
+移植版已经归档。进入 Sway 后运行 `nwg-look`，可以查看或修改 GTK、图标、字体和光标设置。内置 Sway 壁纸位于
+`~/.config/sway/wallpapers/dark-star.jpg`；如需更换壁纸，可以替换该文件并修改 `output * bg` 配置行。
+该图片来自 [walls-catppuccin-mocha](https://github.com/orangci/walls-catppuccin-mocha) 壁纸集合。
 
 ## Windows 剪贴板桥接
 
@@ -328,6 +330,7 @@ WSL 启动配置，能够适应 WSLg 目录重建，并保留 Sway 内正常的 
 - [SwayNC](https://github.com/ErikReider/SwayNotificationCenter)
 - [Yazi](https://yazi-rs.github.io/)
 - [Catppuccin](https://catppuccin.com/)
+- [walls-catppuccin-mocha](https://github.com/orangci/walls-catppuccin-mocha)
 - [Maple Mono](https://github.com/subframe7536/maple-font)
 - [Sarasa Gothic](https://github.com/be5invis/Sarasa-Gothic)
 

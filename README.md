@@ -210,7 +210,9 @@ The installer applies these GTK defaults with `gsettings`:
 
 Catppuccin Mocha is bundled for Sway, Waybar, SwayNC, Fuzzel, Foot, swaynag, and Yazi. GTK uses Adwaita Dark because the
 historical Catppuccin GTK port is archived. Run `nwg-look` inside Sway whenever you want to review or change the GTK,
-icon, font, or cursor settings.
+icon, font, or cursor settings. The bundled Sway wallpaper is installed at
+`~/.config/sway/wallpapers/dark-star.jpg`; replace that file and update the `output * bg` line if you want another
+image. The image comes from the [walls-catppuccin-mocha](https://github.com/orangci/walls-catppuccin-mocha) collection.
 
 ## Commands
 
@@ -365,6 +367,7 @@ Additional references:
 - [SwayNC](https://github.com/ErikReider/SwayNotificationCenter)
 - [Yazi](https://yazi-rs.github.io/)
 - [Catppuccin](https://catppuccin.com/)
+- [walls-catppuccin-mocha](https://github.com/orangci/walls-catppuccin-mocha)
 - [Maple Mono](https://github.com/subframe7536/maple-font)
 - [Sarasa Gothic](https://github.com/be5invis/Sarasa-Gothic)
 

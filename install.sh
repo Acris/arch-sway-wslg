@@ -372,6 +372,11 @@ validate_staged_payload() {
     local validation_runtime="$local_stage/validation-runtime"
     local validation_x11="$local_stage/validation-x11" x11_target user_name
 
+    [[ -s "$config_stage/sway/wallpapers/dark-star.jpg" ]] || {
+        warn "staged Sway wallpaper payload is missing"
+        return 1
+    }
+
     command -v Xwayland >/dev/null 2>&1 || {
         warn "Xwayland is not installed"
         return 1
