@@ -41,15 +41,8 @@ wsl --shutdown
 systemd 不是必需的。启动器会优先复用可用的用户 D-Bus，否则使用私有的 `dbus-run-session`；不会修改全局 D-Bus 或 systemd
 激活环境。
 
-硬件加速有助于获得流畅的嵌套合成效果。如果出现渲染问题，先更新 Windows，执行 `wsl --update`，并安装主机显卡的最新驱动。
-如果问题仍然存在，可以在启动 Sway 前尝试软件渲染：
-
-```bash
-export LIBGL_ALWAYS_SOFTWARE=1
-arch-sway-wslg start
-```
-
-软件渲染会更慢。取消该变量或重新打开 shell 即可恢复硬件加速。
+硬件加速是流畅运行嵌套合成器所必需的。如果出现渲染问题，先更新 Windows，执行 `wsl --update`，并安装主机显卡的最新驱动。
+启动器会保持 Sway 使用硬件加速；只有单独对出现问题的应用禁用硬件渲染。
 
 ## 快速开始
 
@@ -272,8 +265,7 @@ arch-sway-wslg doctor
 wsl --shutdown
 ```
 
-遇到渲染错误时，先更新 Windows、WSL 和主机显卡驱动；如果硬件渲染仍不稳定，请尝试前置条件中的
-`LIBGL_ALWAYS_SOFTWARE=1` 回退方案，它会牺牲性能以换取兼容性。
+遇到渲染错误时，先更新 Windows、WSL 和主机显卡驱动。启动器会保持 Sway 使用硬件加速。
 
 `doctor` 只检查前置条件，不申请 sudo，也不改变 mount 状态。真正的私有 namespace 和 Sway 配置校验发生在 `start` 期间。 在
 Sway 启动的 Foot 中执行 `echo "$DISPLAY"`，即使还没有启动 X11 应用，也应显示 Sway 分配的嵌套 display。空值表示 XWayland

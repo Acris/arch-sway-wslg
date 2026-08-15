@@ -45,16 +45,9 @@ wsl --shutdown
 Systemd is optional. The launcher reuses a working user D-Bus session when available and otherwise starts a private
 `dbus-run-session`; it does not modify the global D-Bus or systemd activation environment.
 
-Hardware acceleration is recommended for a smooth nested compositor. If rendering is unstable, first update Windows, run
-`wsl --update`, and install the latest driver for your host GPU. If problems continue, try the software-rendering
-fallback below before starting Sway:
-
-```bash
-export LIBGL_ALWAYS_SOFTWARE=1
-arch-sway-wslg start
-```
-
-Software rendering is slower. Unset the variable (or open a new shell) to return to accelerated rendering.
+Hardware acceleration is required for a smooth nested compositor. If rendering is unstable, first update Windows, run
+`wsl --update`, and install the latest driver for your host GPU. The launcher keeps Sway hardware-accelerated; disable
+hardware rendering only for an individual problematic application.
 
 ## Quick Start
 
@@ -294,8 +287,8 @@ again:
 wsl --shutdown
 ```
 
-For rendering errors, update Windows, WSL, and the host GPU driver first. If accelerated rendering remains unstable, try
-the `LIBGL_ALWAYS_SOFTWARE=1` fallback from the prerequisites section; it trades performance for compatibility.
+For rendering errors, update Windows, WSL, and the host GPU driver first. The launcher keeps Sway
+hardware-accelerated.
 
 `doctor` checks prerequisites without requesting sudo or changing mount state. The real private-namespace and Sway
 configuration validation happens during `start`. Inside a Foot terminal launched by Sway, `echo "$DISPLAY"` should print
