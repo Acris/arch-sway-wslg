@@ -282,6 +282,7 @@ backup_existing_files() {
 install_packages() {
     local package
     local -a selected_bootstrap=()
+    local -a selected_main=()
 
     if paru -Qq pipewire-jack >/dev/null 2>&1; then
         for package in "${BOOTSTRAP_PACKAGES[@]}"; do
@@ -297,9 +298,18 @@ install_packages() {
     note "Paru may request sudo to update the system and install the packages listed in packages.conf."
     paru -Syu --needed "${selected_bootstrap[@]}"
 
+    if paru -T org.freedesktop.secrets >/dev/null 2>&1; then
+        for package in "${MAIN_PACKAGES[@]}"; do
+            [[ "$package" == oo7 ]] || selected_main+=("$package")
+        done
+        note "An org.freedesktop.secrets credential manager is already installed; skipping oo7."
+    else
+        selected_main=("${MAIN_PACKAGES[@]}")
+    fi
+
     note ""
-    note "Installing ${#MAIN_PACKAGES[@]} remaining packages..."
-    paru -S --needed "${MAIN_PACKAGES[@]}"
+    note "Installing ${#selected_main[@]} remaining packages..."
+    paru -S --needed "${selected_main[@]}"
 }
 
 TRANSACTION_TARGETS=()

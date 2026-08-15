@@ -62,6 +62,8 @@ cd arch-sway-wslg
 - 询问嵌套 Sway 输出缩放比例，默认值为 `1`；
 - 检测正在运行的受管理 Sway 会话，并在更新前询问是否停止；
 - 更新 Arch，先安装 `packages.conf` 中的 bootstrap provider，再安装其余桌面软件；
+- 安装 Seahorse；如果尚未安装 `org.freedesktop.secrets` 凭据管理器，则同时安装轻量级 Secret Service 后端
+  `oo7`；
 - 将完整 payload 放入 staging，应用选择的缩放比例，并在替换文件前校验最终的 Shell、Sway、Foot 和 Fuzzel 配置；
 - 如果部署失败，回滚已替换的路径；
 - 将公开启动器安装到 `~/.local/bin`，将私有辅助程序安装到 `~/.local/libexec/arch-sway-wslg`；
@@ -289,6 +291,9 @@ GDK_BACKEND=x11 nwg-look
   ，安装器会保留它并跳过
   `jack2`，因为两个 provider 互相冲突。
 - `qt5-wayland` 为 Qt 5 应用提供原生 Wayland 支持。
+- `oo7` 提供用于存储应用凭据的 Secret Service 后端，Seahorse 提供图形管理界面。安装 `oo7` 前，安装器会检查
+  `org.freedesktop.secrets` 虚拟依赖；如果已有 GNOME Keyring、KeePassXC 或 KWallet 等 provider，安装器会保留它并跳过
+  `oo7`。无论使用哪个 provider，Seahorse 都会安装。
 - `maplemono-nf-cn-unhinted` 为 Foot 提供 Maple Mono NF CN。
 - `ttf-nerd-fonts-symbols-mono` 满足 Yazi 的 Nerd Font 要求，让回退图标保持终端单元格对齐；它不会替换终端字体。
 

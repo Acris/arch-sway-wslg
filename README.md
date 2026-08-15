@@ -67,6 +67,8 @@ Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer th
 - asks for the nested Sway output scale, defaulting to `1`;
 - detects a running managed Sway session and asks to stop it before updating;
 - updates Arch and installs the bootstrap providers from `packages.conf`, then installs the remaining desktop packages;
+- installs Seahorse and, unless an `org.freedesktop.secrets` credential manager is already present, the lightweight
+  `oo7` Secret Service backend;
 - stages the complete payload, applies the selected scale, and validates the final Shell, Sway, Foot, and Fuzzel
   configuration before replacing anything;
 - rolls back already-replaced paths if any deployment step fails;
@@ -318,6 +320,10 @@ pacman.
   PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
   providers conflict.
 - `qt5-wayland` provides native Wayland support for Qt 5 applications.
+- `oo7` provides the Secret Service backend used to store application credentials, while Seahorse provides its graphical
+  management interface. Before installing `oo7`, the installer checks the `org.freedesktop.secrets` virtual dependency;
+  if a provider such as GNOME Keyring, KeePassXC, or KWallet is already installed, it keeps that provider and skips
+  `oo7`. Seahorse is installed in either case.
 - `maplemono-nf-cn-unhinted` supplies Maple Mono NF CN for Foot.
 - `ttf-nerd-fonts-symbols-mono` satisfies Yazi's Nerd Font requirement and keeps fallback icons aligned to terminal
   cells; it does not replace the terminal font.
