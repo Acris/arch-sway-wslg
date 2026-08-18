@@ -1,8 +1,9 @@
 {
   "layer": "top",
   "position": "top",
-  "height": 40,
-  "spacing": 0,
+  // Waybar's own defaults for the bar height and the gap between modules.
+  "height": 32,
+  "spacing": 4,
   "fixed-center": false,
   "modules-left": [
     "sway/workspaces",
@@ -20,7 +21,7 @@
     "clock"
   ],
   // Only memory stays visible; CPU and disk slide out on hover so the right
-  // side keeps five pills instead of seven.
+  // side keeps five items instead of seven.
   "group/resources": {
     "orientation": "horizontal",
     "drawer": {
@@ -84,7 +85,7 @@
   },
   "sway/window": {
     "format": "{title}",
-    "max-length": 48,
+    "max-length": 40,
     "tooltip": false
   },
   "pulseaudio": {
@@ -105,13 +106,16 @@
     "tooltip-format": "{desc}\nVolume: {volume}%"
   },
   "tray": {
-    "icon-size": 17,
-    "spacing": 8,
+    // 22 is one of the sizes the Papirus icon theme ships, so tray icons are
+    // never rescaled.
+    "icon-size": 22,
+    "spacing": 10,
     "show-passive-items": false
   },
   "custom/notification": {
     "tooltip": true,
-    "format": "<span size='16pt'>{icon}</span>",
+    // The glyph is sized from style.css like every other module.
+    "format": "{icon}",
     "format-icons": {
       "notification": "󱅫",
       "none": "󰂜",

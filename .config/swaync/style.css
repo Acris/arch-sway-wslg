@@ -17,12 +17,13 @@
     --text-color: rgb(205, 214, 244);
     --text-color-disabled: rgb(108, 112, 134);
     --bg-selected: rgb(203, 166, 247);
-    --notification-icon-size: 56px;
-    --notification-group-icon-size: 28px;
+    /* Icon sizes, radius, and font sizes are SwayNC's own defaults. */
+    --notification-icon-size: 64px;
+    --notification-group-icon-size: 32px;
     --border: 1px solid var(--noti-border-color);
-    --border-radius: 14px;
-    --font-size-body: 12px;
-    --font-size-summary: 13px;
+    --border-radius: 12px;
+    --font-size-body: 15px;
+    --font-size-summary: 16px;
 }
 
 * {
@@ -33,7 +34,7 @@
     color: #cdd6f4;
     background: var(--cc-bg);
     border: 1px solid rgba(203, 166, 247, 0.30);
-    border-radius: 16px;
+    border-radius: var(--border-radius);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
 }
 
@@ -114,3 +115,11 @@
     color: #11111b;
     background: #cba6f7;
 }
+
+/* =============================================================================
+ * Local overrides
+ * ============================================================================= */
+/* local.css is yours: the installer creates it once and never replaces it.
+ * GTK reads it last, so every rule it sets wins. Leave the file in place even
+ * when it is empty; GTK discards the whole stylesheet if an import is missing. */
+@import "local.css";

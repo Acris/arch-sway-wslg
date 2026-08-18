@@ -1,5 +1,7 @@
 # Swaynag / Catppuccin Mocha
-font=Sarasa UI SC 12
+# Only the font family and the colors are changed; every size keeps swaynag's
+# own default.
+font=Sarasa UI SC 10
 edge=top
 layer=overlay
 
@@ -11,13 +13,6 @@ text=cdd6f4
 button-background=313244
 button-text=cdd6f4
 details-background=181825
-border-bottom-size=2
-message-padding=12
-button-border-size=1
-button-gap=8
-button-dismiss-gap=8
-button-margin-right=8
-button-padding=8
 
 [error]
 background=1e1e2e
@@ -27,10 +22,3 @@ text=cdd6f4
 button-background=313244
 button-text=cdd6f4
 details-background=181825
-border-bottom-size=2
-message-padding=12
-button-border-size=1
-button-gap=8
-button-dismiss-gap=8
-button-margin-right=8
-button-padding=8

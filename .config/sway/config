@@ -33,13 +33,16 @@ set $wallpaper "__ARCH_SWAY_WSLG_WALLPAPER__"
 # -----------------------------------------------------------------------------
 # Appearance
 # -----------------------------------------------------------------------------
-font pango:Sarasa UI SC 12
+# Sway's own default is `monospace 10`; only the family changes here.
+font pango:Sarasa UI SC 10
 
+# Sway's default border thickness.
 default_border pixel 2
 default_floating_border pixel 2
 
+# Sway has no gaps by default. Inner gaps are the one deliberate deviation;
+# outer gaps stay at the default so windows keep the full nested output.
 gaps inner 8
-gaps outer 8
 smart_gaps on
 smart_borders on
 
@@ -57,8 +60,9 @@ output * {
     bg $wallpaper fill $base
 }
 
-# Keep compositor cursor consistent with nwg-look.
-seat * xcursor_theme Adwaita 28
+# Keep the compositor cursor consistent with nwg-look. 24 is both Sway's and
+# GNOME's default, and one of the sizes the Adwaita theme actually ships.
+seat * xcursor_theme Adwaita 24
 
 # -----------------------------------------------------------------------------
 # Behaviour

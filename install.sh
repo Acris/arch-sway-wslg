@@ -36,9 +36,11 @@ DESKTOP_OVERRIDE_FILES=("$ROOT/extras/desktop-overrides/"*.desktop)
 MANAGED_CONFIG_DIRS=(sway waybar swaync swaynag foot fuzzel yazi)
 # Files and directories inside the managed configuration that belong to the
 # user. They survive every reinstall and are read after the managed files.
-LOCAL_OVERRIDE_PATHS=(sway/config.d foot/local.ini fuzzel/local.ini)
+LOCAL_OVERRIDE_PATHS=(sway/config.d foot/local.ini fuzzel/local.ini waybar/local.css swaync/local.css)
 # Bundled wallpaper, relative to the managed configuration root.
 WALLPAPER_RELATIVE="sway/wallpapers/dark-star.jpg"
+# Bundled syntax highlighting theme for the Yazi file preview.
+YAZI_THEME_RELATIVE="yazi/Catppuccin-mocha.tmTheme"
 
 # Providers and shared prerequisites that have to be resolved before the
 # desktop stack. jack2 is the default JACK provider and is skipped when
@@ -65,12 +67,13 @@ MAIN_PACKAGES=(
 YAZI_INTEGRATION_PACKAGES=(fd ripgrep fzf zoxide jq 7zip)
 YAZI_PREVIEW_PACKAGES=(ffmpeg poppler resvg imagemagick)
 
-BROWSER_KEYS=(firefox chromium chrome edge none)
+BROWSER_KEYS=(firefox chromium chrome edge brave none)
 declare -A BROWSER_LABELS=(
     [firefox]="Firefox"
     [chromium]="Chromium"
     [chrome]="Google Chrome"
     [edge]="Microsoft Edge"
+    [brave]="Brave"
     [none]="No browser"
 )
 declare -A BROWSER_PACKAGES=(
@@ -78,18 +81,21 @@ declare -A BROWSER_PACKAGES=(
     [chromium]="chromium"
     [chrome]="google-chrome"
     [edge]="microsoft-edge-stable-bin"
+    [brave]="brave-bin"
 )
 declare -A BROWSER_SOURCES=(
     [firefox]="official repository"
     [chromium]="official repository"
     [chrome]="AUR"
     [edge]="AUR"
+    [brave]="AUR"
 )
 declare -A BROWSER_COMMANDS=(
     [firefox]="firefox"
     [chromium]="chromium"
     [chrome]="google-chrome-stable"
     [edge]="microsoft-edge-stable"
+    [brave]="brave"
 )
 BROWSER_CHOICE="firefox"
 declare -A BROWSER_INSTALLED=()
@@ -120,8 +126,8 @@ Managed configuration directories are replaced exactly, except for the local
 override paths (${LOCAL_OVERRIDE_PATHS[*]}), which are always preserved.
 
 The installer asks for a backup of the current state, the Sway output scale, a
-browser, the optional desktop-entry masks and the GTK appearance defaults.
-Backups are written to $BACKUP_BASE.
+browser, the optional desktop-entry masks, automatic oo7 keyring unlocking and
+the GTK appearance defaults. Backups are written to $BACKUP_BASE.
 EOF2
 }
 
@@ -299,9 +305,11 @@ install_packages() {
     fi
 
     note ""
-    note "Updating Arch and installing ${#selected_bootstrap[@]} bootstrap packages..."
-    note "Paru may request sudo to update the system and install packages."
-    paru -Syu --needed "${selected_bootstrap[@]}"
+    note "Refreshing the package databases and installing ${#selected_bootstrap[@]} bootstrap packages..."
+    note "Paru may request sudo to install packages."
+    # Refresh the databases only. Upgrading the whole system belongs to the
+    # user's own schedule, not to a desktop installation.
+    paru -Sy --needed "${selected_bootstrap[@]}"
 
     if paru -T org.freedesktop.secrets >/dev/null 2>&1; then
         selected_main=()
@@ -335,6 +343,96 @@ write_browser_choice() {
     mkdir -p "$SETTINGS_DIR"
     printf '%s\n' "$browser_command" > "$BROWSER_FILE"
     note "BROWSER inside Sway: $browser_command"
+}
+
+# -----------------------------------------------------------------------------
+# Secret Service
+# -----------------------------------------------------------------------------
+OO7_UNIT="oo7-daemon.service"
+OO7_CREDENTIAL="oo7.keyring-encryption-password"
+# The daemon imports the keyring password from the user credential store, which
+# systemd only reads from this version onwards.
+OO7_CREDENTIAL_SYSTEMD=258
+OO7_SUMMARY="oo7 not installed"
+
+# oo7 is otherwise only started through D-Bus activation, which leaves the
+# keyring closed until something asks for a secret. Enabling the unit starts the
+# daemon with the user session instead.
+configure_oo7() {
+    paru -Qq oo7 >/dev/null 2>&1 || return 0
+
+    note ""
+    if ! systemctl_user enable --now "$OO7_UNIT"; then
+        OO7_SUMMARY="$OO7_UNIT could not be enabled"
+        warn "could not enable $OO7_UNIT"
+        warn "run 'systemctl --user enable --now $OO7_UNIT' once the user manager is healthy"
+        return 0
+    fi
+    OO7_SUMMARY="$OO7_UNIT enabled and started"
+    note "$OO7_UNIT is enabled and running."
+
+    store_oo7_credential
+}
+
+# systemd resolves the credential store against the user manager's own
+# XDG_CONFIG_HOME, which is rarely the one an interactive shell exports.
+oo7_credstore_dir() {
+    local line value=""
+
+    while IFS= read -r line; do
+        [[ "$line" == XDG_CONFIG_HOME=* ]] || continue
+        value="${line#XDG_CONFIG_HOME=}"
+        break
+    done < <(systemctl_user show-environment 2>/dev/null)
+    [[ "$value" == /* ]] || value="$HOME/.config"
+
+    printf '%s\n' "$value/credstore.encrypted"
+}
+
+# Without a display manager there is no PAM step to hand the keyring password to
+# the daemon, so store it as an encrypted credential the daemon imports at
+# startup.
+store_oo7_credential() {
+    local store target staged raw version=""
+
+    command -v systemd-creds >/dev/null 2>&1 || return 0
+    raw="$(systemctl --version)"
+    raw="${raw#* }"
+    version="${raw%%[!0-9]*}"
+    if [[ -z "$version" ]] || (( version < OO7_CREDENTIAL_SYSTEMD )); then
+        note "Automatic keyring unlocking needs systemd $OO7_CREDENTIAL_SYSTEMD or newer; skipping."
+        return 0
+    fi
+
+    store="$(oo7_credstore_dir)"
+    target="$store/$OO7_CREDENTIAL"
+    if [[ -e "$target" ]]; then
+        prompt_yes_no "An encrypted oo7 keyring password is already stored. Replace it?" no || return 0
+    elif ! prompt_yes_no "Unlock the oo7 keyring automatically with a stored password?" yes; then
+        note "Unlock the keyring yourself with 'oo7-cli unlock' when an application asks for a secret."
+        return 0
+    fi
+
+    mkdir -p "$store"
+    chmod 700 "$store"
+    note "Enter the keyring password. It is encrypted with systemd-creds, never stored in plain text."
+    note "Anyone who can read $target and use the TPM, including root, can decrypt it."
+
+    staged="$target.new"
+    rm -f -- "$staged"
+    if systemd-ask-password -n "oo7 keyring password:" | \
+        systemd-creds encrypt --user --name="$OO7_CREDENTIAL" - "$staged"; then
+        chmod 600 "$staged"
+        mv -f -- "$staged" "$target"
+        OO7_SUMMARY="$OO7_SUMMARY; automatic unlocking configured"
+        note "Keyring password stored at $target."
+        systemctl_user restart "$OO7_UNIT" || \
+            warn "could not restart $OO7_UNIT; the credential is imported at its next start"
+    else
+        rm -f -- "$staged"
+        OO7_SUMMARY="$OO7_SUMMARY; automatic unlocking not configured"
+        warn "the keyring password could not be stored; use 'oo7-cli unlock' instead"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -568,6 +666,18 @@ stage_local_overrides() {
         '# Options set here win, for example:' \
         '#   [main]' \
         '#   lines=12'
+    # Both stylesheets import their local.css last. GTK drops the whole
+    # stylesheet when an import is missing, so these files always exist.
+    seed_local_override "$STAGE_CONFIG/waybar/local.css" \
+        '/* Personal Waybar styling; never replaced by arch-sway-wslg.' \
+        ' * Rules set here win, for example:' \
+        ' *   * { font-size: 16px; }' \
+        ' * Keep this file even when it is empty. */'
+    seed_local_override "$STAGE_CONFIG/swaync/local.css" \
+        '/* Personal SwayNC styling; never replaced by arch-sway-wslg.' \
+        ' * Rules set here win, for example:' \
+        ' *   :root { --font-size-body: 17px; }' \
+        ' * Keep this file even when it is empty. */'
 }
 
 render_staged_payload() {
@@ -581,11 +691,19 @@ render_staged_payload() {
         "$CONFIG_HOME/foot/local.ini" || return 1
     render_marker "$STAGE_CONFIG/fuzzel/fuzzel.ini" "__ARCH_SWAY_WSLG_FUZZEL_LOCAL__" \
         "$CONFIG_HOME/fuzzel/local.ini" || return 1
+    # The wallpaper value above already rejected a configuration root a quoted
+    # path cannot express, which is what this TOML string needs as well.
+    render_marker "$STAGE_CONFIG/yazi/theme.toml" "__ARCH_SWAY_WSLG_YAZI_THEME__" \
+        "$CONFIG_HOME/$YAZI_THEME_RELATIVE" || return 1
 }
 
 check_staged_payload() {
     [[ -s "$STAGE_CONFIG/$WALLPAPER_RELATIVE" ]] || {
         warn "staged Sway wallpaper payload is missing"
+        return 1
+    }
+    [[ -s "$STAGE_CONFIG/$YAZI_THEME_RELATIVE" ]] || {
+        warn "staged Yazi syntax highlighting theme is missing"
         return 1
     }
     bash -n "$STAGE_LOCAL/bin/$NAME" || return 1
@@ -671,8 +789,10 @@ list_desktop_overrides() {
 # -----------------------------------------------------------------------------
 APPEARANCE_SCHEMA="org.gnome.desktop.interface"
 APPEARANCE_KEYS=(gtk-theme color-scheme icon-theme font-name cursor-theme cursor-size)
+# The font size and the cursor size are the GNOME defaults; the cursor size
+# also matches the Sway configuration and a size Adwaita really ships.
 APPEARANCE_VALUES=("'adw-gtk3-dark'" "'prefer-dark'" "'Papirus-Dark'" \
-                   "'Sarasa UI SC 11'" "'Adwaita'" '28')
+                   "'Sarasa UI SC 11'" "'Adwaita'" '24')
 APPEARANCE_REQUESTED=0
 APPEARANCE_SUMMARY="not requested"
 
@@ -794,6 +914,7 @@ main() {
 
     stop_active_session
     install_packages
+    configure_oo7
     prompt_appearance_defaults
 
     take_control_lock
@@ -813,15 +934,18 @@ Installed configuration: $CONFIG_HOME
 Installed launcher:      $LOCAL_BIN_DIR/$NAME
 Sway output scale:       $SWAY_SCALE
 Browser:                 ${BROWSER_LABELS[$BROWSER_CHOICE]}
+Secret Service:          $OO7_SUMMARY
 Backup:                  $BACKUP_SUMMARY
 
 GTK appearance:          $APPEARANCE_SUMMARY
-Run nwg-look inside Sway if you want to review or change the appearance.
+Run nwg-look inside Sway to review or change the appearance.
 
-Your own settings belong in:
+Personal settings belong in:
   $CONFIG_HOME/sway/config.d/*.conf
   $CONFIG_HOME/foot/local.ini
   $CONFIG_HOME/fuzzel/local.ini
+  $CONFIG_HOME/waybar/local.css
+  $CONFIG_HOME/swaync/local.css
 EOF2
 
     note ""

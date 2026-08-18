@@ -19,7 +19,9 @@ count_selected = { fg = "#1e1e2e", bg = "#b4befe" }
 border_symbol = "│"
 border_style  = { fg = "#7f849c" }
 
-syntect_theme = "~/.config/yazi/Catppuccin-mocha.tmTheme"
+# install.sh replaces this marker with the resolved absolute path of the
+# bundled Catppuccin Mocha tmTheme.
+syntect_theme = "__ARCH_SWAY_WSLG_YAZI_THEME__"
 
 [tabs]
 active   = { fg = "#1e1e2e", bg = "#cdd6f4", bold = true }

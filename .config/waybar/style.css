@@ -4,13 +4,14 @@
  * ============================================================================= */
 @import "catppuccin-mocha.css";
 
+/* 13px is Waybar's own default font size; the family and the pill styling
+ * below are the only deliberate deviations. */
 * {
     border: none;
     border-radius: 0;
     min-height: 0;
     font-family: "Sarasa UI SC", "Maple Mono NF CN", "Noto Color Emoji";
-    font-size: 12px;
-    font-weight: 500;
+    font-size: 13px;
     text-shadow: none;
 }
 
@@ -27,23 +28,23 @@ tooltip {
 
 tooltip label {
     color: @text;
-    padding: 7px 9px;
+    padding: 8px 10px;
 }
 
 #workspaces {
     background: @mantle;
-    margin: 5px 0 5px 8px;
+    margin: 4px 0 4px 8px;
     padding: 2px 4px;
     border: 1px solid rgba(88, 91, 112, 0.30);
-    border-radius: 14px;
+    border-radius: 12px;
 }
 
 #workspaces button {
-    min-width: 26px;
+    min-width: 24px;
     padding: 0 8px;
     color: @overlay1;
     background: transparent;
-    border-radius: 10px;
+    border-radius: 8px;
     box-shadow: none;
 }
 
@@ -77,27 +78,27 @@ tooltip label {
 #mode {
     color: @crust;
     background: @peach;
-    margin: 5px 0 5px 6px;
-    padding: 0 12px;
-    border-radius: 14px;
+    margin: 4px 0;
+    padding: 0 10px;
+    border-radius: 12px;
 }
 
 #scratchpad {
     color: @pink;
     background: @mantle;
-    margin: 5px 0 5px 6px;
-    padding: 0 12px;
+    margin: 4px 0;
+    padding: 0 10px;
     border: 1px solid rgba(245, 194, 231, 0.30);
-    border-radius: 14px;
+    border-radius: 12px;
 }
 
 #window {
     color: @text;
     background: @mantle;
-    margin: 5px 0;
-    padding: 0 16px;
+    margin: 4px 0;
+    padding: 0 10px;
     border: 1px solid rgba(88, 91, 112, 0.30);
-    border-radius: 14px;
+    border-radius: 12px;
 }
 
 /* Prevent an empty rounded pill when the workspace has no focused window. */
@@ -112,17 +113,17 @@ window#waybar.empty #window {
 /* Collapsed resource drawer: one pill that expands to the left on hover. */
 #resources {
     background: @mantle;
-    margin: 5px 0 5px 6px;
+    margin: 4px 0;
     padding: 0 4px;
     border: 1px solid rgba(88, 91, 112, 0.30);
-    border-radius: 14px;
+    border-radius: 12px;
 }
 
 #memory,
 #cpu,
 #disk {
     background: transparent;
-    padding: 0 8px;
+    padding: 0 6px;
 }
 
 #memory {
@@ -154,12 +155,10 @@ window#waybar.empty #window {
 #custom-notification,
 #clock {
     background: @mantle;
-    margin-top: 5px;
-    margin-bottom: 5px;
-    margin-left: 6px;
-    padding: 0 12px;
+    margin: 4px 0;
+    padding: 0 10px;
     border: 1px solid rgba(88, 91, 112, 0.30);
-    border-radius: 14px;
+    border-radius: 12px;
 }
 
 #pulseaudio {
@@ -177,8 +176,6 @@ window#waybar.empty #window {
 
 #tray {
     color: @subtext1;
-    padding-left: 10px;
-    padding-right: 10px;
 }
 
 #tray > .needs-attention {
@@ -188,6 +185,7 @@ window#waybar.empty #window {
 
 #custom-notification {
     color: @mauve;
+    font-size: 16px;
 }
 
 #custom-notification:hover {
@@ -204,3 +202,11 @@ window#waybar.empty #window {
     color: @crust;
     background: @blue;
 }
+
+/* =============================================================================
+ * Local overrides
+ * ============================================================================= */
+/* local.css is yours: the installer creates it once and never replaces it.
+ * GTK reads it last, so every rule it sets wins. Leave the file in place even
+ * when it is empty; GTK discards the whole stylesheet if an import is missing. */
+@import "local.css";

@@ -194,12 +194,11 @@ poll_parent_locked() {
 
 # Polling is skipped entirely while the user is typing, which is also when the
 # inbound direction is least useful: text copied on Windows is picked up on the
-# first poll after the session goes quiet again.
+# first poll after the session goes quiet again. A gate that had to be given up
+# stops the automatic reads rather than releasing them; `sync` stays available.
 poll_parent_when_idle() {
     [[ "$MODE" == both ]] || return 0
-    if (( GATED && ! IDLE )); then
-        return 0
-    fi
+    (( GATED && IDLE )) || return 0
     poll_parent
 }
 
