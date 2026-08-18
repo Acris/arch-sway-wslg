@@ -13,14 +13,15 @@
 # which is also why the direction and the interval are configurable.
 #
 # Such a read has to take focus on the parent compositor, so it only happens
-# while the session reports no input activity. Sway starts swayidle, which tells
-# the bridge when that changes through `__idle idle` and `__idle active`.
+# while the session reports no input activity. The bridge starts swayidle itself
+# and supervises it, so the gate cannot outlive or silently outlast the bridge.
 set -Eeuo pipefail
 umask 077
 
 NAME="arch-sway-wslg"
 SELF="$(readlink -f "$0")"
 PARENT_DISPLAY="/mnt/wslg/runtime-dir/wayland-0"
+NESTED_DISPLAY="${ARCH_SWAY_WSLG_NESTED_DISPLAY:-${WAYLAND_DISPLAY:-}}"
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 STATE_DIR="$RUNTIME_BASE/$NAME/clipboard"
 BRIDGE_LOCK="$STATE_DIR/bridge.lock"
@@ -41,15 +42,22 @@ MODE="${ARCH_SWAY_WSLG_CLIPBOARD:-both}"
 # One second stays below what is noticeable between a copy on Windows and the
 # switch back into the session; below the floor the reads start to overlap.
 POLL_INTERVAL="${ARCH_SWAY_WSLG_CLIPBOARD_POLL:-1.0}"
-POLL_INTERVAL_MIN="0.2"
+POLL_INTERVAL_MIN_MS=200
 PARENT_READ_TIMEOUT="3s"
 
 # A read on the parent takes keyboard focus away from the nested session, and
 # wlroots replays the keys that were held when focus returns, so a poll that
-# overlaps typing duplicates or drops characters. swayidle drives the two signals
-# below, which gate the polling on the session being idle. Nothing is read until
-# swayidle reports the first idle period, which arrives within its timeout.
+# overlaps typing duplicates or drops characters. swayidle reports the two
+# transitions as signals, which gate the polling on the session being quiet, and
+# the quiet period is what actually decides the inbound latency.
+IDLE_TIMEOUT="${ARCH_SWAY_WSLG_CLIPBOARD_IDLE:-2}"
+# `sync` is meant to be pressed, so it waits for the keys to be released before
+# the read takes focus; otherwise the read itself replays the shortcut.
+MANUAL_SYNC_DELAY="0.3"
 IDLE=0
+IDLE_PID=""
+IDLE_RESTARTS=0
+GATED=1
 
 WATCHER_PID=""
 
@@ -57,14 +65,13 @@ note() { printf '%s\n' "clipboard: $*"; }
 warn() { printf 'WARNING: clipboard: %s\n' "$*" >&2; }
 die() { printf 'ERROR: clipboard: %s\n' "$*" >&2; exit 1; }
 
-# Milliseconds are precise enough to compare the interval against its floor and
-# keep the check inside Bash. The caller validates the number format first.
+# Fixed-point milliseconds keep the floor check inside Bash. The caller
+# validates the number format first.
 interval_ms() {
-    local value="$1"
-    local whole="${value%%.*}" frac="000"
+    local whole="${1%%.*}" frac="000"
 
-    [[ "$value" == *.* ]] && frac="${value#*.}000"
-    printf '%d' "$(( 10#${whole:-0} * 1000 + 10#${frac:0:3} ))"
+    [[ "$1" == *.* ]] && frac="${1#*.}000"
+    printf '%d' "$(( 10#$whole * 1000 + 10#${frac:0:3} ))"
 }
 
 # ---------------------------------------------------------------------------
@@ -87,22 +94,25 @@ publish_selection() {
         return 0
     fi
 
-    printf '%s' "$hash" > "$MIRROR_FILE"
+    # The hash is recorded only once the peer really holds the text. A hash
+    # written for a failed copy would mark that text as already mirrored and
+    # suppress every later attempt at it. Echoes stay suppressed regardless:
+    # the peer cannot report the new selection before this lock is released.
     copy_selection "$direction" < "$payload" || {
         warn "failed to publish text ($direction)"
         return 1
     }
+    printf '%s' "$hash" > "$MIRROR_FILE"
 }
 
 copy_selection() {
+    local display
     case "$1" in
-        to-parent)
-            WAYLAND_DISPLAY="$PARENT_DISPLAY" wl-copy --type "$COPY_TYPE"
-            ;;
-        to-sway)
-            WAYLAND_DISPLAY="$ARCH_SWAY_WSLG_NESTED_DISPLAY" wl-copy --type "$COPY_TYPE"
-            ;;
+        to-parent) display="$PARENT_DISPLAY" ;;
+        to-sway)   display="$NESTED_DISPLAY" ;;
+        *)         return 1 ;;
     esac
+    WAYLAND_DISPLAY="$display" wl-copy --type "$COPY_TYPE"
 }
 
 # Entry point for the nested watcher; one instance runs per selection change.
@@ -187,15 +197,75 @@ poll_parent_locked() {
 # first poll after the session goes quiet again.
 poll_parent_when_idle() {
     [[ "$MODE" == both ]] || return 0
-    (( IDLE )) || return 0
+    if (( GATED && ! IDLE )); then
+        return 0
+    fi
     poll_parent
+}
+
+# Pressing the shortcut is an explicit request, so it reads the parent even
+# while the session is busy; the caller has just decided that a paste matters
+# more than a moment of focus loss.
+manual_sync() {
+    [[ "$MODE" != off ]] || die "bridging is disabled by ARCH_SWAY_WSLG_CLIPBOARD=off"
+    [[ -d "$STATE_DIR" && -r "$PID_FILE" ]] || die "the clipboard bridge is not running"
+    [[ -n "$NESTED_DISPLAY" ]] || die "this command must run inside the Sway session"
+    sleep "$MANUAL_SYNC_DELAY"
+    poll_parent
+}
+
+# ---------------------------------------------------------------------------
+# Idle gating
+# ---------------------------------------------------------------------------
+# swayidle is a child of the bridge, so it shares its lifetime, needs no PID
+# file, and its failures are visible here instead of in the Sway configuration.
+start_idle_notifier() {
+    [[ "$MODE" == both ]] || return 0
+
+    swayidle -w \
+        timeout "$IDLE_TIMEOUT" "kill -USR1 $$" \
+        resume "kill -USR2 $$" >/dev/null 2>&1 &
+    IDLE_PID=$!
+    IDLE=0
+}
+
+stop_idle_notifier() {
+    [[ "$IDLE_PID" =~ ^[0-9]+$ ]] || return 0
+    kill "$IDLE_PID" 2>/dev/null || true
+    wait "$IDLE_PID" 2>/dev/null || true
+    IDLE_PID=""
+}
+
+# Without the gate the inbound reads would type into whatever the user is
+# writing, so a notifier that keeps dying disables that direction instead of
+# being ignored. `sync` still works, and the state is reported by the launcher.
+supervise_idle_notifier() {
+    [[ "$MODE" == both ]] || return 0
+    (( GATED )) || return 0
+    [[ "$IDLE_PID" =~ ^[0-9]+$ ]] || return 0
+    if kill -0 "$IDLE_PID" 2>/dev/null; then
+        return 0
+    fi
+
+    wait "$IDLE_PID" 2>/dev/null || true
+    IDLE_PID=""
+    IDLE_RESTARTS=$((IDLE_RESTARTS + 1))
+    if (( IDLE_RESTARTS > MAX_RESTARTS )); then
+        GATED=0
+        IDLE=0
+        warn "swayidle kept exiting; the Windows clipboard is no longer read automatically"
+        warn "press the clipboard sync shortcut when you need it, or restart the session"
+        return 0
+    fi
+    warn "swayidle exited; restarting ($IDLE_RESTARTS/$MAX_RESTARTS)"
+    start_idle_notifier
 }
 
 # ---------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------
 nested_display_alive() {
-    local socket="$ARCH_SWAY_WSLG_NESTED_DISPLAY"
+    local socket="$NESTED_DISPLAY"
     [[ "$socket" == /* ]] || socket="$RUNTIME_BASE/$socket"
     [[ -S "$socket" ]]
 }
@@ -224,6 +294,7 @@ stop_watcher() {
 cleanup() {
     trap - EXIT INT TERM HUP
     stop_watcher
+    stop_idle_notifier
     clear_state
     rm -f -- "$PID_FILE"
 }
@@ -238,8 +309,11 @@ run_bridge() {
     esac
     [[ "$POLL_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || \
         die "invalid ARCH_SWAY_WSLG_CLIPBOARD_POLL value: $POLL_INTERVAL"
-    (( $(interval_ms "$POLL_INTERVAL") >= $(interval_ms "$POLL_INTERVAL_MIN") )) || \
-        die "ARCH_SWAY_WSLG_CLIPBOARD_POLL must be at least ${POLL_INTERVAL_MIN} seconds: $POLL_INTERVAL"
+    (( $(interval_ms "$POLL_INTERVAL") >= POLL_INTERVAL_MIN_MS )) || \
+        die "ARCH_SWAY_WSLG_CLIPBOARD_POLL must be at least ${POLL_INTERVAL_MIN_MS}ms: $POLL_INTERVAL"
+    if [[ ! "$IDLE_TIMEOUT" =~ ^[0-9]+$ ]] || (( IDLE_TIMEOUT < 1 )); then
+        die "ARCH_SWAY_WSLG_CLIPBOARD_IDLE must be a whole number of seconds, at least 1: $IDLE_TIMEOUT"
+    fi
     if [[ "$MODE" == off ]]; then
         note "bridging disabled by ARCH_SWAY_WSLG_CLIPBOARD=off"
         return 0
@@ -252,7 +326,7 @@ run_bridge() {
     exec 8>"$BRIDGE_LOCK"
     flock -n 8 || exit 0
 
-    export ARCH_SWAY_WSLG_NESTED_DISPLAY="$WAYLAND_DISPLAY"
+    export ARCH_SWAY_WSLG_NESTED_DISPLAY="$NESTED_DISPLAY"
     printf '%s\n' "$$" > "$PID_FILE"
     trap cleanup EXIT
     trap 'cleanup; exit 0' INT TERM HUP
@@ -260,9 +334,11 @@ run_bridge() {
     trap 'IDLE=0' USR2
 
     case "$MODE" in
-        both)       note "mirroring text both ways; the parent side is polled every ${POLL_INTERVAL}s while the session is idle" ;;
+        both)       note "mirroring text both ways; the parent side is read every ${POLL_INTERVAL}s after ${IDLE_TIMEOUT}s without input" ;;
         to-windows) note "forwarding text to Windows only" ;;
     esac
+
+    start_idle_notifier
 
     local restarts=0
     while true; do
@@ -270,6 +346,7 @@ run_bridge() {
         while kill -0 "$WATCHER_PID" 2>/dev/null; do
             sleep "$POLL_INTERVAL" || true
             [[ -S "$PARENT_DISPLAY" ]] || break
+            supervise_idle_notifier
             poll_parent_when_idle
         done
         stop_watcher
@@ -288,25 +365,9 @@ run_bridge() {
     done
 }
 
-# swayidle runs the bridge itself rather than a bare kill, so the signal name
-# and the PID file stay an implementation detail of this script.
-signal_idle() {
-    local signal pid
-    case "${1:-}" in
-        idle)   signal=USR1 ;;
-        active) signal=USR2 ;;
-        *)      die "unknown idle state: ${1:-}" ;;
-    esac
-
-    [[ -r "$PID_FILE" ]] || return 0
-    pid="$(<"$PID_FILE")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-    kill -"$signal" "$pid" 2>/dev/null || true
-}
-
 case "${1:-}" in
     '')       run_bridge ;;
+    sync)     manual_sync ;;
     __mirror) mirror_selection "${2:-}" ;;
-    __idle)   signal_idle "${2:-}" ;;
     *)        die "unknown argument: $1" ;;
 esac

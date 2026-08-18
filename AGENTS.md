@@ -8,7 +8,7 @@ Arch Linux. It is not a general bare-metal Sway distribution, and the supported 
 - Arch Linux under WSL2 with WSLg enabled.
 - The official systemd-based Arch WSL setup, including a working systemd user manager.
 - A normal default WSL user with working `sudo` and `paru`.
-- At least one generated non-`C` locale; no particular locale is required.
+- No locale requirement: the project neither checks nor writes locales, and `C.UTF-8` is as acceptable as any other.
 
 `README.md` is the user-facing contract. `README_CN.md` is its Chinese translation and must stay section-for-section
 equivalent whenever installation, runtime, or troubleshooting behavior changes.
@@ -17,7 +17,7 @@ equivalent whenever installation, runtime, or troubleshooting behavior changes.
 
 | Path                             | Role                                                                         |
 |----------------------------------|------------------------------------------------------------------------------|
-| `install.sh`                     | Prompts, package installation, backup, staged payload transaction, GSettings |
+| `install.sh`                     | Prompts, package installation, backup, staged payload replacement, GSettings |
 | `.local/bin/arch-sway-wslg`      | Public launcher and session lifecycle manager                                |
 | `.local/libexec/arch-sway-wslg/` | Private helpers started by the session, currently the clipboard bridge       |
 | `.config/`                       | Configuration payload installed under the user's XDG config root             |
@@ -81,17 +81,23 @@ These are the guarantees the project makes. Implementations may change as long a
   process tree gets a private `01777` X11 socket directory in its own mount namespace.
 - XWayland stays lazy: a display is reserved, but XWayland starts with the first X11 client.
 - User renderer and toolkit overrides are preserved. The launcher may unset `WLR_BACKENDS` to guarantee nested-Wayland
-  backend selection, and it sets Qt, browser, and VS Code hints only when the user has not already set them.
-- Between one and four nested outputs are supported through `--outputs` / `ARCH_SWAY_WSLG_OUTPUTS`. Portals, Flatpak
+  backend selection, and it sets Qt, Java, browser, and VS Code hints only when the user has not already set them.
+  Values the session decides, such as its runtime directory, display, desktop identity, and audio endpoint, always
+  replace an inherited one.
+- Between one and four nested outputs are supported through `--outputs` / `ARCH_SWAY_WSLG_OUTPUTS`, and the count is
+  validated wherever it enters, including the environment variable and the inner session process. Portals, Flatpak
   integration, screen sharing, moving WSLg windows from Linux, and automatic restart after an outer WSLg failure are out
   of scope.
+- `status` reports the observable session state, including whether the clipboard bridge reads the Windows clipboard
+  automatically, and `doctor` reports every command the session cannot work without, including the applications the Sway
+  configuration starts.
 - Every wait around systemd, WSLg, IPC, locks, or the clipboard is bounded.
 
 ### Installer
 
 - The installer runs as the normal user; package changes are delegated to `paru`, which may request sudo.
-- Preflight checks cover only actual prerequisites and the payload the installer needs.
-- Any generated non-`C` locale is accepted; no locale is required, selected, or written.
+- Preflight checks cover only actual prerequisites and the payload the installer needs: a command is checked only if the
+  installer or the session really runs it.
 - The Sway output scale is answered once, between `1` and `4` with decimals allowed, and defaults to `1`. It is not
   detected: WSLg scales the factors Wayland cannot express on the Windows side and keeps advertising scale 1 on its
   parent output. Users change it afterwards in their own Sway override files.
@@ -99,12 +105,15 @@ These are the guarantees the project makes. Implementations may change as long a
   paths are rendered into the staged payload through markers.
 - The bundled wallpaper comes from `orangci/walls-catppuccin-mocha`, is managed with the Sway directory, and keeps its
   separate license notice.
-- Managed config directories are replaced exactly, with same-filesystem staging, payload checks before any replacement,
-  and reverse-order rollback on failure or signal.
+- Managed config directories are replaced exactly, with same-filesystem staging and payload checks before anything is
+  replaced. Each replacement moves the previous path aside first, so a failing rename puts it back, and directories are
+  replaced whole so files from an earlier release cannot survive.
 - The user's override paths (`sway/config.d`, `foot/local.ini`, `fuzzel/local.ini`) survive every installation and are
   seeded with commented examples on a first run.
-- The previous managed state is copied to a timestamped backup before anything is replaced.
-- The launcher control lock is held only around the payload transaction, never across package installation.
+- A timestamped backup of the previous managed state is offered on every run, defaults to yes, and is the documented
+  recovery path; there is no second recovery mechanism for the same failure.
+- A choice that can be revoked, such as declining a browser, also removes what an earlier run recorded for it.
+- The launcher control lock is held only around the payload replacement, never across package installation.
 - The installer prints current and proposed GTK settings and asks before changing GSettings, defaulting to applying
   them, and writes and reads back approved values through the persistent systemd user bus after the payload commits.
 
@@ -115,19 +124,20 @@ These are the guarantees the project makes. Implementations may change as long a
 - WSLg already mirrors its own Wayland clipboard to and from Windows, so the bridge mirrors text between the nested
   session and the parent WSLg socket and requires no Windows helper process.
 - Echo suppression and parent change detection are serialized under one lock, so a forwarded selection can never loop
-  back, and a parent value read while an outgoing selection is still taking effect is not mistaken for a new copy.
+  back, a parent value read while an outgoing selection is still taking effect is not mistaken for a new copy, and text
+  is only recorded as mirrored once the peer really holds it.
 - Sway implements data-control, so the nested selection is watched through events. WSLg's Weston implements no
-  data-control protocol, so the parent side is polled with one-shot reads instead. Because such a read briefly takes
-  focus on the parent compositor, the inbound direction and the interval stay configurable, and the interval is rejected
-  below an explicit floor rather than merely being non-zero.
-- A parent read happens under the shared lock, so it is bounded by its own timeout: a compositor that never focuses the
-  temporary surface costs one skipped poll instead of stalling the outgoing direction as well.
-- A parent read must never overlap user input. Taking focus on the parent makes wlroots replay the keys held at that
-  moment, which duplicates or drops characters, so reads happen only while the session reports no input activity. The
-  idle notifier is a session prerequisite, and the idle state lives in the bridge process and is signalled to it,
-  without any additional state file.
+  data-control protocol, so the parent side is read with one-shot reads under the same lock, each bounded by its own
+  timeout, and the interval is configurable but rejected below an explicit floor.
+- A parent read must never overlap user input: taking focus on the parent makes wlroots replay the keys held at that
+  moment, which duplicates or drops characters. Reads therefore happen only after a configurable quiet period, the
+  bridge owns and supervises the idle notifier that reports it, the idle state lives in the bridge process without any
+  state file, and a notifier that cannot be kept running disables the inbound direction loudly instead of silently
+  reading during input.
+- Because automatic reads wait for quiet, an explicit user-triggered read is always available and is not gated.
 - Sway starts the bridge, so it inherits the nested display and belongs to the session scope.
-- Worker restarts are bounded, and an unhealthy outer WSLg compositor never triggers an unbounded restart loop.
+- Every restart, of the nested watcher or of the idle notifier, is bounded, and an unhealthy outer WSLg compositor never
+  triggers an unbounded restart loop.
 
 ### Configuration payload
 
@@ -158,9 +168,24 @@ These are the guarantees the project makes. Implementations may change as long a
 ## Change checklist
 
 - Inspect the existing worktree first and preserve unrelated user changes.
-- Keep the launcher's required-command list aligned with what start, stop, clipboard, and doctor actually use.
-- Keep `VERSION` current; the launcher receives it through marker rendering, so it is never hard-coded twice.
-- Update both READMEs for user-visible changes and delete stale claims instead of documenting code that no longer
-  exists.
+- Keep the launcher's required-command list aligned with what start, stop, clipboard, and doctor actually use, and the
+  installer's preflight list aligned with what the installer itself runs.
+- Keep `VERSION` current; the launcher receives it through marker rendering, so it is never hard-coded twice. A change
+  to the package lists is user-visible: bump `VERSION` and update the uninstall lists in both READMEs with it.
+- Update both READMEs for user-visible changes, English first and the Chinese translation section-for-section after it,
+  and delete stale claims instead of documenting code that no longer exists.
 - Preserve the contracts above unless the user explicitly changes them.
 - Run the static checks and report exactly which ones were performed.
+
+## Commit conventions
+
+- Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for the subject line:
+  `<type>[optional scope]: <description>`, imperative mood, lower case after the colon, no trailing period, 72
+  characters at most.
+- Types in use: `feat`, `fix`, `refactor`, `perf`, `docs`, `style`, `chore`. Scopes match the repository layout:
+  `installer`, `launcher`, `clipboard`, `config`, `docs`.
+- Explain why in the body, wrapped at 100 characters, and group larger changes under the subsystem headings the change
+  touches rather than listing files.
+- Mark a broken contract with `!` after the type or a `BREAKING CHANGE:` footer, and say what users must redo, such as
+  rerunning `./install.sh` or restarting the session.
+- Do not commit unless the user asks for it.

@@ -13,9 +13,8 @@ Linux，并不打算成为通用的裸机 Sway 发行配置。
 - Waybar、SwayNC、Fuzzel、Foot、swaynag、nwg-look 与 Yazi
 - 整个桌面统一使用 Catppuccin Mocha 配色
 - 界面使用 Sarasa UI SC，终端使用 Maple Mono NF CN
-- 与 Windows 之间自动同步 UTF-8 纯文本剪贴板
+- 与 Windows 之间自动同步 UTF-8 纯文本剪贴板，并带有门控，绝不干扰打字
 - 最多四个嵌套输出，每个都是独立的 WSLg 窗口
-- 输出缩放在安装时询问一次，之后可随时覆盖
 - 你的个人设置放在自定义覆盖文件中，更新永不触碰
 - 可自行选择浏览器，并在会话内接入 `BROWSER`
 - 集成 WSLg PulseAudio
@@ -32,7 +31,8 @@ Linux，并不打算成为通用的裸机 Sway 发行配置。
 2. 有一个普通用户被配置为 WSL 默认用户，且 `sudo` 可用。
 3. 已启用 systemd，并且该普通用户的 systemd 用户管理器工作正常。
 4. 按照 [ArchWiki 的 locale 说明](https://wiki.archlinux.org/title/Locale)
-   生成至少一个非 `C` 的 locale。不要求使用特定 locale。
+   配置 locale。不要求使用特定 locale，安装脚本既不检查也不写入 locale，但强烈建议使用 UTF-8 locale：状态栏、启动器与 Yazi
+   都会显示非 ASCII 文本。
 5. 已配置 WSLg 硬件加速。请保持 Windows 与宿主 GPU 驱动为最新版本。
 6. 为该普通用户安装 `base-devel`、Git 与 `paru`。
 
@@ -72,11 +72,11 @@ cd arch-sway-wslg
 - 询问安装哪个浏览器：Firefox（默认）、Chromium、Google Chrome、Microsoft Edge，或不安装；已经安装的浏览器会标注
   `[installed]`，选中后只接入 `BROWSER`，不会重复安装；
 - 询问 Sway 输出缩放（1 到 4，可含小数）；
+- 询问是否把当前的托管文件复制到 `~/.local/state/arch-sway-wslg/backups/<timestamp>`，默认为“是”；
 - 询问后停止正在运行的托管会话；
 - 更新 Arch、安装引导所需的提供者，然后安装桌面组件与所选浏览器（若该浏览器已安装则跳过）；
 - 打印当前与建议的 GTK 外观设置，并在修改前询问；
-- 将此前的状态复制到 `~/.local/state/arch-sway-wslg/backups/<timestamp>`；
-- 暂存整个载荷、检查后再切换生效，任何失败都会回滚。
+- 暂存整个载荷并完成检查，之后才替换任何内容。
 
 然后启动会话：
 
@@ -112,7 +112,8 @@ Sway 可以驱动多个嵌套输出。每个输出都是独立的顶层 WSLg 窗
 arch-sway-wslg start --outputs 2
 ```
 
-`ARCH_SWAY_WSLG_OUTPUTS=2 arch-sway-wslg start` 效果相同。输出依次命名为 `WL-1`、`WL-2` 等。 在你自己的配置中把工作区绑定到它们，例如写在
+`ARCH_SWAY_WSLG_OUTPUTS=2 arch-sway-wslg start` 效果相同；两种形式都只接受 1 到 4 的整数，其他任何值都会被拒绝。输出依次命名为
+`WL-1`、`WL-2` 等。在你自己的配置中把工作区绑定到它们，例如写在
 `~/.config/sway/config.d/10-local.conf`：
 
 ```
@@ -145,7 +146,7 @@ bindsym $mod+p exec firefox
 ```
 
 Waybar、SwayNC、swaynag 与 Yazi 没有类似的 include 机制，所以 `~/.config/waybar`、`~/.config/swaync`、
-`~/.config/swaynag` 与 `~/.config/yazi` 完全由项目托管。请把这些文件的个人版本保存在托管目录之外，或者从安装脚本在每次更新前写入的备份中恢复。
+`~/.config/swaynag` 与 `~/.config/yazi` 完全由项目托管。请把这些文件的个人版本保存在托管目录之外，或者接受安装脚本在每次更新前提供的备份，再从其中拷回。
 
 以下目录会被替换（这里显示的是默认根目录；绝对路径的 `$XDG_CONFIG_HOME` 会替代 `~/.config`）：
 
@@ -161,16 +162,25 @@ Waybar、SwayNC、swaynag 与 Yazi 没有类似的 include 机制，所以 `~/.c
 
 ## 会话环境
 
-启动器为托管会话导出以下值，并且绝不覆盖你已经设置过的值：
+以下提示只在你自己没有设置过时才会被设置，因此你自己的值总是优先：
 
 | 变量                                  | 值            | 原因                                         |
 |---------------------------------------|---------------|----------------------------------------------|
 | `QT_QPA_PLATFORM`                     | `wayland;xcb` | Qt 5 从不自行选择 Wayland；保留 xcb 作为回退 |
 | `QT_WAYLAND_DISABLE_WINDOWDECORATION` | `1`           | 边框由 Sway 绘制，Qt 不应再画一套自己的      |
 | `DONT_PROMPT_WSL_INSTALL`             | `1`           | 阻止 VS Code 在 Sway 里建议改用 Windows 版本 |
+| `_JAVA_AWT_WM_NONREPARENTING`         | `1`           | 没有它时 Swing 与 JetBrains IDE 会渲染出灰窗 |
 | `BROWSER`                             | 你的选择      | `xdg-open` 把 Sway 视为通用桌面并遵循该变量  |
-| `WLR_WL_OUTPUTS`                      | `--outputs N` | 仅在请求多个嵌套输出时导出                   |
-| `PULSE_SERVER`                        | WSLg 套接字   | 音频始终送往 WSLg PulseAudio 端点            |
+
+以下值由会话自己决定，并且总是覆盖继承来的值，因为过期的值会让会话无法工作：
+
+| 变量                                      | 值                      | 原因                              |
+|-------------------------------------------|-------------------------|-----------------------------------|
+| `XDG_RUNTIME_DIR`                         | `/run/user/$UID`        | 会话从不使用 WSLg 共享的运行时    |
+| `WAYLAND_DISPLAY`、`SWAYSOCK`             | 父级套接字，随后由 Sway | Sway 会用它的嵌套值替换它们       |
+| `XDG_SESSION_TYPE`、`XDG_CURRENT_DESKTOP` | `wayland`、`sway`       | 工具包与 `xdg-open` 的桌面探测    |
+| `WLR_WL_OUTPUTS`                          | `--outputs N`           | 仅在请求多个输出时设置            |
+| `PULSE_SERVER`                            | WSLg 套接字             | 音频始终送往 WSLg PulseAudio 端点 |
 
 同时安装 `qt5-wayland` 与 `qt6-wayland`，让两代 Qt 都有可用的 Wayland 平台插件。较新的 Firefox 与 Chromium 版本默认选择
 Wayland，因此不为它们设置额外参数。
@@ -185,6 +195,7 @@ Wayland，因此不为它们设置额外参数。
 | `Alt+Enter`                  | 打开 Foot                  |
 | `Alt+D`                      | 打开 Fuzzel                |
 | `Alt+Y`                      | 在 Foot 中打开 Yazi        |
+| `Alt+Shift+V`                | 立即读取 Windows 剪贴板    |
 | `Alt+H/J/K/L` 或方向键       | 移动焦点                   |
 | `Alt+Shift+H/J/K/L` 或方向键 | 移动聚焦的容器             |
 | `Alt+1..0`                   | 切换到工作区 1–10          |
@@ -215,18 +226,24 @@ UTF-8 纯文本，这已足以让 Sway 中的 `Ctrl+C` 能在 Windows 中粘贴�
 - 桥接由 Sway 启动，因此与会话同生共死。
 
 两个方向的工作方式并不相同。Sway 实现了 wlroots 的 data-control 协议，因此会话内的复制会在发生的瞬间被转发。WSLg 的 Weston
-完全没有实现任何 data-control 协议，因此外层剪贴板无法通过事件监听，只能每秒读取一次，且每次读取都有 3 秒超时上限。
+完全没有实现任何 data-control 协议，因此外层剪贴板无法通过事件监听，只能改用一次性读取：每秒一次，且每次读取都有 3 秒超时上限。
 
 这样的读取必须在 WSLg 上打开一个 1 像素的 surface，会把键盘焦点从会话短暂夺走。焦点回来时 wlroots
-会把当时按住的键重放一遍，因此与打字重叠的读取会造成字符重复或丢失。为此桥接只在会话空闲时读取外层剪贴板；空闲状态由 Sway
-与桥接一同启动的 `swayidle` 通过两个信号告知，不产生任何额外文件。它等待的 2 秒静止时间，早在你从 Windows
-切回来准备粘贴之前就已经满足，因此实际使用中入向延迟没有变化。
+会把当时按住的键重放一遍，因此与打字重叠的读取会造成字符重复或丢失。为此桥接只在会话两秒没有输入之后才读取外层剪贴板。它自己启动并监督一个
+`swayidle` 来得知这一时刻；如果 `swayidle` 无法保持运行，桥接会在日志中明确说明并停止读取，而不是接着往你的按键里插。
+`arch-sway-wslg status` 会报告桥接处于这两种状态中的哪一种。
 
-如果入向方向仍然影响你，可以调大间隔或彻底关闭它：
+这也意味着在 Windows 上复制的文本会在会话静止之后才到达，而不是在你工作的过程中。想要立即拿到时，按
+`Alt+Shift+V`：无论会话正在做什么，它都会当场读取 Windows 剪贴板。
+
+下面三个变量由桥接读取，而桥接由 Sway 启动，因此请在 `arch-sway-wslg start` **之前** export； 在会话内的终端里设置它们没有任何效果：
 
 ```bash
-# 降低读取 Windows 剪贴板的频率；小于 0.2 秒的值会被拒绝
+# 降低读取 Windows 剪贴板的频率；小于 200ms 的值会被拒绝
 export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
+
+# 读取前等待更长的会话静止时间（整秒，最小 1）
+export ARCH_SWAY_WSLG_CLIPBOARD_IDLE=5
 
 # 只转发 Sway -> Windows，不再读取 Windows 剪贴板
 export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
@@ -235,8 +252,8 @@ export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
 export ARCH_SWAY_WSLG_CLIPBOARD=off
 ```
 
-即使关闭了入向方向，在会话内的任何终端里执行 `WAYLAND_DISPLAY=/mnt/wslg/runtime-dir/wayland-0 wl-paste`
-仍可按需读取 Windows 剪贴板。
+入向方向被关闭后，`Alt+Shift+V` 也不再工作，但在会话内的任何终端里执行
+`WAYLAND_DISPLAY=/mnt/wslg/runtime-dir/wayland-0 wl-paste` 仍可按需读取 Windows 剪贴板。
 
 若要包含敏感选区，请在启动 Sway 之前导出下面的变量；对密码管理器不建议这样做：
 
@@ -247,7 +264,7 @@ arch-sway-wslg start
 
 ## Waybar 布局
 
-状态栏右侧保留四个胶囊：资源、音量、托盘、通知与时钟。内存占用始终可见；把鼠标悬停在上面会滑出 CPU
+状态栏右侧保留五个胶囊：资源、音量、托盘、通知与时钟。内存占用始终可见；把鼠标悬停在上面会滑出 CPU
 与磁盘占用，这样既能看到系统信息，又不会让状态栏过于拥挤。
 
 ## 外观
@@ -294,9 +311,12 @@ git pull --ff-only
 ./install.sh
 ```
 
-每次运行都会在替换任何内容之前，把此前的托管状态复制到 `~/.local/state/arch-sway-wslg/backups/<timestamp>`
+每次运行都会在替换任何内容之前，询问是否把此前的托管状态复制到 `~/.local/state/arch-sway-wslg/backups/<timestamp>`
 ，每个备份都包含一个写明确切恢复命令的
 `RESTORE-INFO.txt`。旧备份永远不会被自动删除；不再需要的请自行移除。
+
+一次更新可能会引入上一个版本不需要的软件包，因此请重新回答安装脚本的提问，不要假定软件包集合没有变化，之后用
+`arch-sway-wslg restart` 重启会话。
 
 ## 卸载
 
@@ -315,6 +335,10 @@ paru -Rns sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look 
   ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
   ttf-nerd-fonts-symbols-mono wl-clipboard xdg-utils jack2
 ```
+
+如果 pacman 因为你要保留的某个东西仍然依赖该列表中的包而拒绝执行，请把那个包从命令中去掉再重新运行。例如保留
+Chromium、Chrome 或 Edge 会让 `xdg-utils` 仍然被需要，保留 Firefox 会让某个字体包作为它的 `ttf-font`
+提供者仍然被需要。
 
 `jack2` 只是作为 Waybar 的 JACK 提供者被安装，`oo7` 只在没有其他 Secret Service 后端时才安装；如果安装脚本跳过了它们，它们就不存在。可选的
 Yazi 辅助工具（`fd`、`ripgrep`、`fzf`、`zoxide`、`jq`、`7zip`、
@@ -342,13 +366,14 @@ dconf 中；用 `gsettings reset-recursively org.gnome.desktop.interface` 重置
 arch-sway-wslg doctor
 ```
 
-`doctor` 会检查 systemd 用户管理器与运行时、所需命令、剪贴板桥接、WSLg 映射、Sway 配置是否可读以及音频连通性。它从不请求
-sudo，也不改动挂载状态。
+`doctor` 会检查 systemd 用户管理器与运行时、会话所需的每一个命令（合成器、空闲通知器、`wl-clipboard`，以及 Sway
+配置启动的那些应用）、剪贴板桥接、WSLg 映射、Sway 配置是否可读以及音频连通性。它从不请求 sudo，也不改动挂载状态。
 
 如果 WSLg 的 Wayland、PulseAudio 或 X11 映射缺失，请关闭 WSL 并在 Windows 中执行 `wsl --shutdown`，然后再试。
 
-如果按一次键却输入了两个字符，说明外层剪贴板正在你打字时被读取。请检查 Sway 配置中是否仍保留着用于门控这些读取的
-`exec swayidle` 那一行；用 `ARCH_SWAY_WSLG_CLIPBOARD=to-windows` 启动会话可以直接停止它们。
+如果按一次键却输入了两个字符，说明外层剪贴板正在你打字时被读取。请执行
+`arch-sway-wslg status`：剪贴板那一行会说明这些读取是否以会话空闲为前提进行门控。如果没有，请在
+`arch-sway-wslg logs` 中查找 `swayidle` 警告，或者用 `ARCH_SWAY_WSLG_CLIPBOARD=to-windows` 启动会话，直接停止这些读取。
 
 宿主休眠、网络变化、显示器或任务栏变化，以及 WSLg Weston 故障，都可能中断父级 Wayland 连接，从而终止嵌套的 Sway 会话。启动器会清理托管的
 cgroup，但不会在父合成器不健康时自动重启 Sway。请检查 `/mnt/wslg/weston.log` 与

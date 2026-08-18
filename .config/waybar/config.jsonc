@@ -20,7 +20,7 @@
     "clock"
   ],
   // Only memory stays visible; CPU and disk slide out on hover so the right
-  // side keeps four pills instead of six.
+  // side keeps five pills instead of seven.
   "group/resources": {
     "orientation": "horizontal",
     "drawer": {

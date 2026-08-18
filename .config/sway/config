@@ -83,13 +83,10 @@ exec swaync
 # WSLg already mirrors its own Wayland clipboard to and from Windows, so the
 # bridge only has to mirror UTF-8 text between this nested session and the
 # parent WSLg socket. Starting it here gives it the nested WAYLAND_DISPLAY.
+# The bridge starts and supervises swayidle itself: reading the outer clipboard
+# steals keyboard focus for a moment, and wlroots replays held keys when focus
+# returns, so those reads wait for the session to go quiet.
 exec "$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge"
-
-# Reading the outer clipboard takes keyboard focus away from this session for a
-# moment, and wlroots replays held keys when focus returns, which duplicates or
-# drops characters while typing. swayidle therefore tells the bridge when the
-# session is quiet, and the bridge only reads the outer clipboard then.
-exec swayidle -w timeout 2 '"$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge" __idle idle' resume '"$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge" __idle active'
 
 bar {
     # Sway execs this value directly and appends `-b <id>`: no shell, no
@@ -104,6 +101,10 @@ bar {
 bindsym $mod+Return exec $term
 bindsym $mod+d exec $menu
 bindsym $mod+y exec $files
+
+# Read the Windows clipboard right now instead of waiting for the session to go
+# quiet. Useful when you copy on Windows and paste here without a pause.
+bindsym $mod+Shift+v exec "$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge" sync
 
 # One-keystroke terminal splits. Sway owns the tiling; Foot stays minimal.
 bindsym $mod+Ctrl+Return splith, exec $term

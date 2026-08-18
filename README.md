@@ -13,9 +13,8 @@ Linux on WSL and is not intended to be a general bare-metal Sway distribution.
 - Waybar, SwayNC, Fuzzel, Foot, swaynag, nwg-look, and Yazi
 - Catppuccin Mocha styling throughout the desktop
 - Sarasa UI SC for the UI and Maple Mono NF CN for the terminal
-- Automatic UTF-8 plain-text clipboard synchronization with Windows
+- Automatic UTF-8 plain-text clipboard synchronization with Windows, gated so it never interferes with typing
 - Up to four nested outputs, each shown as its own WSLg window
-- Output scale answered once at install time and overridable afterwards
 - Your own settings live in override files that updates never touch
 - A browser of your choice, wired to `BROWSER` inside the session
 - WSLg PulseAudio integration
@@ -33,8 +32,9 @@ first. The installer expects:
 1. Arch Linux running under WSL2 with WSLg enabled.
 2. A normal user configured as the default WSL user, with working `sudo` access.
 3. Systemd enabled, with a working systemd user manager for that normal user.
-4. At least one non-`C` locale generated according to the
-   [ArchWiki locale instructions](https://wiki.archlinux.org/title/Locale). No specific locale is required.
+4. A locale configured according to the [ArchWiki locale instructions](https://wiki.archlinux.org/title/Locale). No
+   specific locale is required and none is checked or written by the installer, but a UTF-8 locale is strongly
+   recommended: the bar, the launcher, and Yazi all display non-ASCII text.
 5. WSLg hardware acceleration configured. Keep Windows and the host GPU driver up to date.
 6. `base-devel`, Git, and `paru` installed for the normal user.
 
@@ -74,12 +74,13 @@ Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer:
 - asks which browser to install: Firefox (default), Chromium, Google Chrome, Microsoft Edge, or none; a browser that is
   already installed is marked `[installed]` and is only wired to `BROWSER`, never reinstalled;
 - asks for the Sway output scale (1 through 4, decimals allowed);
+- asks whether to copy the current managed files to `~/.local/state/arch-sway-wslg/backups/<timestamp>`, defaulting to
+  yes;
 - stops a running managed session after asking;
 - updates Arch, installs the bootstrap providers, then the desktop stack and the chosen browser unless it is already
   installed;
 - prints the current and proposed GTK appearance settings and asks before changing them;
-- copies the previous state to `~/.local/state/arch-sway-wslg/backups/<timestamp>`;
-- stages the whole payload, checks it, then swaps it in, rolling back on any failure.
+- stages the whole payload and checks it before replacing anything.
 
 Then start the session:
 
@@ -117,8 +118,9 @@ different Windows monitor:
 arch-sway-wslg start --outputs 2
 ```
 
-`ARCH_SWAY_WSLG_OUTPUTS=2 arch-sway-wslg start` has the same effect. The outputs are named `WL-1`, `WL-2`, and so on.
-Bind workspaces to them from your own configuration, for example in `~/.config/sway/config.d/10-local.conf`:
+`ARCH_SWAY_WSLG_OUTPUTS=2 arch-sway-wslg start` has the same effect; both forms accept only whole numbers from 1 through
+4 and refuse anything else. The outputs are named `WL-1`, `WL-2`, and so on. Bind workspaces to them from your own
+configuration, for example in `~/.config/sway/config.d/10-local.conf`:
 
 ```
 workspace 1 output WL-1
@@ -154,7 +156,7 @@ bindsym $mod+p exec firefox
 
 Waybar, SwayNC, swaynag, and Yazi have no comparable include mechanism, so `~/.config/waybar`, `~/.config/swaync`,
 `~/.config/swaynag`, and `~/.config/yazi` are fully managed. Keep personal versions of those files outside the managed
-directories, or restore them from the backup the installer writes before every update.
+directories, or accept the backup the installer offers before every update and copy them back from there.
 
 These directories are replaced (the default root is shown; an absolute `$XDG_CONFIG_HOME` replaces `~/.config`):
 
@@ -170,16 +172,25 @@ These directories are replaced (the default root is shown; an absolute `$XDG_CON
 
 ## Session Environment
 
-The launcher exports these values for the managed session and never overrides a value you already set:
+These hints are only set when you have not set them yourself, so your own values always win:
 
 | Variable                              | Value         | Why                                                          |
 |---------------------------------------|---------------|--------------------------------------------------------------|
 | `QT_QPA_PLATFORM`                     | `wayland;xcb` | Qt 5 never selects Wayland on its own; xcb stays as fallback |
 | `QT_WAYLAND_DISABLE_WINDOWDECORATION` | `1`           | Sway draws the borders, so Qt should not add its own         |
 | `DONT_PROMPT_WSL_INSTALL`             | `1`           | Stops VS Code from suggesting the Windows build inside Sway  |
+| `_JAVA_AWT_WM_NONREPARENTING`         | `1`           | Swing and the JetBrains IDEs render grey windows without it  |
 | `BROWSER`                             | your choice   | `xdg-open` treats Sway as a generic desktop and honours it   |
-| `WLR_WL_OUTPUTS`                      | `--outputs N` | Only exported when more than one nested output is requested  |
-| `PULSE_SERVER`                        | WSLg socket   | Audio always goes to the WSLg PulseAudio endpoint            |
+
+These are decided by the session itself and always overwrite an inherited value, because a stale one breaks the session:
+
+| Variable                                  | Value                    | Why                                               |
+|-------------------------------------------|--------------------------|---------------------------------------------------|
+| `XDG_RUNTIME_DIR`                         | `/run/user/$UID`         | The session never uses WSLg's shared runtime      |
+| `WAYLAND_DISPLAY`, `SWAYSOCK`             | parent socket, then Sway | Sway replaces them with its nested values         |
+| `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP` | `wayland`, `sway`        | Toolkit and `xdg-open` desktop detection          |
+| `WLR_WL_OUTPUTS`                          | `--outputs N`            | Only set when more than one output is requested   |
+| `PULSE_SERVER`                            | WSLg socket              | Audio always goes to the WSLg PulseAudio endpoint |
 
 `qt5-wayland` and `qt6-wayland` are installed so both Qt generations have the Wayland platform plugin available. Recent
 Firefox and Chromium releases select Wayland by default; no extra flags are set for them.
@@ -194,6 +205,7 @@ executable name) or export `BROWSER` yourself to change it.
 | `Alt+Enter`                   | Open Foot                                |
 | `Alt+D`                       | Open Fuzzel                              |
 | `Alt+Y`                       | Open Yazi in Foot                        |
+| `Alt+Shift+V`                 | Read the Windows clipboard right now     |
 | `Alt+H/J/K/L` or arrows       | Move focus                               |
 | `Alt+Shift+H/J/K/L` or arrows | Move the focused container               |
 | `Alt+1..0`                    | Switch to workspace 1–10                 |
@@ -226,20 +238,28 @@ mirrors UTF-8 plain text between the nested Sway session and the parent WSLg soc
 
 The two directions do not work the same way. Sway implements the wlroots data-control protocol, so a copy inside the
 session is forwarded the moment it happens. WSLg's Weston implements no data-control protocol at all, so the outer
-clipboard cannot be watched for events and is read once per second instead, with each read bounded by a three-second
-timeout.
+clipboard cannot be watched for events and is read with one-shot reads instead, once per second and each bounded by a
+three-second timeout.
 
 Such a read has to open a one-pixel surface on WSLg, which takes keyboard focus away from the session for a moment.
 wlroots replays the keys that were held when focus comes back, so a read that overlaps typing duplicates or drops
-characters. The bridge therefore reads the outer clipboard only while the session is idle; `swayidle`, which Sway starts
-alongside the bridge, reports that state over two signals and keeps no extra files. The two seconds of quiet it waits
-for have long passed by the time you switch back from Windows to paste, so inbound latency is unchanged in practice.
+characters. The bridge therefore reads the outer clipboard only after two seconds without input. It starts and
+supervises its own `swayidle` to know when that is; if `swayidle` cannot be kept running, the bridge says so in the log
+and stops reading rather than typing into your keystrokes. `arch-sway-wslg status` reports which of the two states the
+bridge is in.
 
-If the inbound direction still gets in the way, raise the interval or drop it entirely:
+That also means text copied on Windows arrives once the session goes quiet, not while you are working. When you want it
+immediately, press `Alt+Shift+V`: it reads the Windows clipboard on the spot, whatever the session is doing.
+
+The three variables below are read by the bridge, which Sway starts, so export them **before** `arch-sway-wslg start`;
+setting them in a terminal inside the session has no effect:
 
 ```bash
-# read the Windows clipboard less often; values below 0.2 seconds are rejected
+# read the Windows clipboard less often; values below 200ms are rejected
 export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
+
+# wait longer for the session to go quiet before reading (whole seconds, minimum 1)
+export ARCH_SWAY_WSLG_CLIPBOARD_IDLE=5
 
 # only forward Sway -> Windows, never read the Windows clipboard
 export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
@@ -248,8 +268,9 @@ export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
 export ARCH_SWAY_WSLG_CLIPBOARD=off
 ```
 
-Even with the inbound direction disabled, `WAYLAND_DISPLAY=/mnt/wslg/runtime-dir/wayland-0 wl-paste` still reads the
-Windows clipboard on demand from any terminal inside the session.
+With the inbound direction disabled, `Alt+Shift+V` stops working too, but
+`WAYLAND_DISPLAY=/mnt/wslg/runtime-dir/wayland-0 wl-paste` still reads the Windows clipboard on demand from any terminal
+inside the session.
 
 To include sensitive selections, export this before starting Sway; it is not recommended for password managers:
 
@@ -260,7 +281,7 @@ arch-sway-wslg start
 
 ## Waybar Layout
 
-The right side of the bar keeps four pills: resources, volume, tray, notifications, and the clock. Memory usage is
+The right side of the bar keeps five pills: resources, volume, tray, notifications, and the clock. Memory usage is
 always visible; hovering it slides out CPU and disk usage, so system information is available without crowding the bar.
 
 ## Appearance
@@ -313,9 +334,12 @@ git pull --ff-only
 ./install.sh
 ```
 
-Every run copies the previous managed state to `~/.local/state/arch-sway-wslg/backups/<timestamp>` before replacing
-anything, and each backup contains a `RESTORE-INFO.txt` with the exact restore command. Old backups are never deleted
-automatically; remove the ones you no longer need.
+Every run offers to copy the previous managed state to `~/.local/state/arch-sway-wslg/backups/<timestamp>` before
+replacing anything, and each backup contains a `RESTORE-INFO.txt` with the exact restore command. Old backups are never
+deleted automatically; remove the ones you no longer need.
+
+An update can add packages the previous release did not need, so answer the installer's questions again rather than
+assuming the package set is unchanged, and restart the session afterwards with `arch-sway-wslg restart`.
 
 ## Uninstalling
 
@@ -334,6 +358,10 @@ paru -Rns sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look 
   ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
   ttf-nerd-fonts-symbols-mono wl-clipboard xdg-utils jack2
 ```
+
+If pacman refuses because something you keep still depends on a package in that list, drop that package from the command
+and run it again. Keeping Chromium, Chrome, or Edge for example keeps `xdg-utils` required, and keeping Firefox keeps a
+font package required as its `ttf-font` provider.
 
 `jack2` was installed only as Waybar's JACK provider, and `oo7` only when no other Secret Service backend existed;
 neither is present if the installer skipped it. Optional Yazi helpers (`fd`, `ripgrep`, `fzf`, `zoxide`, `jq`, `7zip`,
@@ -361,15 +389,17 @@ Run diagnostics first:
 arch-sway-wslg doctor
 ```
 
-`doctor` checks the systemd user manager and runtime, the required commands, the clipboard bridge, the WSLg mappings,
+`doctor` checks the systemd user manager and runtime, every command the session needs (the compositor, the idle
+notifier, `wl-clipboard`, and the applications the Sway configuration starts), the clipboard bridge, the WSLg mappings,
 Sway config readability, and audio connectivity. It never requests sudo or changes mount state.
 
 If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run `wsl --shutdown` from Windows before
 trying again.
 
-If a single keystroke ever produces two characters, the outer clipboard is being read while you type. Check that your
-Sway configuration still contains the `exec swayidle` line that gates those reads; starting the session with
-`ARCH_SWAY_WSLG_CLIPBOARD=to-windows` stops them outright.
+If a single keystroke ever produces two characters, the outer clipboard is being read while you type. Run
+`arch-sway-wslg status`: the clipboard line says whether reads are gated on the session being idle. If they are not,
+check `arch-sway-wslg logs` for `swayidle` warnings, or start the session with `ARCH_SWAY_WSLG_CLIPBOARD=to-windows` to
+stop those reads outright.
 
 Host sleep, network changes, monitor or taskbar changes, or a WSLg Weston failure can terminate the parent Wayland
 connection and therefore the nested Sway session. The launcher cleans up the managed cgroup but does not automatically

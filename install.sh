@@ -37,6 +37,8 @@ MANAGED_CONFIG_DIRS=(sway waybar swaync swaynag foot fuzzel yazi)
 # Files and directories inside the managed configuration that belong to the
 # user. They survive every reinstall and are read after the managed files.
 LOCAL_OVERRIDE_PATHS=(sway/config.d foot/local.ini fuzzel/local.ini)
+# Bundled wallpaper, relative to the managed configuration root.
+WALLPAPER_RELATIVE="sway/wallpapers/dark-star.jpg"
 
 # Providers and shared prerequisites that have to be resolved before the
 # desktop stack. jack2 is the default JACK provider and is skipped when
@@ -108,11 +110,11 @@ Usage: $0
 Installs the package set and the $NAME user configuration.
 
 Managed configuration directories are replaced exactly, except for the local
-override paths (${LOCAL_OVERRIDE_PATHS[*]}), which are always preserved. The
-previous state is copied to $BACKUP_BASE before anything is replaced.
+override paths (${LOCAL_OVERRIDE_PATHS[*]}), which are always preserved.
 
-The installer asks for the Sway output scale, a browser, the optional
-desktop-entry masks and the GTK appearance defaults.
+The installer asks for a backup of the current state, the Sway output scale, a
+browser, the optional desktop-entry masks and the GTK appearance defaults.
+Backups are written to $BACKUP_BASE.
 EOF2
 }
 
@@ -213,24 +215,11 @@ gsettings_user() {
     user_bus_command gsettings "$@"
 }
 
-first_generated_locale() {
-    local locale_name lower
-    while IFS= read -r locale_name; do
-        lower="${locale_name,,}"
-        case "$lower" in
-            c|c.utf8|c.utf-8|posix) continue ;;
-        esac
-        printf '%s\n' "$locale_name"
-        return 0
-    done < <(locale -a 2>/dev/null)
-    return 1
-}
-
 preflight() {
     (( EUID != 0 )) || die "run this installer as your normal Arch user, not as root"
 
-    local command_name config_name generated_locale
-    for command_name in paru flock sudo systemctl timeout; do
+    local command_name config_name
+    for command_name in paru flock sudo systemctl; do
         command -v "$command_name" >/dev/null 2>&1 || \
             die "required command not found: $command_name"
     done
@@ -249,10 +238,6 @@ preflight() {
     [[ -x "$LIBEXEC_PAYLOAD_DIR/clipboard-bridge" ]] || \
         die "clipboard bridge payload is missing: $LIBEXEC_PAYLOAD_DIR/clipboard-bridge"
     ((${#DESKTOP_OVERRIDE_FILES[@]})) || die "desktop-entry overrides are missing"
-
-    generated_locale="$(first_generated_locale || true)"
-    [[ -n "$generated_locale" ]] || \
-        die "generate at least one locale before installing; see README.md"
 }
 
 # -----------------------------------------------------------------------------
@@ -327,7 +312,12 @@ install_packages() {
 }
 
 write_browser_choice() {
-    [[ "$BROWSER_CHOICE" != none ]] || return 0
+    if [[ "$BROWSER_CHOICE" == none ]]; then
+        # A recorded choice from an earlier installation would otherwise keep
+        # setting BROWSER inside the session.
+        rm -f -- "$BROWSER_FILE"
+        return 0
+    fi
     local browser_command="${BROWSER_COMMANDS[$BROWSER_CHOICE]}"
 
     mkdir -p "$SETTINGS_DIR"
@@ -350,7 +340,7 @@ stop_active_session() {
     "$installed_launcher" stop || die "failed to stop the managed Sway session"
 }
 
-# The launcher control lock is only held around the payload transaction, so a
+# The launcher control lock is only held around the payload replacement, so a
 # long package update never blocks another terminal from starting Sway.
 take_control_lock() {
     local installed_launcher="$LOCAL_BIN_DIR/$NAME"
@@ -369,8 +359,24 @@ take_control_lock() {
 # -----------------------------------------------------------------------------
 # Backup
 # -----------------------------------------------------------------------------
+# The backup is the only safety net for the replacement below, so it is offered
+# on every run and enabled by default. Users who track their configuration
+# elsewhere can decline it.
 BACKUP_DIR=""
+BACKUP_REQUESTED=0
+BACKUP_SUMMARY="declined"
 BACKUP_COUNT=0
+
+prompt_backup() {
+    note ""
+    if prompt_yes_no "Copy the current managed files to a timestamped backup before replacing them?" yes; then
+        BACKUP_REQUESTED=1
+        BACKUP_SUMMARY="requested; pending installation"
+    else
+        BACKUP_SUMMARY="declined"
+        warn "no backup will be made; the current managed files will be replaced"
+    fi
+}
 
 backup_item() {
     local source_path="$1" relative_path="$2"
@@ -383,6 +389,8 @@ backup_item() {
 
 backup_existing_files() {
     local include_desktop_overrides="$1" config_name source_file basename
+
+    (( BACKUP_REQUESTED )) || return 0
 
     mkdir -p "$BACKUP_BASE"
     chmod 700 "$BACKUP_BASE"
@@ -404,6 +412,7 @@ backup_existing_files() {
     if (( BACKUP_COUNT == 0 )); then
         rmdir "$BACKUP_DIR"
         BACKUP_DIR=""
+        BACKUP_SUMMARY="none needed; nothing was installed yet"
         note "No existing managed files needed a backup."
         return 0
     fi
@@ -418,19 +427,19 @@ backup_existing_files() {
         printf '  rm -rf "%s/sway" && cp -a "%s/config/sway" "%s/sway"\n' \
             "$CONFIG_HOME" "$BACKUP_DIR" "$CONFIG_HOME"
     } > "$BACKUP_DIR/RESTORE-INFO.txt"
+    BACKUP_SUMMARY="$BACKUP_DIR"
     note "Backup: $BACKUP_DIR"
 }
 
 # -----------------------------------------------------------------------------
-# Payload transaction
+# Payload staging
 # -----------------------------------------------------------------------------
-# Every managed path is staged on the same filesystem, checked, then swapped in
-# with rename operations. A failure or signal restores the previous state in
-# reverse order.
+# Every managed path is staged on the same filesystem and checked before
+# anything is replaced, so the replacement itself is a pair of renames that
+# fails only when the target cannot be moved at all.
 STAGE_CONFIG=""
 STAGE_LOCAL=""
 STAGE_DATA=""
-TRANSACTION_ENTRIES=()
 
 cleanup_staging() {
     local path
@@ -444,59 +453,35 @@ cleanup_staging() {
     STAGE_DATA=""
 }
 
-transaction_replace() {
-    local staged="$1" target="$2" rollback had_old=0
-    rollback="${target}.${NAME}.rollback.$$"
-    if [[ -e "$rollback" || -L "$rollback" ]]; then
-        warn "stale transaction rollback path exists: $rollback"
+# The old path is moved aside first, so a failing second rename can put it back,
+# and it is deleted only once the new one is in place.
+replace_path() {
+    local staged="$1" target="$2"
+    local previous="${target}.${NAME}.old.$$"
+
+    if [[ -e "$previous" || -L "$previous" ]]; then
+        warn "a leftover replacement path is in the way: $previous"
         return 1
     fi
-    [[ -e "$target" || -L "$target" ]] && had_old=1
-
-    # Register before moving anything so the signal handler also knows about an
-    # in-flight replacement.
-    TRANSACTION_ENTRIES+=("$target"$'\t'"$rollback"$'\t'"$had_old")
-    if (( had_old )) && ! mv -- "$target" "$rollback"; then
+    if [[ -e "$target" || -L "$target" ]] && ! mv -- "$target" "$previous"; then
         return 1
     fi
-    mv -- "$staged" "$target"
-}
-
-transaction_rollback() {
-    local index entry target rollback had_old failed=0
-    for (( index=${#TRANSACTION_ENTRIES[@]} - 1; index >= 0; index-- )); do
-        entry="${TRANSACTION_ENTRIES[$index]}"
-        IFS=$'\t' read -r target rollback had_old <<< "$entry"
-        if (( had_old )); then
-            # No rollback copy means the target was never moved aside.
-            [[ -e "$rollback" || -L "$rollback" ]] || continue
-            rm -rf -- "$target"
-            if ! mv -- "$rollback" "$target"; then
-                warn "manual recovery required: $rollback -> $target"
-                failed=1
-            fi
-        else
-            rm -rf -- "$target"
+    if ! mv -- "$staged" "$target"; then
+        if [[ -e "$previous" || -L "$previous" ]]; then
+            mv -- "$previous" "$target" || \
+                warn "manual recovery required: $previous -> $target"
         fi
-    done
-    TRANSACTION_ENTRIES=()
-    return "$failed"
-}
-
-transaction_finish() {
-    local entry rollback
-    for entry in "${TRANSACTION_ENTRIES[@]}"; do
-        rollback="${entry#*$'\t'}"
-        rm -rf -- "${rollback%$'\t'*}"
-    done
-    TRANSACTION_ENTRIES=()
+        return 1
+    fi
+    rm -rf -- "$previous"
 }
 
 payload_fail() {
-    local recovery="previous files were restored"
-    transaction_rollback || recovery="rollback was incomplete; review the warnings above"
     cleanup_staging
-    die "$1; $recovery"
+    if [[ -n "$BACKUP_DIR" ]]; then
+        warn "restore the previous state from $BACKUP_DIR; see its RESTORE-INFO.txt"
+    fi
+    die "$1"
 }
 
 # -----------------------------------------------------------------------------
@@ -514,16 +499,18 @@ render_marker() {
     printf '%s\n' "${content//"$marker"/"$value"}" > "$file"
 }
 
+# The Sway config quotes this value, which covers spaces, and doubles a dollar
+# sign to keep it literal. A quote, backslash, or newline cannot be expressed
+# there at all, so such a configuration root is rejected instead of mangled.
 sway_wallpaper_value() {
-    local path="$CONFIG_HOME/sway/wallpapers/dark-star.jpg"
+    local path="$CONFIG_HOME/$WALLPAPER_RELATIVE"
 
-    [[ "$path" != *$'\n'* && "$path" != *$'\r'* && \
-       "$path" != *'"'* && "$path" != *'\'* ]] || {
-        warn "configuration root contains a quote, backslash, or newline unsupported by the Sway config"
-        return 1
-    }
-    # Sway uses a doubled dollar sign for a literal dollar sign in a variable
-    # value. Spaces stay protected by the quotes already in the config.
+    case "$path" in
+        *'"'*|*'\'*|*$'\n'*|*$'\r'*)
+            warn "configuration root contains a quote, backslash, or newline unsupported by the Sway config"
+            return 1
+            ;;
+    esac
     printf '%s\n' "${path//\$/\$\$}"
 }
 
@@ -580,7 +567,7 @@ render_staged_payload() {
 }
 
 check_staged_payload() {
-    [[ -s "$STAGE_CONFIG/sway/wallpapers/dark-star.jpg" ]] || {
+    [[ -s "$STAGE_CONFIG/$WALLPAPER_RELATIVE" ]] || {
         warn "staged Sway wallpaper payload is missing"
         return 1
     }
@@ -608,7 +595,6 @@ install_payload() {
             die "failed to create desktop-entry staging directory"
         }
     fi
-    trap 'payload_fail "payload transaction interrupted"' INT TERM HUP
 
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
         cp -a -- "$ROOT/.config/$config_name" "$STAGE_CONFIG/$config_name" || \
@@ -629,27 +615,24 @@ install_payload() {
     render_staged_payload || payload_fail "failed to render the staged payload"
     check_staged_payload || payload_fail "staged payload check failed"
 
-    TRANSACTION_ENTRIES=()
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
-        transaction_replace "$STAGE_CONFIG/$config_name" "$CONFIG_HOME/$config_name" || \
-            payload_fail "payload transaction failed while replacing config/$config_name"
+        replace_path "$STAGE_CONFIG/$config_name" "$CONFIG_HOME/$config_name" || \
+            payload_fail "failed to replace config/$config_name"
     done
-    transaction_replace "$STAGE_LOCAL/bin/$NAME" "$LOCAL_BIN_DIR/$NAME" || \
-        payload_fail "payload transaction failed while replacing the launcher"
-    transaction_replace "$STAGE_LOCAL/libexec/$NAME" "$LOCAL_LIBEXEC_DIR" || \
-        payload_fail "payload transaction failed while replacing the private helpers"
+    replace_path "$STAGE_LOCAL/bin/$NAME" "$LOCAL_BIN_DIR/$NAME" || \
+        payload_fail "failed to replace the launcher"
+    # Replacing the whole directory also removes helpers dropped by an earlier
+    # release, which a file-by-file copy would leave behind.
+    replace_path "$STAGE_LOCAL/libexec/$NAME" "$LOCAL_LIBEXEC_DIR" || \
+        payload_fail "failed to replace the private helpers"
     if (( include_desktop_overrides )); then
         for source_file in "${DESKTOP_OVERRIDE_FILES[@]}"; do
             basename="${source_file##*/}"
-            transaction_replace "$STAGE_DATA/$basename" "$APPLICATIONS_DIR/$basename" || \
-                payload_fail "payload transaction failed while installing $basename"
+            replace_path "$STAGE_DATA/$basename" "$APPLICATIONS_DIR/$basename" || \
+                payload_fail "failed to install $basename"
         done
     fi
 
-    # The installed payload is now the committed state. Disable rollback before
-    # deleting its copies so an interrupt cannot remove a committed target.
-    trap - INT TERM HUP
-    transaction_finish
     cleanup_staging
     if (( include_desktop_overrides )); then
         note "Desktop-entry overrides: installed"
@@ -790,6 +773,7 @@ main() {
     fi
     prompt_browser
     prompt_scale
+    prompt_backup
 
     stop_active_session
     install_packages
@@ -812,7 +796,7 @@ Installed configuration: $CONFIG_HOME
 Installed launcher:      $LOCAL_BIN_DIR/$NAME
 Sway output scale:       $SWAY_SCALE
 Browser:                 ${BROWSER_LABELS[$BROWSER_CHOICE]}
-Backup:                  ${BACKUP_DIR:-none needed}
+Backup:                  $BACKUP_SUMMARY
 
 GTK appearance:          $APPEARANCE_SUMMARY
 Run nwg-look inside Sway if you want to review or change the appearance.

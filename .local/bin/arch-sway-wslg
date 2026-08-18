@@ -52,15 +52,20 @@ CONTROL_LOCK_TIMEOUT=60
 OUTPUTS_MAX=4
 SESSION_OUTPUTS="${ARCH_SWAY_WSLG_OUTPUTS:-1}"
 
-# Only commands that are not part of a minimal Arch install are checked here.
-# util-linux, coreutils and systemd provide the rest of the start path.
-SESSION_COMMANDS=(sway Xwayland swaymsg swayidle dbus-run-session systemd-run sudo)
+# Everything the managed session cannot start without, minus what a minimal Arch
+# install already provides through util-linux, coreutils and systemd. The
+# clipboard bridge and its idle gate belong to the session, so they are listed
+# with the compositor rather than checked later.
+SESSION_COMMANDS=(sway Xwayland swaymsg swayidle dbus-run-session systemd-run sudo
+                  wl-copy wl-paste)
+
+# Started by the Sway configuration itself. A missing one only shows up in the
+# session log, so `doctor` reports them instead.
+SESSION_APPLICATIONS=(swaybg waybar swaync foot fuzzel)
 
 note() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-
-SUDO_AUTHORIZED=0
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
@@ -118,12 +123,16 @@ check_wslg() {
 parse_outputs() {
     local value="$1"
     if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > OUTPUTS_MAX )); then
-        die "nested output count must be an integer from 1 through $OUTPUTS_MAX"
+        die "nested output count must be an integer from 1 through $OUTPUTS_MAX: $value"
     fi
     SESSION_OUTPUTS="$value"
 }
 
+# The environment variable reaches the same place as the option, including the
+# inner session process, so it is validated wherever the value is used rather
+# than only on the command-line path.
 parse_session_options() {
+    parse_outputs "$SESSION_OUTPUTS"
     while (( $# )); do
         case "$1" in
             --outputs)
@@ -169,6 +178,34 @@ clipboard_pid() {
     printf '%s\n' "$pid"
 }
 
+# The bridge reads the Windows clipboard only while the session is quiet and
+# runs its own swayidle to know when that is. That child is therefore the
+# visible part of a state the bridge otherwise keeps in memory.
+clipboard_gated() {
+    local pid
+    pid="$(clipboard_pid)" || return 1
+    pgrep -P "$pid" -x swayidle >/dev/null 2>&1
+}
+
+clipboard_state() {
+    local pid
+    if ! clipboard_running; then
+        if clipboard_available; then
+            printf "not running; see '%s logs'\n" "$NAME"
+        else
+            printf 'unavailable (wl-clipboard is missing)\n'
+        fi
+        return 0
+    fi
+
+    pid="$(clipboard_pid)" || pid="unknown"
+    if clipboard_gated; then
+        printf 'running (PID %s; Windows clipboard read while the session is idle)\n' "$pid"
+    else
+        printf 'running (PID %s; Windows clipboard not read automatically)\n' "$pid"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Session lifecycle
 # -----------------------------------------------------------------------------
@@ -182,12 +219,9 @@ cleanup_stale_state() {
 }
 
 authorize_x11_namespace() {
-    (( SUDO_AUTHORIZED )) && return 0
-
     note "Sudo is required only to create a private X11 mount namespace for this Sway start."
     note "Sway and all desktop applications will still run as your normal user; no global WSLg files are changed."
     sudo -v || die "sudo authorization failed; Sway was not started"
-    SUDO_AUTHORIZED=1
 }
 
 prepare_environment() {
@@ -228,6 +262,12 @@ prepare_environment() {
     # WSL. Inside this desktop the Linux build is the intended one.
     : "${DONT_PROMPT_WSL_INSTALL:=1}"
     export DONT_PROMPT_WSL_INSTALL
+
+    # Java toolkits ask the window manager to reparent their windows, which
+    # wlroots' XWayland does not do; without this hint Swing applications such
+    # as the JetBrains IDEs render grey windows and misplaced menus.
+    : "${_JAVA_AWT_WM_NONREPARENTING:=1}"
+    export _JAVA_AWT_WM_NONREPARENTING
 
     # xdg-open reports XDG_CURRENT_DESKTOP=sway as a generic desktop and then
     # honours BROWSER first, so publishing the browser chosen at install time is
@@ -292,6 +332,7 @@ run_from_environment() {
 run_session() {
     need sway
     need Xwayland
+    parse_outputs "$SESSION_OUTPUTS"
     ensure_dirs
 
     cleanup_session() {
@@ -354,13 +395,7 @@ report_running_session() {
     note "Systemd scope: $SESSION_SCOPE"
     note "IPC: $SWAYSOCK_PATH"
     note "XWayland: configured (lazy; runtime errors are logged)"
-    if clipboard_running; then
-        note "Clipboard: Windows <-> Sway text bridge running"
-    elif clipboard_available; then
-        note "Clipboard: bridge is not running yet; see '$NAME logs'"
-    else
-        note "Clipboard: unavailable (install wl-clipboard)"
-    fi
+    note "Clipboard: $(clipboard_state)"
 }
 
 start_session() {
@@ -473,13 +508,7 @@ status_session() {
         note "IPC: not ready ($SWAYSOCK_PATH)"
     fi
     note "XWayland: configured (lazy; see logs for runtime errors)"
-    if clipboard_running; then
-        note "Clipboard: running (PID $(clipboard_pid || echo unknown))"
-    elif clipboard_available; then
-        note "Clipboard: not running"
-    else
-        note "Clipboard: unavailable (wl-clipboard is missing)"
-    fi
+    note "Clipboard: $(clipboard_state)"
     note "Log: $LOG_FILE"
 }
 
@@ -498,6 +527,7 @@ show_logs() {
 
 doctor() {
     local failed=0 cmd path_launcher
+    parse_outputs "$SESSION_OUTPUTS"
     note "Sway WSLg launcher diagnostics"
     note "-----------------------------"
 
@@ -522,7 +552,7 @@ doctor() {
         failed=1
     fi
 
-    for cmd in "${SESSION_COMMANDS[@]}" wl-copy wl-paste; do
+    for cmd in "${SESSION_COMMANDS[@]}" "${SESSION_APPLICATIONS[@]}"; do
         if command -v "$cmd" >/dev/null 2>&1; then
             note "OK   command: $cmd"
         else
