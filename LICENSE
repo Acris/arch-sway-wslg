@@ -1,4 +1,4 @@
-MIT License
+MIT License (software and configuration files)
 
 Copyright (c) 2026 Acris Liu
 Copyright (c) 2024 Jordan Koehn (sway-wsl2 portions)
@@ -21,3 +21,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Bundled wallpaper notice
+
+.config/sway/wallpapers/dark-star.jpg is sourced from the
+orangci/walls-catppuccin-mocha wallpaper collection:
+https://github.com/orangci/walls-catppuccin-mocha
+
+The wallpaper is not covered by the MIT license grant above. Its upstream
+collection does not state a redistribution license; distributors must verify
+permission before redistributing the image.

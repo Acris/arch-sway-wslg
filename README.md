@@ -14,9 +14,12 @@ Linux on WSL and is not intended to be a general bare-metal Sway distribution.
 - Catppuccin Mocha styling throughout the desktop
 - Sarasa UI SC for the UI and Maple Mono NF CN for the terminal
 - Automatic UTF-8 plain-text clipboard synchronization with Windows
+- Up to four nested outputs, each shown as its own WSLg window
+- Output scale answered once at install time and overridable afterwards
+- Your own settings live in override files that updates never touch
+- A browser of your choice, wired to `BROWSER` inside the session
 - WSLg PulseAudio integration
-- One-command background lifecycle management with status, logs, diagnostics, cleanup, and crash recovery
-- Transactional configuration installation with optional backups
+- One command to start, stop, inspect and diagnose the session
 
 The default session is deliberately compact. Windows owns screenshots and the outer WSLg window; the guest does not
 install screen locking, power management, battery, network, or screenshot tools.
@@ -29,11 +32,11 @@ first. The installer expects:
 
 1. Arch Linux running under WSL2 with WSLg enabled.
 2. A normal user configured as the default WSL user, with working `sudo` access.
-3. Locale configured according to the [ArchWiki locale instructions](https://wiki.archlinux.org/title/Locale), with an
-   active UTF-8 locale.
-4. WSLg hardware acceleration configured. Keep Windows and the host GPU driver up to date.
-5. `base-devel`, Git, and `paru` installed for the normal user.
-6. Windows interoperability enabled so `powershell.exe` can run from WSL.
+3. Systemd enabled, with a working systemd user manager for that normal user.
+4. At least one non-`C` locale generated according to the
+   [ArchWiki locale instructions](https://wiki.archlinux.org/title/Locale). No specific locale is required.
+5. WSLg hardware acceleration configured. Keep Windows and the host GPU driver up to date.
+6. `base-devel`, Git, and `paru` installed for the normal user.
 
 Keep WSL current from Windows:
 
@@ -42,12 +45,17 @@ wsl --update
 wsl --shutdown
 ```
 
-Systemd is optional. The launcher reuses a working user D-Bus session when available and otherwise starts a private
-`dbus-run-session`; it does not modify the global D-Bus or systemd activation environment.
+Systemd is required. The current official Arch image installed by `wsl --install -d archlinux` enables it by default.
+For an older or imported distribution where `systemctl status` reports that systemd is not running, add the following to
+`/etc/wsl.conf`, then run `wsl --shutdown` from Windows:
+
+```ini
+[boot]
+systemd=true
+```
 
 Hardware acceleration is required for a smooth nested compositor. If rendering is unstable, first update Windows, run
-`wsl --update`, and install the latest driver for your host GPU. The launcher keeps Sway hardware-accelerated; disable
-hardware rendering only for an individual problematic application.
+`wsl --update`, and install the latest driver for your host GPU.
 
 ## Quick Start
 
@@ -59,29 +67,21 @@ cd arch-sway-wslg
 ./install.sh
 ```
 
-Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer then:
+Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer:
 
-- verifies the required payload files;
-- asks whether to back up existing managed paths;
-- lists every optional desktop-entry mask and asks whether to install them;
-- asks for the nested Sway output scale, defaulting to `1`;
-- detects a running managed Sway session and asks to stop it before updating;
-- updates Arch and installs the bootstrap providers from `packages.conf`, then installs the remaining desktop packages;
-- installs Seahorse and, unless an `org.freedesktop.secrets` credential manager is already present, the lightweight
-  `oo7` Secret Service backend;
-- stages the complete payload, applies the selected scale, and validates the final Shell, Sway, Foot, and Fuzzel
-  configuration before replacing anything;
-- rolls back already-replaced paths if any deployment step fails;
-- installs the public launcher into `~/.local/bin` and private helpers into
-  `~/.local/libexec/arch-sway-wslg`;
-- applies the recommended GTK appearance defaults with `gsettings`;
-- prints optional Yazi integration and rich-preview `paru` commands after installation.
+- checks the prerequisites and the payload before touching any package;
+- asks whether to install the optional desktop-entry masks;
+- asks which browser to install: Firefox (default), Chromium, Google Chrome, Microsoft Edge, or none; a browser that is
+  already installed is marked `[installed]` and is only wired to `BROWSER`, never reinstalled;
+- asks for the Sway output scale (1 through 4, decimals allowed);
+- stops a running managed session after asking;
+- updates Arch, installs the bootstrap providers, then the desktop stack and the chosen browser unless it is already
+  installed;
+- prints the current and proposed GTK appearance settings and asks before changing them;
+- copies the previous state to `~/.local/state/arch-sway-wslg/backups/<timestamp>`;
+- stages the whole payload, checks it, then swaps it in, rolling back on any failure.
 
-The installer explains its sudo request before validating Sway: root permission is used only to create a temporary,
-private X11 mount namespace. The validation itself runs as the normal user and leaves WSLg's global X11 mapping
-unchanged.
-
-If `~/.local/bin` is not in `PATH`, the installer prints the appropriate Bash or Fish command. Then start the session:
+Then start the session:
 
 ```bash
 arch-sway-wslg doctor
@@ -89,28 +89,74 @@ arch-sway-wslg start
 arch-sway-wslg status
 ```
 
-Open the session log if startup does not complete:
+If startup does not complete, read the log with `arch-sway-wslg logs`.
+
+## Commands
 
 ```bash
+arch-sway-wslg start [--outputs N]    # start the session with N nested outputs (1-4, default 1)
+arch-sway-wslg stop
+arch-sway-wslg restart [--outputs N]
+arch-sway-wslg status
 arch-sway-wslg logs
+arch-sway-wslg doctor
+arch-sway-wslg version
 ```
 
-## Resize and Maximize the WSLg Window
+`start` and `restart` explain and request sudo once to create the session's isolated X11 mount namespace, then launch
+the managed session as your normal user in a transient systemd user scope with a private D-Bus session. Sway and its
+desktop applications never run as root. `stop` needs no sudo: it asks Sway to exit through IPC, then stops the scope if
+necessary. The systemd scope is the authoritative session state; IPC is only a communication channel.
 
-These shortcuts operate on the outer Windows/WSLg window, not on Sway containers:
+## Multiple Monitors
 
-- `Win+Up` maximizes the WSLg window.
-- `Win+Shift+Left/Right` moves it to another monitor.
-- If the window does not fill the target screen, press `Win+Left` or `Win+Right` first, then `Win+Up`.
+Sway can drive more than one nested output. Each output is a separate top-level WSLg window that you can move to a
+different Windows monitor:
 
-To use the full height of the display, enable automatic hiding for the Windows taskbar. Alternatively, keep the taskbar
-on a less important primary display and place the WSLg window on another monitor. Windows owns these shortcuts, so they
-do not need Sway key bindings.
+```bash
+arch-sway-wslg start --outputs 2
+```
 
-## Installation and Updates
+`ARCH_SWAY_WSLG_OUTPUTS=2 arch-sway-wslg start` has the same effect. The outputs are named `WL-1`, `WL-2`, and so on.
+Bind workspaces to them from your own configuration, for example in `~/.config/sway/config.d/10-local.conf`:
 
-Managed configuration directories are replaced exactly. This prevents stale files from older releases surviving an
-update, but it also means custom files inside these directories are replaced:
+```
+workspace 1 output WL-1
+workspace 2 output WL-1
+workspace 9 output WL-2
+workspace 10 output WL-2
+```
+
+Position the windows with Windows shortcuts: `Win+Shift+Left/Right` moves a window to another monitor and `Win+Up`
+maximizes it. If a window does not fill the target screen, press `Win+Left` or `Win+Right` first, then `Win+Up`. Enable
+automatic hiding for the Windows taskbar to use the full height of a display. This project does not move or maximize
+WSLg windows for you.
+
+## Customizing Without Losing Changes
+
+Managed configuration directories are replaced exactly on every install, so stale files from older releases cannot
+survive an update. Three paths are always yours and are never replaced:
+
+| Path                             | Purpose                                        |
+|----------------------------------|------------------------------------------------|
+| `~/.config/sway/config.d/*.conf` | Sway settings, read after everything else      |
+| `~/.config/foot/local.ini`       | Foot options, applied after the bundled ones   |
+| `~/.config/fuzzel/local.ini`     | Fuzzel options, applied after the bundled ones |
+
+The installer creates them on a first installation with commented examples and copies them forward on every later
+installation. Because they are read last, anything you set there wins:
+
+```
+# ~/.config/sway/config.d/10-local.conf
+output * scale 1.5
+bindsym $mod+p exec firefox
+```
+
+Waybar, SwayNC, swaynag, and Yazi have no comparable include mechanism, so `~/.config/waybar`, `~/.config/swaync`,
+`~/.config/swaynag`, and `~/.config/yazi` are fully managed. Keep personal versions of those files outside the managed
+directories, or restore them from the backup the installer writes before every update.
+
+These directories are replaced (the default root is shown; an absolute `$XDG_CONFIG_HOME` replaces `~/.config`):
 
 ```text
 ~/.config/foot
@@ -122,109 +168,24 @@ update, but it also means custom files inside these directories are replaced:
 ~/.config/yazi
 ```
 
-Accept the backup prompt if those directories contain local changes. Backups are stored under
-`$XDG_STATE_HOME/arch-sway-wslg/backups`, or by default under
-`~/.local/state/arch-sway-wslg/backups`.
+## Session Environment
 
-To update, pull the repository and run the installer again:
+The launcher exports these values for the managed session and never overrides a value you already set:
 
-```bash
-git pull --ff-only
-./install.sh
-```
+| Variable                              | Value         | Why                                                          |
+|---------------------------------------|---------------|--------------------------------------------------------------|
+| `QT_QPA_PLATFORM`                     | `wayland;xcb` | Qt 5 never selects Wayland on its own; xcb stays as fallback |
+| `QT_WAYLAND_DISABLE_WINDOWDECORATION` | `1`           | Sway draws the borders, so Qt should not add its own         |
+| `DONT_PROMPT_WSL_INSTALL`             | `1`           | Stops VS Code from suggesting the Windows build inside Sway  |
+| `BROWSER`                             | your choice   | `xdg-open` treats Sway as a generic desktop and honours it   |
+| `WLR_WL_OUTPUTS`                      | `--outputs N` | Only exported when more than one nested output is requested  |
+| `PULSE_SERVER`                        | WSLg socket   | Audio always goes to the WSLg PulseAudio endpoint            |
 
-Desktop-entry masks contain only `Hidden=true`; they hide helper applications from Fuzzel without uninstalling them.
-Declining the prompt never deletes or modifies an existing same-named desktop file.
+`qt5-wayland` and `qt6-wayland` are installed so both Qt generations have the Wayland platform plugin available. Recent
+Firefox and Chromium releases select Wayland by default; no extra flags are set for them.
 
-## Yazi
-
-Press `Alt+Y` to open Yazi in Foot. The bundled theme uses the Catppuccin Mocha palette. Yazi is a terminal file
-manager; it does not replace GTK/Qt file chooser dialogs or install applications for every file type.
-
-Useful default Yazi bindings:
-
-| Key                 | Action                                           |
-|---------------------|--------------------------------------------------|
-| `h/j/k/l` or arrows | Leave, move, or enter a directory                |
-| `Enter`             | Open the selected file or directory              |
-| `Space`             | Toggle selection                                 |
-| `y` / `x` / `p`     | Copy / cut / paste selected files                |
-| `d` / `D`           | Move to trash / permanently delete               |
-| `a` / `r`           | Create / rename                                  |
-| `.`                 | Toggle hidden files                              |
-| `f`                 | Filter the current directory                     |
-| `s` / `S`           | Search names with `fd` / contents with `ripgrep` |
-| `z` / `Z`           | Navigate with `fzf` / `zoxide`                   |
-| `F1` or `~`         | Open Yazi help                                   |
-| `q`                 | Quit Yazi                                        |
-
-See the [Yazi quick-start keybindings](https://yazi-rs.github.io/docs/quick-start/#keybindings)
-for the complete default map.
-
-The [official Yazi installation guide](https://yazi-rs.github.io/docs/installation/) recommends the tools below. The
-installer already includes Yazi, its Nerd Font provider, and Wayland clipboard support. For the remaining search,
-navigation, JSON, and archive integrations, install:
-
-```bash
-paru -S --needed fd ripgrep fzf zoxide jq 7zip
-```
-
-- `fd` supplies fast filename discovery.
-- `ripgrep` supplies content search.
-- `fzf` supplies fuzzy selection.
-- `zoxide` supplies frecency-based directory navigation.
-- `jq` formats and previews JSON.
-- `7zip` previews and extracts additional archive formats.
-
-Rich previews are optional:
-
-```bash
-paru -S --needed ffmpeg poppler resvg imagemagick
-```
-
-- `ffmpeg` extracts video thumbnails and media metadata.
-- `poppler` supplies PDF rendering and text-extraction utilities.
-- `resvg` renders SVG files for previews.
-- `imagemagick` converts and identifies extra image/font formats, including formats not handled by Yazi's basic image
-  path.
-
-Foot supports Yazi image previews through its built-in Sixel implementation. For an interactive shell wrapper that
-changes the shell's working directory to Yazi's last directory, follow
-the [Yazi quick-start wrapper](https://yazi-rs.github.io/docs/quick-start/#shell-wrapper). This project does not edit
-shell startup files.
-
-## Appearance
-
-The installer applies these GTK defaults with `gsettings`:
-
-- GTK theme: `adw-gtk3-dark`
-- Color scheme: `prefer-dark`
-- Icon theme: `Papirus-Dark`
-- UI font: `Sarasa UI SC 11`
-- Cursor: `Adwaita`, size `28`
-
-Catppuccin Mocha is bundled for Sway, Waybar, SwayNC, Fuzzel, Foot, swaynag, and Yazi. GTK uses Adwaita Dark because the
-historical Catppuccin GTK port is archived. Run `nwg-look` inside Sway whenever you want to review or change the GTK,
-icon, font, or cursor settings. The bundled Sway wallpaper is installed at
-`~/.config/sway/wallpapers/dark-star.jpg`; replace that file and update the `output * bg` line if you want another
-image. The image comes from the [walls-catppuccin-mocha](https://github.com/orangci/walls-catppuccin-mocha) collection.
-
-## Commands
-
-```bash
-arch-sway-wslg doctor
-arch-sway-wslg start
-arch-sway-wslg status
-arch-sway-wslg logs
-arch-sway-wslg restart
-arch-sway-wslg stop
-arch-sway-wslg version
-```
-
-`start` and `restart` explain and request sudo once to create the session's isolated X11 mount namespace, then launch
-the managed session as the normal user. Sway and its desktop applications never run as root. `stop` does not require
-sudo. It first uses Sway IPC, then performs bounded process-group cleanup if the compositor does not exit normally. The
-fixed IPC path still allows recovery when PID state is missing.
+The browser you pick at install time is recorded in `~/.config/arch-sway-wslg/browser`. Edit that file (a single
+executable name) or export `BROWSER` yourself to change it.
 
 ## Key Bindings
 
@@ -249,30 +210,148 @@ fixed IPC path still allows recovery when PID state is missing.
 | `Alt+Shift+E`                 | Confirm and exit the Sway session        |
 
 Windows owns `Alt+Tab` and `Alt+Space`, so the configuration avoids those combinations. Screenshots remain available
-through Windows `Win+Shift+S`.
+through Windows `Win+Shift+S`. Users who prefer a dedicated modifier can set `$mod` to `Mod3` in
+`~/.config/sway/config.d/` and map a Windows key to Mod3 with a Windows keyboard-remapping tool.
 
-## Clipboard Bridge
+## Clipboard
 
-The bridge synchronizes UTF-8 plain text in both directions. It does not sync images, HTML, or file lists.
+WSLg already synchronizes its own Wayland clipboard with Windows in both directions. The bundled bridge therefore only
+mirrors UTF-8 plain text between the nested Sway session and the parent WSLg socket, which is enough for
+`Ctrl+C` in Sway to paste in Windows and the other way around. No Windows helper process is involved, and
+`powershell.exe` is not required.
 
-- One persistent Windows PowerShell 5.1 setter handles Sway-to-Windows writes.
-- Every setter request receives an explicit success or failure acknowledgement.
-- The Windows watcher uses clipboard sequence numbers instead of repeatedly launching a process.
-- Protocol lines use LF and Linux readers defensively accept CRLF.
-- Reflection hashes are short-lived, payload-aware, and consumed once.
-- On bridge startup, supported Windows text is published to the fresh Sway clipboard before Sway-to-Windows watching
-  begins.
-- `nil`, clear, and `CLIPBOARD_STATE=sensitive` events do not overwrite the Windows clipboard by default.
+- Images, HTML, and file lists are not synchronized.
+- Selections marked `sensitive` by the source application (password managers) are skipped by default.
+- Sway starts the bridge, so it lives and dies with the session.
 
-To opt into synchronizing clipboard content marked sensitive, export this before starting Sway:
+The two directions do not work the same way. Sway implements the wlroots data-control protocol, so a copy inside the
+session is forwarded the moment it happens. WSLg's Weston implements no data-control protocol at all, so the outer
+clipboard cannot be watched for events and is read once per second instead, with each read bounded by a three-second
+timeout.
+
+Such a read has to open a one-pixel surface on WSLg, which takes keyboard focus away from the session for a moment.
+wlroots replays the keys that were held when focus comes back, so a read that overlaps typing duplicates or drops
+characters. The bridge therefore reads the outer clipboard only while the session is idle; `swayidle`, which Sway starts
+alongside the bridge, reports that state over two signals and keeps no extra files. The two seconds of quiet it waits
+for have long passed by the time you switch back from Windows to paste, so inbound latency is unchanged in practice.
+
+If the inbound direction still gets in the way, raise the interval or drop it entirely:
+
+```bash
+# read the Windows clipboard less often; values below 0.2 seconds are rejected
+export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
+
+# only forward Sway -> Windows, never read the Windows clipboard
+export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
+
+# no clipboard bridging at all
+export ARCH_SWAY_WSLG_CLIPBOARD=off
+```
+
+Even with the inbound direction disabled, `WAYLAND_DISPLAY=/mnt/wslg/runtime-dir/wayland-0 wl-paste` still reads the
+Windows clipboard on demand from any terminal inside the session.
+
+To include sensitive selections, export this before starting Sway; it is not recommended for password managers:
 
 ```bash
 export ARCH_SWAY_WSLG_SYNC_SENSITIVE=1
 arch-sway-wslg start
 ```
 
-This is not recommended for password-manager content. `WINDOWS_POWERSHELL` may be exported to override PowerShell
-discovery when Windows is mounted somewhere other than the default `/mnt/c` layout.
+## Waybar Layout
+
+The right side of the bar keeps four pills: resources, volume, tray, notifications, and the clock. Memory usage is
+always visible; hovering it slides out CPU and disk usage, so system information is available without crowding the bar.
+
+## Appearance
+
+The installer shows the current values followed by these proposed GTK defaults and asks before changing them. The prompt
+defaults to yes; answering no leaves every GSettings value unchanged.
+
+- GTK theme: `adw-gtk3-dark`
+- Color scheme: `prefer-dark`
+- Icon theme: `Papirus-Dark`
+- UI font: `Sarasa UI SC 11`
+- Cursor: `Adwaita`, size `28`
+
+Catppuccin Mocha is bundled for Sway, Waybar, SwayNC, Fuzzel, Foot, swaynag, and Yazi. GTK uses Adwaita Dark because the
+historical Catppuccin GTK port is archived. Run `nwg-look` inside Sway to review or change GTK, icon, font, and cursor
+settings.
+
+The installer asks for the output scale and accepts any value from 1 through 4, including decimals such as `1.25`. It
+cannot be detected: WSLg performs the scaling Wayland cannot express itself on the Windows side and keeps advertising
+scale 1 on its parent output, so a Windows setting of 125% is invisible from Linux. Match your Windows display scaling
+(125% is `1.25`, 150% is `1.5`) and change it at any time with `output * scale 1.25` in `~/.config/sway/config.d/`.
+
+The bundled wallpaper is installed at `~/.config/sway/wallpapers/dark-star.jpg` and the resolved absolute path is
+written into the Sway configuration. It comes from the
+[walls-catppuccin-mocha](https://github.com/orangci/walls-catppuccin-mocha) collection and is not relicensed by this
+project's MIT license. That collection does not publish a license for the image, so distributors must verify permission
+before redistributing it.
+
+## Yazi
+
+Press `Alt+Y` to open Yazi in Foot; the bundled theme uses the Catppuccin Mocha palette. See the
+[Yazi quick-start keybindings](https://yazi-rs.github.io/docs/quick-start/#keybindings) for the default key map and the
+[Yazi installation guide](https://yazi-rs.github.io/docs/installation/) for optional integrations.
+
+The installer prints the two recommended commands after a successful run:
+
+```bash
+paru -S --needed fd ripgrep fzf zoxide jq 7zip        # search, navigation, JSON, archives
+paru -S --needed ffmpeg poppler resvg imagemagick     # rich previews
+```
+
+Foot renders Yazi image previews through its built-in Sixel implementation. This project does not edit shell startup
+files, so add the [Yazi shell wrapper](https://yazi-rs.github.io/docs/quick-start/#shell-wrapper) yourself if you want
+directory tracking.
+
+## Updating
+
+```bash
+git pull --ff-only
+./install.sh
+```
+
+Every run copies the previous managed state to `~/.local/state/arch-sway-wslg/backups/<timestamp>` before replacing
+anything, and each backup contains a `RESTORE-INFO.txt` with the exact restore command. Old backups are never deleted
+automatically; remove the ones you no longer need.
+
+## Uninstalling
+
+Stop the session first:
+
+```bash
+arch-sway-wslg stop
+```
+
+Remove the packages this project installed. Drop anything you want to keep and append the browser you chose (`firefox`,
+`chromium`, `google-chrome`, or `microsoft-edge-stable-bin`):
+
+```bash
+paru -Rns sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look \
+  qt5-wayland qt6-wayland yazi oo7 seahorse adw-gtk-theme papirus-icon-theme \
+  ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
+  ttf-nerd-fonts-symbols-mono wl-clipboard xdg-utils jack2
+```
+
+`jack2` was installed only as Waybar's JACK provider, and `oo7` only when no other Secret Service backend existed;
+neither is present if the installer skipped it. Optional Yazi helpers (`fd`, `ripgrep`, `fzf`, `zoxide`, `jq`, `7zip`,
+`ffmpeg`, `poppler`, `resvg`, `imagemagick`) were never installed by this project.
+
+Remove the files:
+
+```bash
+rm -rf ~/.config/sway ~/.config/waybar ~/.config/swaync ~/.config/swaynag \
+       ~/.config/foot ~/.config/fuzzel ~/.config/yazi ~/.config/arch-sway-wslg
+rm -rf ~/.local/libexec/arch-sway-wslg ~/.local/state/arch-sway-wslg
+rm -f  ~/.local/bin/arch-sway-wslg
+```
+
+If you accepted the desktop-entry masks, also remove the `Hidden=true` files under `~/.local/share/applications`
+(`avahi-discover.desktop`, `bssh.desktop`, `bvnc.desktop`, `foot-server.desktop`, `footclient.desktop`,
+`lstopo.desktop`, `qv4l2.desktop`, `qvidcap.desktop`, `xgps.desktop`, `xgpsspeed.desktop`). GTK appearance values set
+through GSettings stay in dconf; reset them with `gsettings reset-recursively org.gnome.desktop.interface`.
 
 ## Troubleshooting
 
@@ -282,80 +361,64 @@ Run diagnostics first:
 arch-sway-wslg doctor
 ```
 
-If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run the following from Windows before trying
-again:
+`doctor` checks the systemd user manager and runtime, the required commands, the clipboard bridge, the WSLg mappings,
+Sway config readability, and audio connectivity. It never requests sudo or changes mount state.
 
-```powershell
-wsl --shutdown
-```
+If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run `wsl --shutdown` from Windows before
+trying again.
 
-For rendering errors, update Windows, WSL, and the host GPU driver first. The launcher keeps Sway
-hardware-accelerated.
+If a single keystroke ever produces two characters, the outer clipboard is being read while you type. Check that your
+Sway configuration still contains the `exec swayidle` line that gates those reads; starting the session with
+`ARCH_SWAY_WSLG_CLIPBOARD=to-windows` stops them outright.
 
-`doctor` checks prerequisites without requesting sudo or changing mount state. The real private-namespace and Sway
-configuration validation happens during `start`. Inside a Foot terminal launched by Sway, `echo "$DISPLAY"` should print
-the nested display reserved by Sway even before the first X11 application starts. An empty value means XWayland
-initialization failed; inspect `arch-sway-wslg logs`. Sway selects the nested display number, so it does not need to
-match WSLg's parent `:0`.
+Host sleep, network changes, monitor or taskbar changes, or a WSLg Weston failure can terminate the parent Wayland
+connection and therefore the nested Sway session. The launcher cleans up the managed cgroup but does not automatically
+restart Sway against an unhealthy parent compositor. Check `/mnt/wslg/weston.log` and `/mnt/wslg/versions.txt`, run
+`wsl --update`, then `arch-sway-wslg stop` followed by `arch-sway-wslg start` once WSLg is healthy.
 
-To exercise the X11 path explicitly with a bundled application, run this inside Sway:
+Inside a Foot terminal launched by Sway, `echo "$DISPLAY"` should print the nested display reserved by Sway even before
+the first X11 application starts. An empty value means XWayland initialization failed; inspect `arch-sway-wslg logs`.
+Sway selects the nested display number, so it does not need to match WSLg's parent `:0`. To exercise the X11 path
+explicitly, run `GDK_BACKEND=x11 nwg-look` inside Sway.
 
-```bash
-GDK_BACKEND=x11 nwg-look
-```
+If a managed session is wedged, use `arch-sway-wslg stop`; systemd stops the complete session cgroup. Never delete
+`/tmp/.X11-unix`.
 
-If Sway is already running but its launcher state was interrupted, use
-`arch-sway-wslg stop`; the fixed IPC socket supports recovery. Do not manually delete `/tmp/.X11-unix`.
+## Design Notes and Limitations
 
-## Package Notes
+**Private X11 mount namespace.** WSLg owns the distribution-wide `/tmp/.X11-unix` mapping and mounts it read-only, so a
+nested XWayland cannot create its socket there. The launcher gives only the managed Sway process tree a private `01777`
+X11 socket directory inside its own mount namespace. A short, fixed sudo step creates that namespace and bind mount and
+immediately drops back to your user with `runuser`. The parent WSLg mapping is never unmounted, deleted, or replaced,
+and `/etc/wsl.conf` is never edited. The namespace disappears with the session.
 
-`packages.conf` is the installer's only package manifest. Its `[bootstrap]` section is installed first and contains the
-portal, font, Nerd Font, and JACK providers needed by later packages. After that transaction succeeds, the `[main]`
-section installs the desktop stack and applications. The manifest does not repeat ordinary dependencies resolved by
-pacman.
+**Systemd runtime.** The launcher requires systemd's owner-only `/run/user/$UID` runtime and keeps its control files in
+`/run/user/$UID/arch-sway-wslg`. It ignores WSLg's shared `XDG_RUNTIME_DIR` value while still connecting to the absolute
+WSLg Wayland socket at `/mnt/wslg/runtime-dir/wayland-0`.
 
-- `xdg-desktop-portal-gtk-dummy` satisfies Arch GTK requirements without installing a guest portal stack that is
-  unnecessary for this WSLg session.
-- `jack2` is the default provider for Waybar's JACK library requirement and is not started; audio continues through WSLg
-  PulseAudio. If `pipewire-jack` is already installed, the installer keeps it and skips `jack2` because the two
-  providers conflict.
-- `qt5-wayland` provides native Wayland support for Qt 5 applications.
-- `oo7` provides the Secret Service backend used to store application credentials, while Seahorse provides its graphical
-  management interface. Before installing `oo7`, the installer checks the `org.freedesktop.secrets` virtual dependency;
-  if a provider such as GNOME Keyring, KeePassXC, or KWallet is already installed, it keeps that provider and skips
-  `oo7`. Seahorse is installed in either case.
-- `maplemono-nf-cn-unhinted` supplies Maple Mono NF CN for Foot.
-- `ttf-nerd-fonts-symbols-mono` satisfies Yazi's Nerd Font requirement and keeps fallback icons aligned to terminal
-  cells; it does not replace the terminal font.
+**Wayland first.** The launcher removes an inherited `WLR_BACKENDS` value so Sway can select its nested Wayland backend,
+but preserves renderer workarounds you set. Applications choose Wayland or XWayland themselves. Fractionally scaled
+XWayland applications may look less sharp than native Wayland applications.
 
-## Runtime Design and Limitations
+**Private D-Bus, and what it costs.** Each managed session runs a private `dbus-run-session`. The benefit is that
+services activated inside Sway inherit the nested display instead of opening on the outer WSLg desktop, and everything
+ends with the session. The costs are real and worth knowing:
 
-Sway connects directly to WSLg's absolute parent Wayland socket at
-`/mnt/wslg/runtime-dir/wayland-0`. WSLg owns the distribution-wide `/tmp/.X11-unix` mapping, so the launcher gives only
-the managed Sway process tree a private `01777` X11 socket directory in a separate mount namespace. A short, fixed sudo
-step creates that namespace and bind mount; its fixed root shell invokes `runuser` before the project launcher continues
-inside the namespace. The session remains in the normal WSL user namespace, so setuid tools such as `sudo` keep working
-inside Sway. The parent WSLg mapping is never unmounted, deleted, or replaced, and no `/etc/wsl.conf` change is needed.
-Sway reserves a display in the private namespace and starts XWayland only when the first X11 client connects. The mount
-namespace disappears with the managed session.
+- Services on your persistent user bus are not reachable from inside the session, and a session application can activate
+  a *second* instance of a service such as the `oo7` Secret Service. Avoid using secret-consuming applications on both
+  buses at the same time.
+- GSettings values are not affected: dconf stores them in a shared file, so the values the installer writes are visible
+  inside the session; only change notifications do not cross buses.
+- Adding an XDG Desktop Portal backend would require deliberate integration with this private bus, which is why portal
+  based file choosers, Flatpak portal access, and Wayland screen sharing are outside the supported scope.
 
-The session remains Wayland-first. Qt and SDL2 use Wayland with X11 fallback; GTK, SDL3, Firefox, and current Electron
-applications use their native backend selection. Fractionally scaled XWayland applications may be less sharp than native
-Wayland applications.
-
-The bundle creates one nested Sway output. Multi-output emulation and multiple independent WSLg windows are outside its
-default scope.
+**Scope.** Up to four nested outputs are supported. Automatic restart after an outer WSLg failure, portals, screen
+sharing, and moving WSLg windows from Linux are not.
 
 ## Credits
 
-The project follows upstream Sway conventions and retains useful nested-Sway, XWayland, and Windows clipboard-sequence
-ideas from
-[jordankoehn/sway-wsl2](https://github.com/jordankoehn/sway-wsl2). Compared with that project's startup script, this
-project does not restart the user systemd service or globally unmount, delete, and recreate `/tmp/.X11-unix`. Its brief
-sudo step creates an isolated mount view for one managed session and invokes the project launcher only after dropping
-back to the user. This keeps WSLg's mapping intact, needs no WSL boot configuration, survives WSLg directory recreation,
-and preserves normal `sudo` behavior inside Sway. It also avoids per-copy process launches and foreground-window-title
-gates.
+The nested-Sway approach and the idea of driving several nested outputs come from
+[jordankoehn/sway-wsl2](https://github.com/jordankoehn/sway-wsl2).
 
 Additional references:
 
@@ -372,4 +435,5 @@ Additional references:
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+The software and configuration are MIT licensed; the bundled `dark-star.jpg` wallpaper is excluded from the MIT grant,
+and its upstream collection does not state a redistribution license. See [LICENSE](LICENSE).

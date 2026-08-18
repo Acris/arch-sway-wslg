@@ -26,15 +26,76 @@ LOCAL_LIBEXEC_DIR="$HOME/.local/libexec/$NAME"
 APPLICATIONS_DIR="$DATA_HOME/applications"
 BACKUP_BASE="$STATE_HOME/$NAME/backups"
 CONTROL_LOCK_FILE="$STATE_HOME/$NAME/control.lock"
-DESKTOP_OVERRIDES_DIR="$ROOT/extras/desktop-overrides"
 LIBEXEC_PAYLOAD_DIR="$ROOT/.local/libexec/$NAME"
-PACKAGE_MANIFEST="$ROOT/packages.conf"
+SETTINGS_DIR="$CONFIG_HOME/$NAME"
+BROWSER_FILE="$SETTINGS_DIR/browser"
+
+DESKTOP_OVERRIDE_FILES=("$ROOT/extras/desktop-overrides/"*.desktop)
+[[ -e "${DESKTOP_OVERRIDE_FILES[0]}" ]] || DESKTOP_OVERRIDE_FILES=()
 
 MANAGED_CONFIG_DIRS=(sway waybar swaync swaynag foot fuzzel yazi)
-BOOTSTRAP_PACKAGES=()
-MAIN_PACKAGES=()
+# Files and directories inside the managed configuration that belong to the
+# user. They survive every reinstall and are read after the managed files.
+LOCAL_OVERRIDE_PATHS=(sway/config.d foot/local.ini fuzzel/local.ini)
+
+# Providers and shared prerequisites that have to be resolved before the
+# desktop stack. jack2 is the default JACK provider and is skipped when
+# pipewire-jack is already installed. Maple Mono ships Nerd Font glyphs but its
+# AUR package does not declare the ttf-font-nerd provider Yazi depends on.
+BOOTSTRAP_PACKAGES=(noto-fonts jack2 ttf-nerd-fonts-symbols-mono)
+
+# Remaining top-level packages. Ordinary dependencies are left to pacman.
+MAIN_PACKAGES=(
+    # Desktop stack
+    sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look
+    qt5-wayland qt6-wayland
+    # Terminal file manager
+    yazi
+    # Credential storage; oo7 is skipped when another Secret Service exists
+    oo7 seahorse
+    # Appearance
+    adw-gtk-theme papirus-icon-theme ttf-sarasa-gothic
+    maplemono-nf-cn-unhinted noto-fonts-emoji
+    # WSLg integration and desktop plumbing
+    wl-clipboard xdg-utils
+)
+
 YAZI_INTEGRATION_PACKAGES=(fd ripgrep fzf zoxide jq 7zip)
 YAZI_PREVIEW_PACKAGES=(ffmpeg poppler resvg imagemagick)
+
+BROWSER_KEYS=(firefox chromium chrome edge none)
+declare -A BROWSER_LABELS=(
+    [firefox]="Firefox"
+    [chromium]="Chromium"
+    [chrome]="Google Chrome"
+    [edge]="Microsoft Edge"
+    [none]="No browser"
+)
+declare -A BROWSER_PACKAGES=(
+    [firefox]="firefox"
+    [chromium]="chromium"
+    [chrome]="google-chrome"
+    [edge]="microsoft-edge-stable-bin"
+)
+declare -A BROWSER_SOURCES=(
+    [firefox]="official repository"
+    [chromium]="official repository"
+    [chrome]="AUR"
+    [edge]="AUR"
+)
+declare -A BROWSER_COMMANDS=(
+    [firefox]="firefox"
+    [chromium]="chromium"
+    [chrome]="google-chrome-stable"
+    [edge]="microsoft-edge-stable"
+)
+BROWSER_CHOICE="firefox"
+declare -A BROWSER_INSTALLED=()
+
+SWAY_SCALE_MAX=4
+SWAY_SCALE=1
+SYSTEMD_RUNTIME_DIR="/run/user/$EUID"
+CONTROL_LOCK_TIMEOUT=30
 
 note() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -45,8 +106,13 @@ usage() {
 Usage: $0
 
 Installs the package set and the $NAME user configuration.
-Managed configuration directories are replaced exactly. The installer asks
-about a backup, Sway output scale, and optional desktop-entry masks.
+
+Managed configuration directories are replaced exactly, except for the local
+override paths (${LOCAL_OVERRIDE_PATHS[*]}), which are always preserved. The
+previous state is copied to $BACKUP_BASE before anything is replaced.
+
+The installer asks for the Sway output scale, a browser, the optional
+desktop-entry masks and the GTK appearance defaults.
 EOF2
 }
 
@@ -69,220 +135,162 @@ prompt_yes_no() {
             y|yes) return 0 ;;
             n|no)  return 1 ;;
             '')
-                if [[ "$default_answer" == yes ]]; then
-                    return 0
-                fi
+                [[ "$default_answer" == yes ]] && return 0
                 return 1
                 ;;
-            *)     warn "please answer y or n" ;;
+            *) warn "please answer y or n" ;;
         esac
     done
 }
 
-prompt_scale() {
-    local answer
+# A browser that is already installed only contributes its BROWSER value; the
+# installer must not run a second package transaction for it.
+detect_installed_browsers() {
+    local key
+    for key in "${BROWSER_KEYS[@]}"; do
+        [[ "$key" != none ]] || continue
+        if paru -Qq "${BROWSER_PACKAGES[$key]}" >/dev/null 2>&1; then
+            BROWSER_INSTALLED[$key]=1
+        else
+            BROWSER_INSTALLED[$key]=0
+        fi
+    done
+}
+
+prompt_browser() {
+    local index key answer marker
+
+    detect_installed_browsers
+
+    note ""
+    note "Web browser (sets BROWSER inside the Sway session):"
+    for index in "${!BROWSER_KEYS[@]}"; do
+        key="${BROWSER_KEYS[$index]}"
+        if [[ "$key" == none ]]; then
+            printf '  %d) %-15s install none; xdg-open keeps the current default\n' \
+                $((index + 1)) "${BROWSER_LABELS[$key]}"
+        else
+            marker=""
+            (( BROWSER_INSTALLED[$key] )) && marker=" [installed]"
+            printf '  %d) %-15s %s (%s)%s\n' $((index + 1)) "${BROWSER_LABELS[$key]}" \
+                "${BROWSER_PACKAGES[$key]}" "${BROWSER_SOURCES[$key]}" "$marker"
+        fi
+    done
 
     while true; do
-        printf 'Sway output scale [1]: ' >&2
+        printf 'Choose a browser [1-%d, default: 1]: ' "${#BROWSER_KEYS[@]}" >&2
         if ! IFS= read -r answer; then
             printf '\n' >&2
-            die "input closed before the scale was answered"
+            die "input closed before the browser was chosen"
         fi
-        [[ -n "$answer" ]] || answer="1"
-        [[ "$answer" == .* ]] && answer="0$answer"
-
-        if [[ "$answer" =~ ^[0-9]+([.][0-9]+)?$ ]] && \
-           [[ ! "$answer" =~ ^0+([.]0+)?$ ]]; then
-            printf '%s\n' "$answer"
+        [[ -n "$answer" ]] || answer=1
+        if [[ "$answer" =~ ^[0-9]+$ ]] && \
+           (( answer >= 1 && answer <= ${#BROWSER_KEYS[@]} )); then
+            BROWSER_CHOICE="${BROWSER_KEYS[$((answer - 1))]}"
             return 0
         fi
-        warn "scale must be a positive decimal number (for example: 1, 1.25, 1.5, 2)"
+        warn "enter a number from 1 through ${#BROWSER_KEYS[@]}"
     done
+}
+
+user_bus_command() {
+    env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
+        XDG_RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR" "$@"
+}
+
+systemctl_user() {
+    user_bus_command systemctl --user "$@"
+}
+
+systemd_user_usable() {
+    [[ -d /run/systemd/system && -d "$SYSTEMD_RUNTIME_DIR" && \
+       -O "$SYSTEMD_RUNTIME_DIR" && -w "$SYSTEMD_RUNTIME_DIR" && \
+       -S "$SYSTEMD_RUNTIME_DIR/bus" ]] || return 1
+    systemctl_user show-environment >/dev/null 2>&1
+}
+
+gsettings_user() {
+    user_bus_command gsettings "$@"
+}
+
+first_generated_locale() {
+    local locale_name lower
+    while IFS= read -r locale_name; do
+        lower="${locale_name,,}"
+        case "$lower" in
+            c|c.utf8|c.utf-8|posix) continue ;;
+        esac
+        printf '%s\n' "$locale_name"
+        return 0
+    done < <(locale -a 2>/dev/null)
+    return 1
 }
 
 preflight() {
     (( EUID != 0 )) || die "run this installer as your normal Arch user, not as root"
 
-    local command_name config_name helper_name
-    for command_name in paru bash cp env flock install mkdir mktemp mount mv readlink rm \
-                        runuser sed sudo unshare; do
+    local command_name config_name generated_locale
+    for command_name in paru flock sudo systemctl timeout; do
         command -v "$command_name" >/dev/null 2>&1 || \
             die "required command not found: $command_name"
     done
 
     grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || \
         die "this installer is only supported inside WSL2"
+    systemd_user_usable || \
+        die "systemd and its user manager are required; restart this Arch WSL distribution with systemd"
 
     [[ -s "$ROOT/VERSION" ]] || die "version file is missing or empty: $ROOT/VERSION"
-    [[ -d "$ROOT/.config" ]] || die "configuration payload is missing: $ROOT/.config"
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
         [[ -d "$ROOT/.config/$config_name" ]] || \
             die "managed configuration payload is missing: $ROOT/.config/$config_name"
     done
     [[ -x "$ROOT/.local/bin/$NAME" ]] || die "launcher payload is missing: $ROOT/.local/bin/$NAME"
-    [[ -d "$LIBEXEC_PAYLOAD_DIR" ]] || \
-        die "private helper payload is missing: $LIBEXEC_PAYLOAD_DIR"
-    for helper_name in clipboard-protocol.sh windows-clipboard-setter.ps1 windows-clipboard-watcher.ps1; do
-        [[ -s "$LIBEXEC_PAYLOAD_DIR/$helper_name" ]] || \
-            die "private helper payload is missing: $LIBEXEC_PAYLOAD_DIR/$helper_name"
+    [[ -x "$LIBEXEC_PAYLOAD_DIR/clipboard-bridge" ]] || \
+        die "clipboard bridge payload is missing: $LIBEXEC_PAYLOAD_DIR/clipboard-bridge"
+    ((${#DESKTOP_OVERRIDE_FILES[@]})) || die "desktop-entry overrides are missing"
+
+    generated_locale="$(first_generated_locale || true)"
+    [[ -n "$generated_locale" ]] || \
+        die "generate at least one locale before installing; see README.md"
+}
+
+# -----------------------------------------------------------------------------
+# Sway output scale
+# -----------------------------------------------------------------------------
+# WSLg performs the scaling Wayland cannot express itself on the Windows side
+# and keeps advertising scale 1 on its parent wl_output, so a fractional Windows
+# setting such as 125% is not observable from Linux. Ask instead of guessing.
+prompt_scale() {
+    local answer
+
+    note ""
+    note "Sway output scale (match your Windows display scaling):"
+    note "  100% -> 1    125% -> 1.25    150% -> 1.5    175% -> 1.75    200% -> 2"
+
+    while true; do
+        printf 'Sway output scale [1-%d, default: 1]: ' "$SWAY_SCALE_MAX" >&2
+        if ! IFS= read -r answer; then
+            printf '\n' >&2
+            die "input closed before the scale was answered"
+        fi
+        [[ -n "$answer" ]] || answer=1
+        if [[ "$answer" =~ ^[1-3]([.][0-9]+)?$ || "$answer" =~ ^4([.]0+)?$ ]]; then
+            SWAY_SCALE="$answer"
+            note "Change it any time in $CONFIG_HOME/sway/config.d/, for example: output * scale 1.5"
+            return 0
+        fi
+        warn "enter a number from 1 through $SWAY_SCALE_MAX, for example: 1, 1.25, 1.5, 2"
     done
-    grep -Fq "VERSION=\"$VERSION\"" "$ROOT/.local/bin/$NAME" || \
-        die "launcher version does not match VERSION"
-    [[ -s "$PACKAGE_MANIFEST" ]] || die "package manifest is missing or empty: $PACKAGE_MANIFEST"
-    compgen -G "$DESKTOP_OVERRIDES_DIR/*.desktop" >/dev/null || \
-        die "desktop-entry overrides are missing"
-
-    if ! locale -a 2>/dev/null | grep -Eiq '^en_US[.]utf-?8$'; then
-        die "generate en_US.UTF-8 before installing; see README.md"
-    fi
-    [[ "$(locale charmap 2>/dev/null || true)" == "UTF-8" ]] || \
-        die "the current locale is not UTF-8; see README.md"
-
-    if [[ ! -S /mnt/wslg/runtime-dir/wayland-0 || ! -S /mnt/wslg/PulseServer ]]; then
-        warn "WSLg Wayland/Pulse sockets are not active; installation will continue"
-        warn "run '$NAME doctor' from a WSLg session before starting Sway"
-    fi
-    if [[ ! -d /tmp/.X11-unix ]]; then
-        warn "WSLg's /tmp/.X11-unix mapping is missing"
-        warn "run '$NAME doctor' after installation for detailed diagnostics"
-    fi
-    local windows_powershell="${WINDOWS_POWERSHELL:-}"
-    if [[ -n "$windows_powershell" ]]; then
-        if [[ ! -x "$windows_powershell" ]]; then
-            warn "WINDOWS_POWERSHELL is not executable: $windows_powershell"
-            warn "installation will continue, but the clipboard bridge will not work until it is corrected"
-        fi
-    elif command -v powershell.exe >/dev/null 2>&1; then
-        : # Preferred: Windows PATH projected into WSL.
-    elif [[ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]]; then
-        : # Compatibility fallback for the default WSL automount layout.
-    else
-        warn "Windows PowerShell 5.1 was not found through WSL interop or the default /mnt/c fallback"
-        warn "installation will continue, but the clipboard bridge will not work"
-    fi
 }
 
-load_packages() {
-    local line package section=""
-    local -A seen=()
-    BOOTSTRAP_PACKAGES=()
-    MAIN_PACKAGES=()
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -n "$line" && "$line" != \#* ]] || continue
-
-        case "$line" in
-            "[bootstrap]")
-                [[ -z "$section" ]] || die "invalid or repeated [bootstrap] section"
-                section="bootstrap"
-                continue
-                ;;
-            "[main]")
-                [[ "$section" == "bootstrap" ]] || die "[main] must follow [bootstrap]"
-                section="main"
-                continue
-                ;;
-            \[*\]) die "unknown package manifest section: $line" ;;
-        esac
-
-        [[ -n "$section" ]] || die "package appears before a manifest section: $line"
-        [[ "$line" =~ ^[a-zA-Z0-9@._+:-]+$ ]] || \
-            die "invalid package manifest line: $line"
-        package="$line"
-        [[ -z "${seen[$package]:-}" ]] || die "duplicate package in manifest: $package"
-        seen[$package]=1
-        if [[ "$section" == "bootstrap" ]]; then
-            BOOTSTRAP_PACKAGES+=("$package")
-        else
-            MAIN_PACKAGES+=("$package")
-        fi
-    done < "$PACKAGE_MANIFEST"
-
-    ((${#BOOTSTRAP_PACKAGES[@]})) || die "package manifest contains no bootstrap packages"
-    ((${#MAIN_PACKAGES[@]})) || die "package manifest contains no main packages"
-}
-
-protect_active_session() {
-    local installed_launcher="$LOCAL_BIN_DIR/$NAME" status_output
-
-    if [[ -x "$installed_launcher" ]] && \
-       status_output="$("$installed_launcher" status 2>&1)"; then
-        note "$status_output"
-        if ! prompt_yes_no "A managed Sway session is running. Stop it before installing?" yes; then
-            die "installation cannot replace launcher files while Sway is running"
-        fi
-        "$installed_launcher" stop || die "failed to stop the managed Sway session"
-    fi
-
-    # Hold the launcher's control lock through package installation and payload
-    # replacement so another terminal cannot start a new managed session in the
-    # gap after the check above.
-    mkdir -p "$STATE_HOME/$NAME"
-    chmod 700 "$STATE_HOME/$NAME"
-    exec 8>"$CONTROL_LOCK_FILE"
-    flock 8
-
-    if [[ -x "$installed_launcher" ]] && "$installed_launcher" status >/dev/null 2>&1; then
-        die "a managed Sway session started while the installer was preparing; stop it and retry"
-    fi
-}
-
-BACKUP_DIR=""
-BACKUP_COUNT=0
-
-ensure_backup_dir() {
-    [[ -z "$BACKUP_DIR" ]] || return 0
-    mkdir -p "$BACKUP_BASE"
-    chmod 700 "$BACKUP_BASE"
-    BACKUP_DIR="$(mktemp -d "$BACKUP_BASE/$(date +%Y%m%d-%H%M%S).XXXXXX")"
-}
-
-backup_item() {
-    local source_path="$1" relative_path="$2"
-    [[ -e "$source_path" || -L "$source_path" ]] || return 0
-
-    ensure_backup_dir
-    mkdir -p "$(dirname -- "$BACKUP_DIR/$relative_path")"
-    cp -a -- "$source_path" "$BACKUP_DIR/$relative_path"
-    BACKUP_COUNT=$((BACKUP_COUNT + 1))
-}
-
-backup_existing_files() {
-    local include_desktop_overrides="$1" config_name source_file basename
-
-    for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
-        backup_item "$CONFIG_HOME/$config_name" "config/$config_name"
-    done
-    backup_item "$LOCAL_BIN_DIR/$NAME" "local/bin/$NAME"
-    backup_item "$LOCAL_LIBEXEC_DIR" "local/libexec/$NAME"
-
-    if (( include_desktop_overrides )); then
-        for source_file in "$DESKTOP_OVERRIDES_DIR"/*.desktop; do
-            basename="${source_file##*/}"
-            backup_item "$APPLICATIONS_DIR/$basename" "data/applications/$basename"
-        done
-    fi
-
-    if (( BACKUP_COUNT == 0 )); then
-        note "No existing managed files needed a backup."
-        return 0
-    fi
-
-    {
-        printf 'Created: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
-        printf 'Original config root: %s\n' "$CONFIG_HOME"
-        printf 'Original data root: %s\n' "$DATA_HOME"
-        printf 'Original launcher root: %s\n' "$LOCAL_BIN_DIR"
-    } > "$BACKUP_DIR/RESTORE-INFO.txt"
-    note "Backup: $BACKUP_DIR"
-}
-
+# -----------------------------------------------------------------------------
+# Packages
+# -----------------------------------------------------------------------------
 install_packages() {
     local package
     local -a selected_bootstrap=()
-    local -a selected_main=()
+    local -a selected_main=("${MAIN_PACKAGES[@]}")
 
     if paru -Qq pipewire-jack >/dev/null 2>&1; then
         for package in "${BOOTSTRAP_PACKAGES[@]}"; do
@@ -295,16 +303,22 @@ install_packages() {
 
     note ""
     note "Updating Arch and installing ${#selected_bootstrap[@]} bootstrap packages..."
-    note "Paru may request sudo to update the system and install the packages listed in packages.conf."
+    note "Paru may request sudo to update the system and install packages."
     paru -Syu --needed "${selected_bootstrap[@]}"
 
     if paru -T org.freedesktop.secrets >/dev/null 2>&1; then
+        selected_main=()
         for package in "${MAIN_PACKAGES[@]}"; do
             [[ "$package" == oo7 ]] || selected_main+=("$package")
         done
         note "An org.freedesktop.secrets credential manager is already installed; skipping oo7."
-    else
-        selected_main=("${MAIN_PACKAGES[@]}")
+    fi
+    if [[ "$BROWSER_CHOICE" != none ]]; then
+        if (( ${BROWSER_INSTALLED[$BROWSER_CHOICE]:-0} )); then
+            note "${BROWSER_LABELS[$BROWSER_CHOICE]} is already installed; skipping ${BROWSER_PACKAGES[$BROWSER_CHOICE]}."
+        else
+            selected_main+=("${BROWSER_PACKAGES[$BROWSER_CHOICE]}")
+        fi
     fi
 
     note ""
@@ -312,9 +326,123 @@ install_packages() {
     paru -S --needed "${selected_main[@]}"
 }
 
-TRANSACTION_TARGETS=()
-TRANSACTION_ROLLBACKS=()
-TRANSACTION_HAD_OLD=()
+write_browser_choice() {
+    [[ "$BROWSER_CHOICE" != none ]] || return 0
+    local browser_command="${BROWSER_COMMANDS[$BROWSER_CHOICE]}"
+
+    mkdir -p "$SETTINGS_DIR"
+    printf '%s\n' "$browser_command" > "$BROWSER_FILE"
+    note "BROWSER inside Sway: $browser_command"
+}
+
+# -----------------------------------------------------------------------------
+# Session protection
+# -----------------------------------------------------------------------------
+stop_active_session() {
+    local installed_launcher="$LOCAL_BIN_DIR/$NAME" status_output
+
+    [[ -x "$installed_launcher" ]] || return 0
+    status_output="$("$installed_launcher" status 2>&1)" || return 0
+
+    note "$status_output"
+    prompt_yes_no "A managed Sway session is running. Stop it before installing?" yes || \
+        die "installation cannot replace launcher files while Sway is running"
+    "$installed_launcher" stop || die "failed to stop the managed Sway session"
+}
+
+# The launcher control lock is only held around the payload transaction, so a
+# long package update never blocks another terminal from starting Sway.
+take_control_lock() {
+    local installed_launcher="$LOCAL_BIN_DIR/$NAME"
+
+    mkdir -p "$STATE_HOME/$NAME"
+    chmod 700 "$STATE_HOME/$NAME"
+    exec 8>"$CONTROL_LOCK_FILE"
+    flock -w "$CONTROL_LOCK_TIMEOUT" 8 || \
+        die "another $NAME command has held the control lock for more than ${CONTROL_LOCK_TIMEOUT}s"
+
+    if [[ -x "$installed_launcher" ]] && "$installed_launcher" status >/dev/null 2>&1; then
+        die "a managed Sway session started while the installer was preparing; stop it and retry"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Backup
+# -----------------------------------------------------------------------------
+BACKUP_DIR=""
+BACKUP_COUNT=0
+
+backup_item() {
+    local source_path="$1" relative_path="$2"
+    [[ -e "$source_path" || -L "$source_path" ]] || return 0
+
+    mkdir -p "$(dirname -- "$BACKUP_DIR/$relative_path")"
+    cp -a -- "$source_path" "$BACKUP_DIR/$relative_path"
+    BACKUP_COUNT=$((BACKUP_COUNT + 1))
+}
+
+backup_existing_files() {
+    local include_desktop_overrides="$1" config_name source_file basename
+
+    mkdir -p "$BACKUP_BASE"
+    chmod 700 "$BACKUP_BASE"
+    BACKUP_DIR="$(mktemp -d "$BACKUP_BASE/$(date +%Y%m%d-%H%M%S).XXXXXX")"
+
+    for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
+        backup_item "$CONFIG_HOME/$config_name" "config/$config_name"
+    done
+    backup_item "$LOCAL_BIN_DIR/$NAME" "local/bin/$NAME"
+    backup_item "$LOCAL_LIBEXEC_DIR" "local/libexec/$NAME"
+
+    if (( include_desktop_overrides )); then
+        for source_file in "${DESKTOP_OVERRIDE_FILES[@]}"; do
+            basename="${source_file##*/}"
+            backup_item "$APPLICATIONS_DIR/$basename" "data/applications/$basename"
+        done
+    fi
+
+    if (( BACKUP_COUNT == 0 )); then
+        rmdir "$BACKUP_DIR"
+        BACKUP_DIR=""
+        note "No existing managed files needed a backup."
+        return 0
+    fi
+
+    {
+        printf 'Created: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
+        printf 'Version: %s\n' "$VERSION"
+        printf 'Original config root: %s\n' "$CONFIG_HOME"
+        printf 'Original data root: %s\n' "$DATA_HOME"
+        printf 'Original launcher root: %s\n' "$LOCAL_BIN_DIR"
+        printf '\nRestore a directory with:\n'
+        printf '  rm -rf "%s/sway" && cp -a "%s/config/sway" "%s/sway"\n' \
+            "$CONFIG_HOME" "$BACKUP_DIR" "$CONFIG_HOME"
+    } > "$BACKUP_DIR/RESTORE-INFO.txt"
+    note "Backup: $BACKUP_DIR"
+}
+
+# -----------------------------------------------------------------------------
+# Payload transaction
+# -----------------------------------------------------------------------------
+# Every managed path is staged on the same filesystem, checked, then swapped in
+# with rename operations. A failure or signal restores the previous state in
+# reverse order.
+STAGE_CONFIG=""
+STAGE_LOCAL=""
+STAGE_DATA=""
+TRANSACTION_ENTRIES=()
+
+cleanup_staging() {
+    local path
+    for path in "$STAGE_CONFIG" "$STAGE_LOCAL" "$STAGE_DATA"; do
+        if [[ -n "$path" ]]; then
+            rm -rf -- "$path"
+        fi
+    done
+    STAGE_CONFIG=""
+    STAGE_LOCAL=""
+    STAGE_DATA=""
+}
 
 transaction_replace() {
     local staged="$1" target="$2" rollback had_old=0
@@ -323,201 +451,206 @@ transaction_replace() {
         warn "stale transaction rollback path exists: $rollback"
         return 1
     fi
+    [[ -e "$target" || -L "$target" ]] && had_old=1
 
-    if [[ -e "$target" || -L "$target" ]]; then
-        mv -- "$target" "$rollback" || return 1
-        had_old=1
-    fi
-    if ! mv -- "$staged" "$target"; then
-        (( had_old )) && mv -- "$rollback" "$target" 2>/dev/null || true
+    # Register before moving anything so the signal handler also knows about an
+    # in-flight replacement.
+    TRANSACTION_ENTRIES+=("$target"$'\t'"$rollback"$'\t'"$had_old")
+    if (( had_old )) && ! mv -- "$target" "$rollback"; then
         return 1
     fi
-
-    TRANSACTION_TARGETS+=("$target")
-    TRANSACTION_ROLLBACKS+=("$rollback")
-    TRANSACTION_HAD_OLD+=("$had_old")
+    mv -- "$staged" "$target"
 }
 
 transaction_rollback() {
-    local index target rollback had_old
-    for (( index=${#TRANSACTION_TARGETS[@]}-1; index>=0; index-- )); do
-        target="${TRANSACTION_TARGETS[$index]}"
-        rollback="${TRANSACTION_ROLLBACKS[$index]}"
-        had_old="${TRANSACTION_HAD_OLD[$index]}"
-        rm -rf -- "$target"
+    local index entry target rollback had_old failed=0
+    for (( index=${#TRANSACTION_ENTRIES[@]} - 1; index >= 0; index-- )); do
+        entry="${TRANSACTION_ENTRIES[$index]}"
+        IFS=$'\t' read -r target rollback had_old <<< "$entry"
         if (( had_old )); then
-            mv -- "$rollback" "$target" 2>/dev/null || \
+            # No rollback copy means the target was never moved aside.
+            [[ -e "$rollback" || -L "$rollback" ]] || continue
+            rm -rf -- "$target"
+            if ! mv -- "$rollback" "$target"; then
                 warn "manual recovery required: $rollback -> $target"
+                failed=1
+            fi
+        else
+            rm -rf -- "$target"
         fi
     done
+    TRANSACTION_ENTRIES=()
+    return "$failed"
 }
 
 transaction_finish() {
-    local rollback
-    for rollback in "${TRANSACTION_ROLLBACKS[@]}"; do
-        rm -rf -- "$rollback"
+    local entry rollback
+    for entry in "${TRANSACTION_ENTRIES[@]}"; do
+        rollback="${entry#*$'\t'}"
+        rm -rf -- "${rollback%$'\t'*}"
     done
-    TRANSACTION_TARGETS=()
-    TRANSACTION_ROLLBACKS=()
-    TRANSACTION_HAD_OLD=()
+    TRANSACTION_ENTRIES=()
 }
 
-cleanup_staging_paths() {
-    local config_stage="$1" local_stage="$2" data_stage="${3:-}"
-    [[ -z "$config_stage" ]] || rm -rf -- "$config_stage"
-    [[ -z "$local_stage" ]] || rm -rf -- "$local_stage"
-    [[ -z "$data_stage" ]] || rm -rf -- "$data_stage"
+payload_fail() {
+    local recovery="previous files were restored"
+    transaction_rollback || recovery="rollback was incomplete; review the warnings above"
+    cleanup_staging
+    die "$1; $recovery"
 }
 
-payload_transaction_fail() {
-    local message="$1" config_stage="$2" local_stage="$3" data_stage="${4:-}"
-    transaction_rollback
-    cleanup_staging_paths "$config_stage" "$local_stage" "$data_stage"
-    die "$message; previous files were restored"
+# -----------------------------------------------------------------------------
+# Payload rendering
+# -----------------------------------------------------------------------------
+render_marker() {
+    local file="$1" marker="$2" value="$3" content occurrences
+
+    occurrences="$(grep -Fc -- "$marker" "$file" || true)"
+    if [[ "$occurrences" != 1 ]]; then
+        warn "expected exactly one $marker in $file"
+        return 1
+    fi
+    content="$(<"$file")"
+    printf '%s\n' "${content//"$marker"/"$value"}" > "$file"
 }
 
-validate_staged_payload() {
-    local config_stage="$1" local_stage="$2"
-    local sway_config="$config_stage/sway/config"
-    local validation_runtime="$local_stage/validation-runtime"
-    local validation_x11="$local_stage/validation-x11" x11_target user_name
+sway_wallpaper_value() {
+    local path="$CONFIG_HOME/sway/wallpapers/dark-star.jpg"
 
-    [[ -s "$config_stage/sway/wallpapers/dark-star.jpg" ]] || {
+    [[ "$path" != *$'\n'* && "$path" != *$'\r'* && \
+       "$path" != *'"'* && "$path" != *'\'* ]] || {
+        warn "configuration root contains a quote, backslash, or newline unsupported by the Sway config"
+        return 1
+    }
+    # Sway uses a doubled dollar sign for a literal dollar sign in a variable
+    # value. Spaces stay protected by the quotes already in the config.
+    printf '%s\n' "${path//\$/\$\$}"
+}
+
+seed_local_override() {
+    local target="$1"
+    shift
+    [[ -e "$target" ]] && return 0
+    printf '%s\n' "$@" > "$target"
+}
+
+# Keep the user's own override files and create them on a first installation.
+stage_local_overrides() {
+    local relative
+
+    for relative in "${LOCAL_OVERRIDE_PATHS[@]}"; do
+        if [[ -e "$CONFIG_HOME/$relative" ]]; then
+            cp -a -- "$CONFIG_HOME/$relative" "$STAGE_CONFIG/$relative" || return 1
+        fi
+    done
+
+    mkdir -p "$STAGE_CONFIG/sway/config.d" || return 1
+    seed_local_override "$STAGE_CONFIG/sway/config.d/10-local.conf" \
+        '# Personal Sway configuration. This directory is never replaced by' \
+        '# arch-sway-wslg and is included after every managed setting.' \
+        '#' \
+        '# Examples:' \
+        '#   output * scale 1.5' \
+        '#   workspace 1 output WL-1' \
+        '#   workspace 9 output WL-2' \
+        '#   bindsym $mod+p exec firefox'
+    seed_local_override "$STAGE_CONFIG/foot/local.ini" \
+        '# Personal Foot configuration; never replaced by arch-sway-wslg.' \
+        '# Options set here win, for example:' \
+        '#   [main]' \
+        '#   font=Maple Mono NF CN:size=12'
+    seed_local_override "$STAGE_CONFIG/fuzzel/local.ini" \
+        '# Personal Fuzzel configuration; never replaced by arch-sway-wslg.' \
+        '# Options set here win, for example:' \
+        '#   [main]' \
+        '#   lines=12'
+}
+
+render_staged_payload() {
+    local wallpaper
+
+    render_marker "$STAGE_LOCAL/bin/$NAME" "__ARCH_SWAY_WSLG_VERSION__" "$VERSION" || return 1
+    render_marker "$STAGE_CONFIG/sway/config" "__ARCH_SWAY_WSLG_SCALE__" "$SWAY_SCALE" || return 1
+    wallpaper="$(sway_wallpaper_value)" || return 1
+    render_marker "$STAGE_CONFIG/sway/config" "__ARCH_SWAY_WSLG_WALLPAPER__" "$wallpaper" || return 1
+    render_marker "$STAGE_CONFIG/foot/foot.ini" "__ARCH_SWAY_WSLG_FOOT_LOCAL__" \
+        "$CONFIG_HOME/foot/local.ini" || return 1
+    render_marker "$STAGE_CONFIG/fuzzel/fuzzel.ini" "__ARCH_SWAY_WSLG_FUZZEL_LOCAL__" \
+        "$CONFIG_HOME/fuzzel/local.ini" || return 1
+}
+
+check_staged_payload() {
+    [[ -s "$STAGE_CONFIG/sway/wallpapers/dark-star.jpg" ]] || {
         warn "staged Sway wallpaper payload is missing"
         return 1
     }
-
-    command -v Xwayland >/dev/null 2>&1 || {
-        warn "Xwayland is not installed"
-        return 1
-    }
-    grep -Eq '^[[:space:]]*xwayland[[:space:]]+enable([[:space:]]|$)' "$sway_config" || {
-        warn "xwayland enable is missing from the staged Sway config"
-        return 1
-    }
-    bash -n "$local_stage/bin/$NAME" || return 1
-    bash -n "$local_stage/libexec/$NAME/clipboard-protocol.sh" || return 1
-
-    x11_target="$(readlink -f -- /tmp/.X11-unix)"
-    [[ -d "$x11_target" ]] || {
-        warn "WSLg X11 socket directory target is unavailable: $x11_target"
-        return 1
-    }
-    mkdir -p "$validation_runtime" "$validation_x11"
-    chmod 700 "$validation_runtime"
-    chmod 1777 "$validation_x11"
-    user_name="$(id -un)"
-
-    note "Sudo is required only to validate Sway inside a temporary private X11 mount namespace."
-    note "Validation runs as your normal user and does not change the global WSLg X11 mapping."
-    sudo -v || {
-        warn "sudo authorization failed"
-        return 1
-    }
-    if ! sudo -n -- unshare --mount --propagation private -- \
-        sh -c 'mount --bind "$1" "$2" && exec runuser -u "$3" -- "$4" __validate "$5" "$6" "$7"' \
-        _ "$validation_x11" "$x11_target" "$user_name" "$local_stage/bin/$NAME" \
-        "$sway_config" "$validation_runtime" /mnt/wslg/runtime-dir/wayland-0; then
-        warn "staged Sway config validation failed"
-        return 1
-    fi
-    XDG_CONFIG_HOME="$config_stage" foot -C || {
-        warn "staged Foot config validation failed"
-        return 1
-    }
-    XDG_CONFIG_HOME="$config_stage" fuzzel --check-config || {
-        warn "staged Fuzzel config validation failed"
-        return 1
-    }
+    bash -n "$STAGE_LOCAL/bin/$NAME" || return 1
+    bash -n "$STAGE_LOCAL/libexec/$NAME/clipboard-bridge" || return 1
 }
 
 install_payload() {
-    local include_desktop_overrides="$1" sway_scale="$2"
-    local config_name source_file basename sway_config
-    local config_stage local_stage data_stage
+    local include_desktop_overrides="$1" config_name source_file basename
 
     note ""
-    note "Staging and validating the configuration payload before installation..."
+    note "Staging and checking the configuration payload before installation..."
     mkdir -p "$CONFIG_HOME" "$HOME/.local" "$LOCAL_BIN_DIR" "$HOME/.local/libexec"
     (( include_desktop_overrides )) && mkdir -p "$APPLICATIONS_DIR"
-    config_stage="$(mktemp -d "$CONFIG_HOME/.${NAME}.config.XXXXXX")" || \
+
+    STAGE_CONFIG="$(mktemp -d "$CONFIG_HOME/.${NAME}.config.XXXXXX")" || \
         die "failed to create configuration staging directory"
-    local_stage="$(mktemp -d "$HOME/.local/.${NAME}.local.XXXXXX")" || {
-        cleanup_staging_paths "$config_stage" "" ""
+    STAGE_LOCAL="$(mktemp -d "$HOME/.local/.${NAME}.local.XXXXXX")" || {
+        cleanup_staging
         die "failed to create launcher staging directory"
     }
-    data_stage=""
     if (( include_desktop_overrides )); then
-        data_stage="$(mktemp -d "$APPLICATIONS_DIR/.${NAME}.desktop.XXXXXX")" || {
-            cleanup_staging_paths "$config_stage" "$local_stage" ""
+        STAGE_DATA="$(mktemp -d "$APPLICATIONS_DIR/.${NAME}.desktop.XXXXXX")" || {
+            cleanup_staging
             die "failed to create desktop-entry staging directory"
         }
     fi
-    trap 'transaction_rollback; cleanup_staging_paths "$config_stage" "$local_stage" "$data_stage"; die "payload transaction interrupted; previous files were restored"' INT TERM HUP
+    trap 'payload_fail "payload transaction interrupted"' INT TERM HUP
 
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
-        cp -a -- "$ROOT/.config/$config_name" "$config_stage/$config_name" || \
-            payload_transaction_fail "failed to stage config/$config_name" \
-                "$config_stage" "$local_stage" "$data_stage"
+        cp -a -- "$ROOT/.config/$config_name" "$STAGE_CONFIG/$config_name" || \
+            payload_fail "failed to stage config/$config_name"
     done
-    mkdir -p "$local_stage/bin" "$local_stage/libexec" || \
-        payload_transaction_fail "failed to create launcher staging layout" \
-            "$config_stage" "$local_stage" "$data_stage"
-    install -m 755 -- "$ROOT/.local/bin/$NAME" "$local_stage/bin/$NAME" || \
-        payload_transaction_fail "failed to stage the launcher" \
-            "$config_stage" "$local_stage" "$data_stage"
-    cp -a -- "$LIBEXEC_PAYLOAD_DIR" "$local_stage/libexec/$NAME" || \
-        payload_transaction_fail "failed to stage private launcher helpers" \
-            "$config_stage" "$local_stage" "$data_stage"
+    mkdir -p "$STAGE_LOCAL/bin" "$STAGE_LOCAL/libexec" || \
+        payload_fail "failed to create launcher staging layout"
+    install -m 755 -- "$ROOT/.local/bin/$NAME" "$STAGE_LOCAL/bin/$NAME" || \
+        payload_fail "failed to stage the launcher"
+    cp -a -- "$LIBEXEC_PAYLOAD_DIR" "$STAGE_LOCAL/libexec/$NAME" || \
+        payload_fail "failed to stage private launcher helpers"
     if (( include_desktop_overrides )); then
-        for source_file in "$DESKTOP_OVERRIDES_DIR"/*.desktop; do
-            install -m 644 -- "$source_file" "$data_stage/${source_file##*/}" || \
-                payload_transaction_fail "failed to stage ${source_file##*/}" \
-                    "$config_stage" "$local_stage" "$data_stage"
-        done
+        install -m 644 -- "${DESKTOP_OVERRIDE_FILES[@]}" "$STAGE_DATA/" || \
+            payload_fail "failed to stage desktop-entry overrides"
     fi
 
-    # Validate the complete staged payload before any managed path is touched.
-    sway_config="$config_stage/sway/config"
-    if [[ "$(grep -Ec '^[[:space:]]*scale[[:space:]]+[0-9]+([.][0-9]+)?[[:space:]]*$' "$sway_config")" != 1 ]]; then
-        cleanup_staging_paths "$config_stage" "$local_stage" "$data_stage"
-        die "expected exactly one Sway output scale directive in $sway_config"
-    fi
-    sed -i -E \
-        "s/^([[:space:]]*)scale[[:space:]]+[0-9]+([.][0-9]+)?[[:space:]]*$/\\1scale $sway_scale/" \
-        "$sway_config" || payload_transaction_fail "failed to stage the selected Sway scale" \
-            "$config_stage" "$local_stage" "$data_stage"
-    validate_staged_payload "$config_stage" "$local_stage" || \
-        payload_transaction_fail "staged payload validation failed" \
-            "$config_stage" "$local_stage" "$data_stage"
+    stage_local_overrides || payload_fail "failed to stage the local override files"
+    render_staged_payload || payload_fail "failed to render the staged payload"
+    check_staged_payload || payload_fail "staged payload check failed"
 
-    TRANSACTION_TARGETS=()
-    TRANSACTION_ROLLBACKS=()
-    TRANSACTION_HAD_OLD=()
+    TRANSACTION_ENTRIES=()
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
-        if ! transaction_replace "$config_stage/$config_name" "$CONFIG_HOME/$config_name"; then
-            payload_transaction_fail "payload transaction failed while replacing config/$config_name" \
-                "$config_stage" "$local_stage" "$data_stage"
-        fi
+        transaction_replace "$STAGE_CONFIG/$config_name" "$CONFIG_HOME/$config_name" || \
+            payload_fail "payload transaction failed while replacing config/$config_name"
     done
-    if ! transaction_replace "$local_stage/bin/$NAME" "$LOCAL_BIN_DIR/$NAME" || \
-       ! transaction_replace "$local_stage/libexec/$NAME" "$LOCAL_LIBEXEC_DIR"; then
-        payload_transaction_fail "payload transaction failed while replacing launcher files" \
-            "$config_stage" "$local_stage" "$data_stage"
-    fi
+    transaction_replace "$STAGE_LOCAL/bin/$NAME" "$LOCAL_BIN_DIR/$NAME" || \
+        payload_fail "payload transaction failed while replacing the launcher"
+    transaction_replace "$STAGE_LOCAL/libexec/$NAME" "$LOCAL_LIBEXEC_DIR" || \
+        payload_fail "payload transaction failed while replacing the private helpers"
     if (( include_desktop_overrides )); then
-        for source_file in "$data_stage"/*.desktop; do
+        for source_file in "${DESKTOP_OVERRIDE_FILES[@]}"; do
             basename="${source_file##*/}"
-            if ! transaction_replace "$source_file" "$APPLICATIONS_DIR/$basename"; then
-                payload_transaction_fail "payload transaction failed while installing $basename" \
-                    "$config_stage" "$local_stage" "$data_stage"
-            fi
+            transaction_replace "$STAGE_DATA/$basename" "$APPLICATIONS_DIR/$basename" || \
+                payload_fail "payload transaction failed while installing $basename"
         done
     fi
 
-    transaction_finish
-    cleanup_staging_paths "$config_stage" "$local_stage" "$data_stage"
+    # The installed payload is now the committed state. Disable rollback before
+    # deleting its copies so an interrupt cannot remove a committed target.
     trap - INT TERM HUP
+    transaction_finish
+    cleanup_staging
     if (( include_desktop_overrides )); then
         note "Desktop-entry overrides: installed"
     else
@@ -528,31 +661,88 @@ install_payload() {
 list_desktop_overrides() {
     local source_file
     note "Optional desktop-entry overrides:"
-    for source_file in "$DESKTOP_OVERRIDES_DIR"/*.desktop; do
+    for source_file in "${DESKTOP_OVERRIDE_FILES[@]}"; do
         printf '  %s\n' "$APPLICATIONS_DIR/${source_file##*/}"
     done
 }
 
-APPEARANCE_SUMMARY="not applied"
+# -----------------------------------------------------------------------------
+# GTK appearance
+# -----------------------------------------------------------------------------
+APPEARANCE_SCHEMA="org.gnome.desktop.interface"
+APPEARANCE_KEYS=(gtk-theme color-scheme icon-theme font-name cursor-theme cursor-size)
+APPEARANCE_VALUES=("'adw-gtk3-dark'" "'prefer-dark'" "'Papirus-Dark'" \
+                   "'Sarasa UI SC 11'" "'Adwaita'" '28')
+APPEARANCE_REQUESTED=0
+APPEARANCE_SUMMARY="not requested"
 
-apply_appearance_defaults() {
-    local failed=0
-    gsettings set org.gnome.desktop.interface gtk-theme 'adw-gtk3-dark' || failed=1
-    gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' || failed=1
-    gsettings set org.gnome.desktop.interface icon-theme 'Papirus-Dark' || failed=1
-    gsettings set org.gnome.desktop.interface font-name 'Sarasa UI SC 11' || failed=1
-    gsettings set org.gnome.desktop.interface cursor-theme 'Adwaita' || failed=1
-    gsettings set org.gnome.desktop.interface cursor-size 28 || failed=1
-    if (( ! failed )); then
-        APPEARANCE_SUMMARY="applied with gsettings"
-        note "GTK appearance defaults applied with gsettings."
-    else
-        APPEARANCE_SUMMARY="partially applied; review with nwg-look"
-        warn "some GTK appearance defaults could not be applied"
-        warn "use nwg-look after starting Sway to review them"
+prompt_appearance_defaults() {
+    local current index
+    if ! command -v gsettings >/dev/null 2>&1; then
+        APPEARANCE_SUMMARY="not applied; GSettings is unavailable"
+        warn "gsettings is unavailable; GTK appearance defaults were not applied"
+        return 0
     fi
+
+    note ""
+    note "Current GTK appearance settings:"
+    for index in "${!APPEARANCE_KEYS[@]}"; do
+        if current="$(gsettings_user get "$APPEARANCE_SCHEMA" \
+            "${APPEARANCE_KEYS[$index]}" 2>&1)"; then
+            printf '  %-14s %s\n' "${APPEARANCE_KEYS[$index]}:" "$current"
+        else
+            printf '  %-14s unavailable (%s)\n' "${APPEARANCE_KEYS[$index]}:" "$current"
+        fi
+    done
+
+    note ""
+    note "Proposed GTK appearance settings:"
+    for index in "${!APPEARANCE_KEYS[@]}"; do
+        printf '  %-14s %s\n' "${APPEARANCE_KEYS[$index]}:" "${APPEARANCE_VALUES[$index]}"
+    done
+    note ""
+    if ! prompt_yes_no "Apply the proposed GTK appearance settings?" yes; then
+        APPEARANCE_SUMMARY="skipped by user"
+        note "GTK appearance settings left unchanged."
+        return 0
+    fi
+
+    APPEARANCE_REQUESTED=1
+    APPEARANCE_SUMMARY="approved; pending installation"
 }
 
+apply_appearance_defaults() {
+    local current index verified=1
+
+    (( APPEARANCE_REQUESTED )) || return 0
+
+    for index in "${!APPEARANCE_KEYS[@]}"; do
+        if ! gsettings_user set "$APPEARANCE_SCHEMA" "${APPEARANCE_KEYS[$index]}" \
+            "${APPEARANCE_VALUES[$index]}"; then
+            verified=0
+            continue
+        fi
+        current="$(gsettings_user get "$APPEARANCE_SCHEMA" \
+            "${APPEARANCE_KEYS[$index]}" 2>/dev/null)" || {
+            verified=0
+            continue
+        }
+        [[ "$current" == "${APPEARANCE_VALUES[$index]}" ]] || verified=0
+    done
+    if (( verified )); then
+        APPEARANCE_SUMMARY="applied with gsettings"
+        note "GTK appearance defaults applied through the systemd user bus."
+        return 0
+    fi
+
+    APPEARANCE_SUMMARY="partially applied; review with nwg-look"
+    warn "some GTK appearance defaults could not be applied or verified"
+    warn "use nwg-look after starting Sway to review them"
+}
+
+# -----------------------------------------------------------------------------
+# Reporting
+# -----------------------------------------------------------------------------
 show_path_hint() {
     case ":${PATH:-}:" in
         *":$LOCAL_BIN_DIR:"*) return 0 ;;
@@ -575,21 +765,12 @@ show_path_hint() {
     esac
 }
 
-print_paru_command() {
-    local package
-    printf '  paru -S --needed'
-    for package in "$@"; do
-        printf ' %s' "$package"
-    done
-    printf '\n'
-}
-
 show_yazi_recommendations() {
     note "Recommended optional Yazi integrations:"
-    print_paru_command "${YAZI_INTEGRATION_PACKAGES[@]}"
+    printf '  paru -S --needed %s\n' "${YAZI_INTEGRATION_PACKAGES[*]}"
     note ""
     note "Optional Yazi rich previews:"
-    print_paru_command "${YAZI_PREVIEW_PACKAGES[@]}"
+    printf '  paru -S --needed %s\n' "${YAZI_PREVIEW_PACKAGES[*]}"
 }
 
 main() {
@@ -600,36 +781,26 @@ main() {
     esac
 
     preflight
-    load_packages
 
-    local create_backup=0 install_desktop_overrides=0 sway_scale
-    if prompt_yes_no "Back up existing managed configuration before replacing it?" yes; then
-        create_backup=1
-    else
-        warn "managed configuration directories will be replaced without a backup"
-    fi
+    local install_desktop_overrides=0
     list_desktop_overrides
     note ""
     if prompt_yes_no "Install the desktop-entry overrides listed above?" yes; then
         install_desktop_overrides=1
     fi
-    note ""
-    sway_scale="$(prompt_scale)"
+    prompt_browser
+    prompt_scale
 
-    protect_active_session
-
-    if (( create_backup )); then
-        backup_existing_files "$install_desktop_overrides"
-    fi
-
+    stop_active_session
     install_packages
-    install_payload "$install_desktop_overrides" "$sway_scale"
+    prompt_appearance_defaults
+
+    take_control_lock
+    backup_existing_files "$install_desktop_overrides"
+    install_payload "$install_desktop_overrides"
+    write_browser_choice
     apply_appearance_defaults
 
-    if [[ -e "$LOCAL_BIN_DIR/start-sway-wslg" ]]; then
-        warn "legacy launcher still exists: $LOCAL_BIN_DIR/start-sway-wslg"
-        warn "remove it after confirming that '$NAME' works"
-    fi
     show_path_hint
 
     cat <<EOF2
@@ -639,10 +810,17 @@ Installation complete.
 Version:                 $VERSION
 Installed configuration: $CONFIG_HOME
 Installed launcher:      $LOCAL_BIN_DIR/$NAME
-Sway output scale:       $sway_scale
+Sway output scale:       $SWAY_SCALE
+Browser:                 ${BROWSER_LABELS[$BROWSER_CHOICE]}
+Backup:                  ${BACKUP_DIR:-none needed}
 
-GTK appearance:           $APPEARANCE_SUMMARY
+GTK appearance:          $APPEARANCE_SUMMARY
 Run nwg-look inside Sway if you want to review or change the appearance.
+
+Your own settings belong in:
+  $CONFIG_HOME/sway/config.d/*.conf
+  $CONFIG_HOME/foot/local.ini
+  $CONFIG_HOME/fuzzel/local.ini
 EOF2
 
     note ""

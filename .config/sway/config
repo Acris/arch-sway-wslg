@@ -5,8 +5,9 @@
 # UI font:       Sarasa UI SC
 # Terminal font: Maple Mono NF CN (configured by Foot)
 # Theme:         Catppuccin Mocha
-# Scale:         1.25
-# Mod:           Alt / Mod1 (avoids Windows/Super conflicts)
+# Scale:         answered during installation
+# Mod:           Alt / Mod1 (avoids Windows/Super conflicts; use Mod3 if Alt conflicts with applications)
+# Overrides:     config.d/*.conf (never replaced by the installer)
 # =============================================================================
 
 include catppuccin-mocha
@@ -26,6 +27,8 @@ set $right l
 set $term foot
 set $menu fuzzel
 set $files foot -e yazi
+# install.sh replaces this marker with the resolved absolute configuration path.
+set $wallpaper "__ARCH_SWAY_WSLG_WALLPAPER__"
 
 # -----------------------------------------------------------------------------
 # Appearance
@@ -46,13 +49,12 @@ client.focused_inactive $overlay0 $base $text  $rosewater $overlay0
 client.unfocused        $overlay0 $base $text  $rosewater $overlay0
 client.urgent           $peach    $base $peach $overlay0  $peach
 
-# client.placeholder and client.background are ignored by current Sway.
-
 # Nested wlroots output inside WSLg.
 output * {
-    scale 1
+    # install.sh replaces this marker with the scale answered during setup.
+    scale __ARCH_SWAY_WSLG_SCALE__
     # Bundled Catppuccin Mocha wallpaper; use the base color if it is unavailable.
-    bg ~/.config/sway/wallpapers/dark-star.jpg fill $base
+    bg $wallpaper fill $base
 }
 
 # Keep compositor cursor consistent with nwg-look.
@@ -69,11 +71,30 @@ workspace_auto_back_and_forth yes
 # -----------------------------------------------------------------------------
 # Session services
 # -----------------------------------------------------------------------------
-# SwayNC inherits the nested display and session bus directly from the
-# launcher.
+# D-Bus activated services are forked by the bus, which still holds the outer
+# WSLg environment from before Sway started, so publish the final nested values
+# for them. Sway's own children, including everything below, inherit them
+# already. DISPLAY is included because Sway reserves and exports the nested X11
+# display before running these commands, even though XWayland starts lazily.
+exec dbus-update-activation-environment DISPLAY WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+
 exec swaync
 
+# WSLg already mirrors its own Wayland clipboard to and from Windows, so the
+# bridge only has to mirror UTF-8 text between this nested session and the
+# parent WSLg socket. Starting it here gives it the nested WAYLAND_DISPLAY.
+exec "$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge"
+
+# Reading the outer clipboard takes keyboard focus away from this session for a
+# moment, and wlroots replays held keys when focus returns, which duplicates or
+# drops characters while typing. swayidle therefore tells the bridge when the
+# session is quiet, and the bridge only reads the outer clipboard then.
+exec swayidle -w timeout 2 '"$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge" __idle idle' resume '"$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge" __idle active'
+
 bar {
+    # Sway execs this value directly and appends `-b <id>`: no shell, no
+    # arguments, no quoting. Waybar inherits the nested display, SWAYSOCK and
+    # the private bus address from Sway, so it needs no wrapper.
     swaybar_command waybar
 }
 
@@ -211,5 +232,10 @@ bindsym --locked XF86AudioPrev exec playerctl previous
 bindsym --locked XF86AudioStop exec playerctl stop
 
 # Screenshots intentionally omitted: use Windows Win+Shift+S.
-# Windows <-> nested-Sway text clipboard sync is provided by arch-sway-wslg
-# using wl-clipboard plus Windows PowerShell through WSL interop.
+
+# -----------------------------------------------------------------------------
+# Local overrides
+# -----------------------------------------------------------------------------
+# config.d/ is yours: the installer creates it once and never replaces it.
+# These files are read last, so they override everything above.
+include config.d/*.conf

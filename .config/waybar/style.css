@@ -135,6 +135,46 @@ window#waybar.empty #window {
     border: none;
 }
 
+/* Collapsed resource drawer: one pill that expands to the left on hover. */
+#resources {
+    background: @mantle;
+    margin: 5px 0 5px 6px;
+    padding: 0 4px;
+    border: 1px solid rgba(88, 91, 112, 0.30);
+    border-radius: 14px;
+}
+
+#memory,
+#cpu,
+#disk {
+    background: transparent;
+    padding: 0 8px;
+}
+
+#memory {
+    color: @teal;
+}
+
+#cpu {
+    color: @sky;
+}
+
+#disk {
+    color: @sapphire;
+}
+
+#memory.warning,
+#cpu.warning,
+#disk.warning {
+    color: @yellow;
+}
+
+#memory.critical,
+#cpu.critical,
+#disk.critical {
+    color: @red;
+}
+
 #pulseaudio,
 #tray,
 #custom-notification,
