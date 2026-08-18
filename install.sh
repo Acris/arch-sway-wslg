@@ -97,6 +97,13 @@ declare -A BROWSER_INSTALLED=()
 SWAY_SCALE_MAX=4
 SWAY_SCALE=1
 SYSTEMD_RUNTIME_DIR="/run/user/$EUID"
+# GSettings and every systemd call have to reach the persistent user manager,
+# which is also the bus the managed session uses. Bind it explicitly: an
+# inherited address may be stale or belong to another bus entirely.
+USER_BUS_ADDRESS="unix:path=$SYSTEMD_RUNTIME_DIR/bus"
+# WSL can recreate /run/user/$UID underneath a running distribution, which
+# leaves the bus socket present but unanswered, so no call to it is unbounded.
+USER_BUS_TIMEOUT=10
 CONTROL_LOCK_TIMEOUT=30
 
 note() { printf '%s\n' "$*"; }
@@ -195,9 +202,14 @@ prompt_browser() {
     done
 }
 
+# Activation details describe how a process was started, not which bus to use;
+# dropping them keeps an inherited value from redirecting children. Callers
+# treat the timeout like any other failure to reach the bus.
 user_bus_command() {
-    env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
-        XDG_RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR" "$@"
+    timeout "$USER_BUS_TIMEOUT" \
+        env -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
+        XDG_RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$USER_BUS_ADDRESS" "$@"
 }
 
 systemctl_user() {
@@ -540,7 +552,12 @@ stage_local_overrides() {
         '#   output * scale 1.5' \
         '#   workspace 1 output WL-1' \
         '#   workspace 9 output WL-2' \
-        '#   bindsym $mod+p exec firefox'
+        '#   bindsym $mod+p exec firefox' \
+        '#' \
+        '# Do not add dbus-update-activation-environment here. The session runs' \
+        '# on your persistent user bus, where that call reaches the systemd user' \
+        '# manager: the nested display values would outlive the session and could' \
+        '# not be removed again. Programs started by Sway inherit them already.'
     seed_local_override "$STAGE_CONFIG/foot/local.ini" \
         '# Personal Foot configuration; never replaced by arch-sway-wslg.' \
         '# Options set here win, for example:' \

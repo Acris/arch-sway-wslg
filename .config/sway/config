@@ -33,7 +33,7 @@ set $wallpaper "__ARCH_SWAY_WSLG_WALLPAPER__"
 # -----------------------------------------------------------------------------
 # Appearance
 # -----------------------------------------------------------------------------
-font pango:Sarasa UI SC 11
+font pango:Sarasa UI SC 12
 
 default_border pixel 2
 default_floating_border pixel 2
@@ -71,13 +71,12 @@ workspace_auto_back_and_forth yes
 # -----------------------------------------------------------------------------
 # Session services
 # -----------------------------------------------------------------------------
-# D-Bus activated services are forked by the bus, which still holds the outer
-# WSLg environment from before Sway started, so publish the final nested values
-# for them. Sway's own children, including everything below, inherit them
-# already. DISPLAY is included because Sway reserves and exports the nested X11
-# display before running these commands, even though XWayland starts lazily.
-exec dbus-update-activation-environment DISPLAY WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
-
+# Everything below is a direct child of Sway and inherits the nested display,
+# SWAYSOCK and the user bus address. The session deliberately publishes none of
+# them to that bus: on dbus-broker an activation environment update is forwarded
+# to the persistent systemd user manager, where it outlives the session and
+# cannot be taken back, and the nested X11 socket only exists inside the
+# session's own mount namespace anyway.
 exec swaync
 
 # WSLg already mirrors its own Wayland clipboard to and from Windows, so the
@@ -91,7 +90,7 @@ exec "$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge"
 bar {
     # Sway execs this value directly and appends `-b <id>`: no shell, no
     # arguments, no quoting. Waybar inherits the nested display, SWAYSOCK and
-    # the private bus address from Sway, so it needs no wrapper.
+    # the user bus address from Sway, so it needs no wrapper.
     swaybar_command waybar
 }
 

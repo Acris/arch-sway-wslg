@@ -21,8 +21,8 @@
     --notification-group-icon-size: 28px;
     --border: 1px solid var(--noti-border-color);
     --border-radius: 14px;
-    --font-size-body: 14px;
-    --font-size-summary: 15px;
+    --font-size-body: 12px;
+    --font-size-summary: 13px;
 }
 
 * {

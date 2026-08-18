@@ -30,6 +30,10 @@ STATE_DIR="$STATE_BASE/$NAME"
 # runtime. Ignore WSLg's shared /mnt/wslg/runtime-dir value; the parent Wayland
 # connection uses an absolute socket path below.
 SYSTEMD_RUNTIME_DIR="/run/user/$UID_NUM"
+# The session and every systemd call share the persistent user bus. Bind its
+# address instead of trusting an inherited one: WSLg may export something else,
+# and a stale value would send systemctl and the session to different buses.
+USER_BUS_ADDRESS="unix:path=$SYSTEMD_RUNTIME_DIR/bus"
 RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR/$NAME"
 SESSION_SCOPE="${NAME}-session.scope"
 NAMESPACE_LAUNCH_PID=""
@@ -49,6 +53,11 @@ BROWSER_FILE="$CONFIG_HOME/$NAME/browser"
 START_TIMEOUT=8
 STOP_TIMEOUT=5
 CONTROL_LOCK_TIMEOUT=60
+# WSL can recreate /run/user/$UID underneath a running distribution, which
+# leaves the bus socket present but unanswered, so every call that talks to the
+# bus is bounded. The limit covers stopping the session scope, the longest job
+# the launcher ever waits for.
+USER_BUS_TIMEOUT=$((STOP_TIMEOUT + 5))
 OUTPUTS_MAX=4
 SESSION_OUTPUTS="${ARCH_SWAY_WSLG_OUTPUTS:-1}"
 
@@ -56,8 +65,7 @@ SESSION_OUTPUTS="${ARCH_SWAY_WSLG_OUTPUTS:-1}"
 # install already provides through util-linux, coreutils and systemd. The
 # clipboard bridge and its idle gate belong to the session, so they are listed
 # with the compositor rather than checked later.
-SESSION_COMMANDS=(sway Xwayland swaymsg swayidle dbus-run-session systemd-run sudo
-                  wl-copy wl-paste)
+SESSION_COMMANDS=(sway Xwayland swaymsg swayidle systemd-run sudo wl-copy wl-paste)
 
 # Started by the Sway configuration itself. A missing one only shows up in the
 # session log, so `doctor` reports them instead.
@@ -71,9 +79,38 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+# Activation details describe how a process was started, not which bus to use;
+# dropping them keeps an inherited value from redirecting children. Callers
+# treat the timeout like any other failure to reach the bus.
+user_bus_command() {
+    timeout "$USER_BUS_TIMEOUT" \
+        env -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
+        XDG_RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$USER_BUS_ADDRESS" "$@"
+}
+
+# `busctl list` reports acquired and activatable names together, and busctl
+# comes from systemd, so the bus checks below add no dependency. One listing
+# answers every question, so callers pass it in rather than querying again.
+bus_name_state() {
+    local names="$1" name="$2" line first second state=""
+
+    while IFS= read -r line; do
+        read -r first second _ <<<"$line"
+        [[ "$first" == "$name" ]] || continue
+        if [[ "$second" == "-" ]]; then
+            [[ -n "$state" ]] || state="activatable"
+        else
+            state="owned"
+        fi
+    done <<<"$names"
+
+    [[ -n "$state" ]] || return 1
+    printf '%s\n' "$state"
+}
+
 systemctl_user() {
-    env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
-        XDG_RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR" systemctl --user "$@"
+    user_bus_command systemctl --user "$@"
 }
 
 systemd_user_usable() {
@@ -214,6 +251,9 @@ cleanup_session_state() {
     rm -rf -- "$X11_PRIVATE_DIR" "$CLIPBOARD_STATE_DIR"
 }
 
+# Destructive, so it must never run while the session is alive. An unreachable
+# bus reports the scope as inactive, which is why every caller goes through
+# ensure_dirs first: that dies when the bus cannot be reached at all.
 cleanup_stale_state() {
     session_scope_active || cleanup_session_state
 }
@@ -286,11 +326,12 @@ prepare_environment() {
         export PULSE_SERVER="unix:$WSLG_PULSE"
     fi
 
-    # A nested compositor must not reuse the persistent WSL user bus: services
-    # activated there inherit the outer WSLg display and can open outside Sway.
-    # run_session always creates a private bus after this inherited state is
-    # removed, so every activation belongs to the managed graphical session.
-    unset DBUS_SESSION_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE
+    # Arch activates services such as the Secret Service through systemd, which
+    # only the persistent user bus can do, so the session shares that bus rather
+    # than running one of its own. Nothing is published to it in return: the
+    # session's own children inherit the nested values directly.
+    export DBUS_SESSION_BUS_ADDRESS="$USER_BUS_ADDRESS"
+    unset DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE
 }
 
 launch_session_in_namespace() {
@@ -321,9 +362,13 @@ run_from_environment() {
     done
     ((${#environment[@]})) || die "session environment handoff was empty"
 
+    # user_bus_command is a shell function and does not survive `env -i`, so the
+    # same binding is repeated here. The session itself is not bounded: this is
+    # the process that runs until Sway exits.
     exec env -i -- "${environment[@]}" \
-        env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
+        env -u DBUS_STARTER_ADDRESS -u DBUS_STARTER_BUS_TYPE \
         XDG_RUNTIME_DIR="$SYSTEMD_RUNTIME_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$USER_BUS_ADDRESS" \
         systemd-run --user --scope --collect --quiet \
         --unit="$SESSION_SCOPE" --property="TimeoutStopSec=${STOP_TIMEOUT}s" \
         "$SELF" __run </dev/null
@@ -352,8 +397,8 @@ run_session() {
     printf 'IPC socket:      %s\n' "$SWAYSOCK"
     printf 'Nested outputs:  %s\n' "$SESSION_OUTPUTS"
     printf 'X11 sockets:     private mount namespace\n'
-    printf 'D-Bus:           private dbus-run-session\n'
-    dbus-run-session -- sway -c "$SWAY_CONFIG"
+    printf 'D-Bus:           %s\n' "$DBUS_SESSION_BUS_ADDRESS"
+    sway -c "$SWAY_CONFIG"
 }
 
 wait_for_start() {
@@ -394,6 +439,7 @@ cleanup_failed_start() {
 report_running_session() {
     note "Systemd scope: $SESSION_SCOPE"
     note "IPC: $SWAYSOCK_PATH"
+    note "D-Bus: $USER_BUS_ADDRESS (shared user bus)"
     note "XWayland: configured (lazy; runtime errors are logged)"
     note "Clipboard: $(clipboard_state)"
 }
@@ -502,6 +548,7 @@ status_session() {
 
     note "Sway: running"
     note "Systemd scope: active ($SESSION_SCOPE)"
+    note "D-Bus: $USER_BUS_ADDRESS (shared user bus)"
     if ipc_ready; then
         note "IPC: ready ($SWAYSOCK_PATH)"
     else
@@ -526,7 +573,7 @@ show_logs() {
 }
 
 doctor() {
-    local failed=0 cmd path_launcher
+    local failed=0 cmd path_launcher bus_names=""
     parse_outputs "$SESSION_OUTPUTS"
     note "Sway WSLg launcher diagnostics"
     note "-----------------------------"
@@ -537,6 +584,41 @@ doctor() {
         note "OK   systemd user runtime: $SYSTEMD_RUNTIME_DIR"
     else
         note "FAIL systemd user manager or runtime is unavailable"
+        failed=1
+    fi
+
+    # The session shares this bus with the rest of the WSL user, so the two
+    # names that decide whether credentials and notifications work inside it are
+    # reported here instead of only in the session log.
+    if bus_names="$(user_bus_command busctl --user list --no-pager --no-legend 2>/dev/null)"; then
+        note "OK   session bus: $USER_BUS_ADDRESS"
+
+        case "$(bus_name_state "$bus_names" org.freedesktop.secrets || true)" in
+            owned)
+                note "OK   Secret Service: org.freedesktop.secrets is running"
+                ;;
+            activatable)
+                note "OK   Secret Service: org.freedesktop.secrets can be activated"
+                ;;
+            *)
+                note "INFO no Secret Service on the bus; install oo7 for Seahorse, browsers and IDEs"
+                ;;
+        esac
+
+        case "$(bus_name_state "$bus_names" org.freedesktop.Notifications || true)" in
+            owned)
+                if session_scope_active; then
+                    note "OK   notifications: org.freedesktop.Notifications held by the session"
+                else
+                    note "INFO org.freedesktop.Notifications is held outside the session; stop that service before starting Sway"
+                fi
+                ;;
+            *)
+                note "OK   notifications: org.freedesktop.Notifications is free for SwayNC"
+                ;;
+        esac
+    else
+        note "FAIL session bus is not reachable: $USER_BUS_ADDRESS"
         failed=1
     fi
 
@@ -623,7 +705,7 @@ Commands:
   start [--outputs N]    Start the managed Sway session (N nested outputs, 1-$OUTPUTS_MAX)
   stop                   Stop the managed Sway session
   restart [--outputs N]  Restart the managed Sway session
-  status                 Report session, IPC and clipboard state
+  status                 Report session, bus, IPC and clipboard state
   logs                   Follow the session log
   doctor                 Check runtime prerequisites
   version                Print the launcher version
