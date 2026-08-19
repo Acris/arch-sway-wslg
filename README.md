@@ -49,6 +49,20 @@ from Windows:
 systemd=true
 ```
 
+WSL may stop the Arch instance after its last terminal closes, which also ends the Sway window. Keep an Arch terminal
+open while using the desktop, or disable both idle timers in `%UserProfile%\.wslconfig`:
+
+```ini
+[general]
+instanceIdleTimeout=-1
+
+[wsl2]
+vmIdleTimeout=-1
+```
+
+Run `wsl --shutdown` from Windows after changing the file, then start WSL again.
+See [microsoft/WSL#13291](https://github.com/microsoft/WSL/issues/13291).
+
 ## Install
 
 Run the following as a normal Arch user, never as root:

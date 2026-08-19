@@ -44,6 +44,20 @@ wsl --shutdown
 systemd=true
 ```
 
+关闭最后一个终端后，WSL 可能会停止 Arch 实例，Sway 窗口也会随之消失。使用桌面期间可保持一个 Arch 终端运行，或在
+`%UserProfile%\.wslconfig` 中同时禁用两个空闲计时器：
+
+```ini
+[general]
+instanceIdleTimeout=-1
+
+[wsl2]
+vmIdleTimeout=-1
+```
+
+修改文件后，请在 Windows 中运行 `wsl --shutdown`，然后重新启动
+WSL。详见 [microsoft/WSL#13291](https://github.com/microsoft/WSL/issues/13291)。
+
 ## 安装
 
 以普通 Arch 用户身份运行以下命令，切勿使用 root：
