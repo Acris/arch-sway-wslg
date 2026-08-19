@@ -110,11 +110,14 @@ still hold.
   add a Windows helper process.
 - Serialise forwarding, echo suppression, and parent reads under one lock, and record a selection as mirrored only after
   the peer really holds it.
-- A parent read takes focus away from the session, so it must never overlap typing: automatic reads require the
-  supervised quiet-period notifier, and a notifier that cannot be kept alive stops those reads loudly instead of
-  releasing them. The explicit sync command stays available, and `status` reports which of the two applies.
+- Any visit to the parent takes focus away from the session, whichever direction causes it, so none of them may overlap
+  typing. Automatic reads require the supervised quiet-period notifier, and a forward waits for the shortcut that
+  triggered it to be released, which also collapses a burst of copies into the newest one. A notifier that cannot be
+  kept alive stops those reads loudly instead of releasing them, and `status` reports which of the two applies.
+- Automatic reads back off the longer the session stays quiet, and any input restores the configured interval.
 - Bound bridge and notifier restarts, every clipboard read, and the poll interval, which is rejected below an explicit
-  floor. The bridge is started by Sway and stays inside the session scope.
+  floor. A restarted watcher keeps what has already been mirrored, so it cannot push a stale selection back over the
+  peer. The bridge is started by Sway and stays inside the session scope.
 
 ### Configuration
 

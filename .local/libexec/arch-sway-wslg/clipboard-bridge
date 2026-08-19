@@ -12,9 +12,11 @@
 # against the parent. The parent side is therefore polled with one-shot reads,
 # which is also why the direction and the interval are configurable.
 #
-# Such a read has to take focus on the parent compositor, so it only happens
-# while the session reports no input activity. The bridge starts swayidle itself
-# and supervises it, so the gate cannot outlive or silently outlast the bridge.
+# Neither direction can touch the parent without taking focus there for a
+# moment, and wlroots replays the keys that were held when focus returns. Reads
+# therefore wait for the session to report no input activity, and writes wait
+# for the keys of the copy shortcut to be released. The bridge starts swayidle
+# itself and supervises it, so the gate cannot outlive or silently outlast it.
 set -Eeuo pipefail
 umask 077
 
@@ -28,6 +30,7 @@ BRIDGE_LOCK="$STATE_DIR/bridge.lock"
 EVENT_LOCK="$STATE_DIR/event.lock"
 MIRROR_FILE="$STATE_DIR/mirror"
 PARENT_SEEN_FILE="$STATE_DIR/parent-seen"
+OUTBOUND_TOKEN_FILE="$STATE_DIR/outbound"
 PID_FILE="$STATE_DIR/bridge.pid"
 COPY_TYPE="text/plain;charset=utf-8"
 EVENT_LOCK_TIMEOUT=5
@@ -43,7 +46,19 @@ MODE="${ARCH_SWAY_WSLG_CLIPBOARD:-both}"
 # switch back into the session; below the floor the reads start to overlap.
 POLL_INTERVAL="${ARCH_SWAY_WSLG_CLIPBOARD_POLL:-1.0}"
 POLL_INTERVAL_MIN_MS=200
+POLL_INTERVAL_MS=0
 PARENT_READ_TIMEOUT="3s"
+
+# Text copied on Windows is normally pasted soon afterwards, so the reads matter
+# most in the first moments of quiet. A session that has been quiet far longer
+# is usually one nobody is copying into, and reading it that often only
+# disturbs whatever has the focus on Windows. The interval therefore doubles
+# once the quiet has lasted a while, and any input starts it over.
+POLL_BACKOFF_AFTER_MS=30000
+POLL_BACKOFF_MAX_FACTOR=8
+QUIET_TICKS=0
+POLL_FACTOR=1
+POLL_PENDING=0
 
 # A read on the parent takes keyboard focus away from the nested session, and
 # wlroots replays the keys that were held when focus returns, so a poll that
@@ -51,9 +66,10 @@ PARENT_READ_TIMEOUT="3s"
 # transitions as signals, which gate the polling on the session being quiet, and
 # the quiet period is what actually decides the inbound latency.
 IDLE_TIMEOUT="${ARCH_SWAY_WSLG_CLIPBOARD_IDLE:-2}"
-# `sync` is meant to be pressed, so it waits for the keys to be released before
-# the read takes focus; otherwise the read itself replays the shortcut.
-MANUAL_SYNC_DELAY="0.3"
+# The copy shortcut is still held when the bridge reacts to it, so a forward
+# waits for the keys to be released before it takes focus on the parent;
+# otherwise the focus change replays the shortcut itself.
+FOCUS_SETTLE_DELAY="0.3"
 IDLE=0
 IDLE_PID=""
 IDLE_RESTARTS=0
@@ -115,9 +131,21 @@ copy_selection() {
     WAYLAND_DISPLAY="$display" wl-copy --type "$COPY_TYPE"
 }
 
+# Writing the parent selection opens a surface there, which is no different
+# from reading it: focus leaves the session and comes back. A copy is triggered
+# by a shortcut, so that would land in the middle of typing. Waiting also lets a
+# burst of copies collapse, because only the newest claim survives the delay.
+defer_outbound() {
+    local token="$$"
+
+    printf '%s' "$token" > "$OUTBOUND_TOKEN_FILE"
+    sleep "$FOCUS_SETTLE_DELAY"
+    [[ -r "$OUTBOUND_TOKEN_FILE" && "$(<"$OUTBOUND_TOKEN_FILE")" == "$token" ]]
+}
+
 # Entry point for the nested watcher; one instance runs per selection change.
 mirror_selection() {
-    local direction="$1"
+    local direction="$1" status=0
 
     case "$direction" in
         to-parent|to-sway) ;;
@@ -133,26 +161,37 @@ mirror_selection() {
 
     [[ -d "$STATE_DIR" ]] || return 0
 
+    # The text is read before the delay: the watcher hands it over through a
+    # pipe and would block until it is drained. Concurrent copies each get their
+    # own file, because they now overlap by design.
+    local payload="$STATE_DIR/payload.$direction.$$"
+    cat > "$payload"
+    if [[ ! -s "$payload" ]]; then
+        rm -f -- "$payload"
+        return 0
+    fi
+
+    if [[ "$direction" == to-parent ]] && ! defer_outbound; then
+        rm -f -- "$payload"
+        return 0
+    fi
+
     # The lock is scoped to this call: the supervisor polls the parent side in
     # the same way, so a descriptor left open would deadlock the other side.
-    mirror_locked "$direction" 9>"$EVENT_LOCK"
+    mirror_locked "$direction" "$payload" 9>"$EVENT_LOCK" || status=1
+    rm -f -- "$payload"
+    return "$status"
 }
 
 mirror_locked() {
-    local direction="$1" status=0
-    local payload="$STATE_DIR/payload.$direction"
+    local direction="$1" payload="$2"
 
     flock -w "$EVENT_LOCK_TIMEOUT" 9 || {
         warn "timed out waiting for the bridge lock"
         return 1
     }
 
-    cat > "$payload"
-    if [[ -s "$payload" ]]; then
-        publish_selection "$direction" "$payload" "$(payload_hash "$payload")" || status=1
-    fi
-    rm -f -- "$payload"
-    return "$status"
+    publish_selection "$direction" "$payload" "$(payload_hash "$payload")"
 }
 
 # A one-shot read is the only way to see the parent selection, and it has to
@@ -192,25 +231,36 @@ poll_parent_locked() {
     rm -f -- "$snapshot"
 }
 
-# Polling is skipped entirely while the user is typing, which is also when the
-# inbound direction is least useful: text copied on Windows is picked up on the
-# first poll after the session goes quiet again. A gate that had to be given up
-# stops the automatic reads rather than releasing them; `sync` stays available.
-poll_parent_when_idle() {
-    [[ "$MODE" == both ]] || return 0
-    (( GATED && IDLE )) || return 0
-    poll_parent
+reset_poll_backoff() {
+    QUIET_TICKS=0
+    POLL_FACTOR=1
+    POLL_PENDING=0
 }
 
-# Pressing the shortcut is an explicit request, so it reads the parent even
-# while the session is busy; the caller has just decided that a paste matters
-# more than a moment of focus loss.
-manual_sync() {
-    [[ "$MODE" != off ]] || die "bridging is disabled by ARCH_SWAY_WSLG_CLIPBOARD=off"
-    [[ -d "$STATE_DIR" && -r "$PID_FILE" ]] || die "the clipboard bridge is not running"
-    [[ -n "$NESTED_DISPLAY" ]] || die "this command must run inside the Sway session"
-    sleep "$MANUAL_SYNC_DELAY"
+# Polling is skipped entirely while the user is typing, which is also when the
+# inbound direction is least useful: text copied on Windows is picked up on the
+# first poll after the session goes quiet again, and switching back into the
+# session restores the configured interval. A gate that had to be given up stops
+# the automatic reads rather than releasing them.
+poll_parent_when_idle() {
+    [[ "$MODE" == both ]] || return 0
+    if ! (( GATED && IDLE )); then
+        reset_poll_backoff
+        return 0
+    fi
+
+    QUIET_TICKS=$((QUIET_TICKS + 1))
+    if (( POLL_PENDING > 0 )); then
+        POLL_PENDING=$((POLL_PENDING - 1))
+        return 0
+    fi
+
     poll_parent
+    if (( QUIET_TICKS * POLL_INTERVAL_MS >= POLL_BACKOFF_AFTER_MS &&
+          POLL_FACTOR < POLL_BACKOFF_MAX_FACTOR )); then
+        POLL_FACTOR=$((POLL_FACTOR * 2))
+    fi
+    POLL_PENDING=$((POLL_FACTOR - 1))
 }
 
 # ---------------------------------------------------------------------------
@@ -237,7 +287,7 @@ stop_idle_notifier() {
 
 # Without the gate the inbound reads would type into whatever the user is
 # writing, so a notifier that keeps dying disables that direction instead of
-# being ignored. `sync` still works, and the state is reported by the launcher.
+# being ignored. The launcher reports which of the two applies.
 supervise_idle_notifier() {
     [[ "$MODE" == both ]] || return 0
     (( GATED )) || return 0
@@ -253,7 +303,7 @@ supervise_idle_notifier() {
         GATED=0
         IDLE=0
         warn "swayidle kept exiting; the Windows clipboard is no longer read automatically"
-        warn "press the clipboard sync shortcut when you need it, or restart the session"
+        warn "restart the session to bring that direction back"
         return 0
     fi
     warn "swayidle exited; restarting ($IDLE_RESTARTS/$MAX_RESTARTS)"
@@ -269,13 +319,22 @@ nested_display_alive() {
     [[ -S "$socket" ]]
 }
 
+# Transfers in flight belong to one watcher generation; what has already been
+# mirrored does not.
+clear_transfers() {
+    rm -f -- "$OUTBOUND_TOKEN_FILE" "$STATE_DIR/parent.snapshot" "$STATE_DIR"/payload.*
+}
+
 clear_state() {
-    rm -f -- "$MIRROR_FILE" "$PARENT_SEEN_FILE" "$STATE_DIR/parent.snapshot" \
-        "$STATE_DIR"/payload.*
+    clear_transfers
+    rm -f -- "$MIRROR_FILE" "$PARENT_SEEN_FILE"
 }
 
 start_watcher() {
-    clear_state
+    # Only the transfer files are dropped here. A restarted watcher reports the
+    # current nested selection straight away, and forgetting that it was already
+    # mirrored would push it back over whatever Windows holds by then.
+    clear_transfers
 
     # The first supervisor poll mirrors whatever is already on the Windows
     # clipboard, so a fresh session inherits it as soon as it goes idle.
@@ -308,7 +367,8 @@ run_bridge() {
     esac
     [[ "$POLL_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || \
         die "invalid ARCH_SWAY_WSLG_CLIPBOARD_POLL value: $POLL_INTERVAL"
-    (( $(interval_ms "$POLL_INTERVAL") >= POLL_INTERVAL_MIN_MS )) || \
+    POLL_INTERVAL_MS="$(interval_ms "$POLL_INTERVAL")"
+    (( POLL_INTERVAL_MS >= POLL_INTERVAL_MIN_MS )) || \
         die "ARCH_SWAY_WSLG_CLIPBOARD_POLL must be at least ${POLL_INTERVAL_MIN_MS}ms: $POLL_INTERVAL"
     if [[ ! "$IDLE_TIMEOUT" =~ ^[0-9]+$ ]] || (( IDLE_TIMEOUT < 1 )); then
         die "ARCH_SWAY_WSLG_CLIPBOARD_IDLE must be a whole number of seconds, at least 1: $IDLE_TIMEOUT"
@@ -325,6 +385,10 @@ run_bridge() {
     exec 8>"$BRIDGE_LOCK"
     flock -n 8 || exit 0
 
+    # Anything left by a bridge that was killed outright describes selections
+    # this session never saw.
+    clear_state
+
     export ARCH_SWAY_WSLG_NESTED_DISPLAY="$NESTED_DISPLAY"
     printf '%s\n' "$$" > "$PID_FILE"
     trap cleanup EXIT
@@ -333,7 +397,7 @@ run_bridge() {
     trap 'IDLE=0' USR2
 
     case "$MODE" in
-        both)       note "mirroring text both ways; the parent side is read every ${POLL_INTERVAL}s after ${IDLE_TIMEOUT}s without input" ;;
+        both)       note "mirroring text both ways; the parent side is read every ${POLL_INTERVAL}s after ${IDLE_TIMEOUT}s without input, less often the longer that lasts" ;;
         to-windows) note "forwarding text to Windows only" ;;
     esac
 
@@ -366,7 +430,6 @@ run_bridge() {
 
 case "${1:-}" in
     '')       run_bridge ;;
-    sync)     manual_sync ;;
     __mirror) mirror_selection "${2:-}" ;;
     *)        die "unknown argument: $1" ;;
 esac

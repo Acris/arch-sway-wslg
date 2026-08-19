@@ -172,7 +172,6 @@ Waybar 与 SwayNC 的布局、swaynag 以及 Yazi 没有可以安全使用的 in
 | `Alt+Enter`                  | 打开 Foot                |
 | `Alt+D`                      | 打开 Fuzzel              |
 | `Alt+Y`                      | 在 Foot 中打开 Yazi      |
-| `Alt+Shift+V`                | 立即读取 Windows 剪贴板  |
 | `Alt+H/J/K/L` 或方向键       | 移动焦点                 |
 | `Alt+Shift+H/J/K/L` 或方向键 | 移动当前容器             |
 | `Alt+1..0`                   | 切换到工作区 1–10        |
@@ -198,13 +197,15 @@ Waybar 与 SwayNC 的布局、swaynag 以及 Yazi 没有可以安全使用的 in
 - 只共享纯文本：图片、HTML 与文件列表不在其中。
 - 应用标记为敏感的选区（例如密码管理器中的条目）默认跳过。
 
-在 Sway 中复制会立即送达 Windows。反方向会稍晚一些：会话会等输入出现短暂停顿（默认两秒）之后再去查看 Windows 剪贴板。 通常在切回
-Sway 窗口时文本已经就位；按 `Alt+Shift+V` 可立即取回。执行 `arch-sway-wslg status` 可以查看会话是否正在读取 Windows 剪贴板。
+共享的时机会刻意避开输入，因此两个方向都不是即时的。在 Sway 中复制的文本会稍后送达
+Windows。反方向耗时更长：会话会等输入出现短暂停顿（默认两秒）之后再去查看 Windows 剪贴板，且会话闲置越久，查看得越稀疏。在
+Windows 中复制的文本通常在切回 Sway 窗口时已经就位；若粘贴得更早，稍作停顿即可。执行 `arch-sway-wslg status`
+可以查看会话是否正在读取 Windows 剪贴板。
 
 以下变量需在 `arch-sway-wslg start` **之前** 导出；在会话内的终端里修改不会生效：
 
 ```bash
-# how often the Windows clipboard is checked, in seconds; values below 0.2 are rejected
+# how often the Windows clipboard is checked once the session is quiet, in seconds; below 0.2 is rejected
 export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
 
 # how long a pause in typing to wait for, in whole seconds (minimum 1)
@@ -216,8 +217,6 @@ export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
 # no clipboard sharing at all
 export ARCH_SWAY_WSLG_CLIPBOARD=off
 ```
-
-关闭该方向后，`Alt+Shift+V` 也随之失效。
 
 敏感选区也可以一并共享，但在使用密码管理器时不建议这样做：
 

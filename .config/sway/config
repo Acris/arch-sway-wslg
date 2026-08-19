@@ -105,10 +105,6 @@ bindsym $mod+Return exec $term
 bindsym $mod+d exec $menu
 bindsym $mod+y exec $files
 
-# Read the Windows clipboard right now instead of waiting for the session to go
-# quiet. Useful when you copy on Windows and paste here without a pause.
-bindsym $mod+Shift+v exec "$HOME/.local/libexec/arch-sway-wslg/clipboard-bridge" sync
-
 # One-keystroke terminal splits. Sway owns the tiling; Foot stays minimal.
 bindsym $mod+Ctrl+Return splith, exec $term
 bindsym $mod+Shift+Return splitv, exec $term

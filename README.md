@@ -72,8 +72,8 @@ installed packages on its own.
 
 Review AUR PKGBUILDs displayed by `paru` before accepting them. The installer checks the prerequisites and asks about
 desktop entry masks, the browser, the output scale, a backup, keyring unlocking, and the GTK appearance settings. It
-checks everything it is about to install before replacing the current configuration, and it stops a running session
-only after asking.
+checks everything it is about to install before replacing the current configuration, and it stops a running session only
+after asking.
 
 Then start the session:
 
@@ -127,13 +127,13 @@ not arrange them.
 Managed configuration directories are replaced on every install. These paths always belong to the user and are never
 replaced:
 
-| Path                             | Purpose                                          |
-|----------------------------------|--------------------------------------------------|
-| `~/.config/sway/config.d/*.conf` | Sway settings, read after everything else        |
-| `~/.config/foot/local.ini`       | Foot options, applied after the bundled ones     |
-| `~/.config/fuzzel/local.ini`     | Fuzzel options, applied after the bundled ones   |
-| `~/.config/waybar/local.css`     | Waybar styling, applied after the bundled sheet  |
-| `~/.config/swaync/local.css`     | SwayNC styling, applied after the bundled sheet  |
+| Path                             | Purpose                                         |
+|----------------------------------|-------------------------------------------------|
+| `~/.config/sway/config.d/*.conf` | Sway settings, read after everything else       |
+| `~/.config/foot/local.ini`       | Foot options, applied after the bundled ones    |
+| `~/.config/fuzzel/local.ini`     | Fuzzel options, applied after the bundled ones  |
+| `~/.config/waybar/local.css`     | Waybar styling, applied after the bundled sheet |
+| `~/.config/swaync/local.css`     | SwayNC styling, applied after the bundled sheet |
 
 The installer creates them with commented examples on the first installation and preserves them later. Settings there
 win:
@@ -146,11 +146,13 @@ bindsym $mod+p exec firefox
 
 ```css
 /* ~/.config/waybar/local.css */
-* { font-size: 16px; }
+* {
+    font-size: 16px;
+}
 ```
 
-Both stylesheets are read after the bundled ones, so rules set there win. Keep the two files in place even when they
-are empty: removing one leaves Waybar or SwayNC unstyled.
+Both stylesheets are read after the bundled ones, so rules set there win. Keep the two files in place even when they are
+empty: removing one leaves Waybar or SwayNC unstyled.
 
 The Waybar and SwayNC layouts, swaynag, and Yazi have no include mechanism that can be used safely, so those files are
 fully managed. Keep personal versions outside the managed directories, or use the backup offered before each update.
@@ -183,7 +185,6 @@ executable name) or exporting `BROWSER` changes it.
 | `Alt+Enter`                   | Open Foot                                |
 | `Alt+D`                       | Open Fuzzel                              |
 | `Alt+Y`                       | Open Yazi in Foot                        |
-| `Alt+Shift+V`                 | Read the Windows clipboard right now     |
 | `Alt+H/J/K/L` or arrows       | Move focus                               |
 | `Alt+Shift+H/J/K/L` or arrows | Move the focused container               |
 | `Alt+1..0`                    | Switch to workspace 1–10                 |
@@ -211,15 +212,16 @@ together with the session.
 - Only plain text is shared: images, HTML, and file lists are not.
 - Selections an application marks as sensitive, such as an entry from a password manager, are skipped by default.
 
-A copy made in Sway reaches Windows right away. The other direction arrives a little later: the session waits for a
-short pause in typing, two seconds by default, before it looks at the Windows clipboard. Usually the text is already
-there by the time the Sway window comes back into focus; `Alt+Shift+V` fetches it immediately. Run
-`arch-sway-wslg status` to see whether the session is picking the Windows clipboard up.
+Sharing is timed to stay out of the way of typing, so neither direction is instant. A copy made in Sway reaches Windows
+a moment later. The other direction takes longer: the session waits for a short pause in typing, two seconds by default,
+before it looks at the Windows clipboard, and it looks less often the longer the session goes untouched. Text copied in
+Windows is usually already there by the time the Sway window comes back into focus; if a paste happens sooner, a short
+pause is enough. Run `arch-sway-wslg status` to see whether the session is picking the Windows clipboard up.
 
 Export these before `arch-sway-wslg start`; changing them in a terminal inside the session has no effect:
 
 ```bash
-# how often the Windows clipboard is checked, in seconds; values below 0.2 are rejected
+# how often the Windows clipboard is checked once the session is quiet, in seconds; below 0.2 is rejected
 export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
 
 # how long a pause in typing to wait for, in whole seconds (minimum 1)
@@ -231,8 +233,6 @@ export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
 # no clipboard sharing at all
 export ARCH_SWAY_WSLG_CLIPBOARD=off
 ```
-
-With that direction disabled, `Alt+Shift+V` also stops working.
 
 Sensitive selections can be included as well, which is not recommended alongside a password manager:
 
