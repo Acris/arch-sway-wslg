@@ -14,27 +14,30 @@
 #
 # Neither direction can touch the parent without taking focus there for a
 # moment, and wlroots replays the keys that were held when focus returns. Reads
-# therefore wait for the session to report no input activity, and writes wait
-# for the keys of the copy shortcut to be released. The bridge starts swayidle
-# itself and supervises it, so the gate cannot outlive or silently outlast it.
+# therefore wait for the session to report no input activity, and writes allow
+# a short settling period for the copy shortcut to be released. The bridge
+# starts swayidle itself and supervises it, so the gate cannot silently outlast
+# the bridge.
 set -Eeuo pipefail
 umask 077
 
 NAME="arch-sway-wslg"
 SELF="$(readlink -f "$0")"
 PARENT_DISPLAY="/mnt/wslg/runtime-dir/wayland-0"
-NESTED_DISPLAY="${ARCH_SWAY_WSLG_NESTED_DISPLAY:-${WAYLAND_DISPLAY:-}}"
+NESTED_DISPLAY="${WAYLAND_DISPLAY:-}"
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 STATE_DIR="$RUNTIME_BASE/$NAME/clipboard"
 BRIDGE_LOCK="$STATE_DIR/bridge.lock"
 EVENT_LOCK="$STATE_DIR/event.lock"
 MIRROR_FILE="$STATE_DIR/mirror"
 PARENT_SEEN_FILE="$STATE_DIR/parent-seen"
-OUTBOUND_TOKEN_FILE="$STATE_DIR/outbound"
 PID_FILE="$STATE_DIR/bridge.pid"
+STATUS_FILE="$STATE_DIR/status"
 COPY_TYPE="text/plain;charset=utf-8"
 EVENT_LOCK_TIMEOUT=5
+COPY_TIMEOUT="3s"
 MAX_RESTARTS=5
+RESTART_RESET_AFTER=60
 
 # both:       mirror in both directions (default)
 # to-windows: only forward the nested selection outwards; never poll the parent
@@ -66,20 +69,25 @@ POLL_PENDING=0
 # transitions as signals, which gate the polling on the session being quiet, and
 # the quiet period is what actually decides the inbound latency.
 IDLE_TIMEOUT="${ARCH_SWAY_WSLG_CLIPBOARD_IDLE:-2}"
-# The copy shortcut is still held when the bridge reacts to it, so a forward
-# waits for the keys to be released before it takes focus on the parent;
-# otherwise the focus change replays the shortcut itself.
+# The copy shortcut may still be held when the bridge reacts to it, so a short
+# settling period normally lets the keys go before focus moves to the parent.
 FOCUS_SETTLE_DELAY="0.3"
 IDLE=0
 IDLE_PID=""
 IDLE_RESTARTS=0
+IDLE_STARTED_AT=0
 GATED=1
 
 WATCHER_PID=""
+WATCHER_STARTED_AT=0
 
 note() { printf '%s\n' "clipboard: $*"; }
 warn() { printf 'WARNING: clipboard: %s\n' "$*" >&2; }
 die() { printf 'ERROR: clipboard: %s\n' "$*" >&2; exit 1; }
+
+set_status() {
+    printf '%s\n' "$1" > "$STATUS_FILE"
+}
 
 # Fixed-point milliseconds keep the floor check inside Bash. The caller
 # validates the number format first.
@@ -95,7 +103,7 @@ interval_ms() {
 # ---------------------------------------------------------------------------
 payload_hash() {
     local hash
-    hash="$(sha256sum < "$1")"
+    hash="$(sha256sum < "$1" 8>&- 9>&-)"
     printf '%s' "${hash%% *}"
 }
 
@@ -128,29 +136,13 @@ copy_selection() {
         to-sway)   display="$NESTED_DISPLAY" ;;
         *)         return 1 ;;
     esac
-    WAYLAND_DISPLAY="$display" wl-copy --type "$COPY_TYPE"
-}
-
-# Writing the parent selection opens a surface there, which is no different
-# from reading it: focus leaves the session and comes back. A copy is triggered
-# by a shortcut, so that would land in the middle of typing. Waiting also lets a
-# burst of copies collapse, because only the newest claim survives the delay.
-defer_outbound() {
-    local token="$$"
-
-    printf '%s' "$token" > "$OUTBOUND_TOKEN_FILE"
-    sleep "$FOCUS_SETTLE_DELAY"
-    [[ -r "$OUTBOUND_TOKEN_FILE" && "$(<"$OUTBOUND_TOKEN_FILE")" == "$token" ]]
+    WAYLAND_DISPLAY="$display" timeout "$COPY_TIMEOUT" \
+        wl-copy --type "$COPY_TYPE" 8>&- 9>&-
 }
 
 # Entry point for the nested watcher; one instance runs per selection change.
 mirror_selection() {
-    local direction="$1" status=0
-
-    case "$direction" in
-        to-parent|to-sway) ;;
-        *) die "unknown mirror direction: $direction" ;;
-    esac
+    local payload="$STATE_DIR/payload.$$" status=0
 
     case "${CLIPBOARD_STATE:-data}" in
         nil|clear) return 0 ;;
@@ -162,36 +154,39 @@ mirror_selection() {
     [[ -d "$STATE_DIR" ]] || return 0
 
     # The text is read before the delay: the watcher hands it over through a
-    # pipe and would block until it is drained. Concurrent copies each get their
-    # own file, because they now overlap by design.
-    local payload="$STATE_DIR/payload.$direction.$$"
-    cat > "$payload"
+    # pipe and would block until it is drained. Bound a source that never
+    # finishes, and keep callbacks from different watcher generations apart.
+    if ! timeout "$COPY_TIMEOUT" cat > "$payload" 8>&- 9>&-; then
+        rm -f -- "$payload"
+        warn "failed or timed out reading the nested selection"
+        return 1
+    fi
     if [[ ! -s "$payload" ]]; then
         rm -f -- "$payload"
         return 0
     fi
 
-    if [[ "$direction" == to-parent ]] && ! defer_outbound; then
-        rm -f -- "$payload"
-        return 0
-    fi
+    # Writing the parent selection also takes focus away. The nested watcher is
+    # serial, so a short settling delay is all that is needed for the copy
+    # shortcut to be released; there is no concurrent burst to coalesce here.
+    sleep "$FOCUS_SETTLE_DELAY" 8>&- 9>&-
 
     # The lock is scoped to this call: the supervisor polls the parent side in
     # the same way, so a descriptor left open would deadlock the other side.
-    mirror_locked "$direction" "$payload" 9>"$EVENT_LOCK" || status=1
+    mirror_locked "$payload" 9>"$EVENT_LOCK" || status=1
     rm -f -- "$payload"
     return "$status"
 }
 
 mirror_locked() {
-    local direction="$1" payload="$2"
+    local payload="$1"
 
     flock -w "$EVENT_LOCK_TIMEOUT" 9 || {
         warn "timed out waiting for the bridge lock"
         return 1
     }
 
-    publish_selection "$direction" "$payload" "$(payload_hash "$payload")"
+    publish_selection to-parent "$payload" "$(payload_hash "$payload")"
 }
 
 # A one-shot read is the only way to see the parent selection, and it has to
@@ -216,7 +211,7 @@ poll_parent_locked() {
     # stall the outgoing direction as well.
     WAYLAND_DISPLAY="$PARENT_DISPLAY" timeout "$PARENT_READ_TIMEOUT" \
         wl-paste --no-newline --type text \
-        > "$snapshot" 2>/dev/null || { rm -f -- "$snapshot"; return 0; }
+        > "$snapshot" 2>/dev/null 8>&- 9>&- || { rm -f -- "$snapshot"; return 0; }
     if [[ -s "$snapshot" ]]; then
         hash="$(payload_hash "$snapshot")"
         # Only an actual change on the parent side counts. wl-copy publishes the
@@ -224,8 +219,9 @@ poll_parent_locked() {
         # forward is often still the previous one; treating it as new would push
         # it straight back into the nested session.
         if [[ ! -r "$PARENT_SEEN_FILE" || "$(<"$PARENT_SEEN_FILE")" != "$hash" ]]; then
-            printf '%s' "$hash" > "$PARENT_SEEN_FILE"
-            publish_selection to-sway "$snapshot" "$hash" || true
+            if publish_selection to-sway "$snapshot" "$hash"; then
+                printf '%s' "$hash" > "$PARENT_SEEN_FILE"
+            fi
         fi
     fi
     rm -f -- "$snapshot"
@@ -273,8 +269,9 @@ start_idle_notifier() {
 
     swayidle -w \
         timeout "$IDLE_TIMEOUT" "kill -USR1 $$" \
-        resume "kill -USR2 $$" >/dev/null 2>&1 &
+        resume "kill -USR2 $$" >/dev/null 2>&1 8>&- 9>&- &
     IDLE_PID=$!
+    IDLE_STARTED_AT=$SECONDS
     IDLE=0
 }
 
@@ -298,10 +295,14 @@ supervise_idle_notifier() {
 
     wait "$IDLE_PID" 2>/dev/null || true
     IDLE_PID=""
+    if (( SECONDS - IDLE_STARTED_AT >= RESTART_RESET_AFTER )); then
+        IDLE_RESTARTS=0
+    fi
     IDLE_RESTARTS=$((IDLE_RESTARTS + 1))
     if (( IDLE_RESTARTS > MAX_RESTARTS )); then
         GATED=0
         IDLE=0
+        set_status degraded
         warn "swayidle kept exiting; the Windows clipboard is no longer read automatically"
         warn "restart the session to bring that direction back"
         return 0
@@ -319,27 +320,26 @@ nested_display_alive() {
     [[ -S "$socket" ]]
 }
 
-# Transfers in flight belong to one watcher generation; what has already been
-# mirrored does not.
-clear_transfers() {
-    rm -f -- "$OUTBOUND_TOKEN_FILE" "$STATE_DIR/parent.snapshot" "$STATE_DIR"/payload.*
-}
-
+# Payload files belong to a single callback, which removes its own, so they are
+# only swept when no callback of this bridge can still be waiting: at startup
+# and on the way out.
 clear_state() {
-    clear_transfers
-    rm -f -- "$MIRROR_FILE" "$PARENT_SEEN_FILE"
+    rm -f -- "$STATE_DIR/parent.snapshot" "$STATE_DIR"/payload.* \
+        "$MIRROR_FILE" "$PARENT_SEEN_FILE" "$PID_FILE" "$STATUS_FILE"
 }
 
 start_watcher() {
-    # Only the transfer files are dropped here. A restarted watcher reports the
-    # current nested selection straight away, and forgetting that it was already
-    # mirrored would push it back over whatever Windows holds by then.
-    clear_transfers
+    # Only the parent snapshot is dropped here. What has already been mirrored
+    # is kept, because a restarted watcher reports the current nested selection
+    # straight away and would otherwise push it back over whatever Windows holds
+    # by then; a payload belongs to a callback that may still be running.
+    rm -f -- "$STATE_DIR/parent.snapshot"
 
     # The first supervisor poll mirrors whatever is already on the Windows
     # clipboard, so a fresh session inherits it as soon as it goes idle.
-    wl-paste --type text --watch "$SELF" __mirror to-parent &
+    wl-paste --type text --watch "$SELF" __mirror 8>&- 9>&- &
     WATCHER_PID=$!
+    WATCHER_STARTED_AT=$SECONDS
 }
 
 stop_watcher() {
@@ -354,7 +354,6 @@ cleanup() {
     stop_watcher
     stop_idle_notifier
     clear_state
-    rm -f -- "$PID_FILE"
 }
 
 run_bridge() {
@@ -373,12 +372,6 @@ run_bridge() {
     if [[ ! "$IDLE_TIMEOUT" =~ ^[0-9]+$ ]] || (( IDLE_TIMEOUT < 1 )); then
         die "ARCH_SWAY_WSLG_CLIPBOARD_IDLE must be a whole number of seconds, at least 1: $IDLE_TIMEOUT"
     fi
-    if [[ "$MODE" == off ]]; then
-        note "bridging disabled by ARCH_SWAY_WSLG_CLIPBOARD=off"
-        return 0
-    fi
-    [[ -S "$PARENT_DISPLAY" ]] || die "WSLg Wayland socket not found: $PARENT_DISPLAY"
-
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
 
@@ -388,9 +381,15 @@ run_bridge() {
     # Anything left by a bridge that was killed outright describes selections
     # this session never saw.
     clear_state
+    if [[ "$MODE" == off ]]; then
+        set_status off
+        note "bridging disabled by ARCH_SWAY_WSLG_CLIPBOARD=off"
+        return 0
+    fi
+    [[ -S "$PARENT_DISPLAY" ]] || die "WSLg Wayland socket not found: $PARENT_DISPLAY"
 
-    export ARCH_SWAY_WSLG_NESTED_DISPLAY="$NESTED_DISPLAY"
     printf '%s\n' "$$" > "$PID_FILE"
+    set_status "$MODE"
     trap cleanup EXIT
     trap 'cleanup; exit 0' INT TERM HUP
     trap 'IDLE=1' USR1
@@ -407,7 +406,7 @@ run_bridge() {
     while true; do
         start_watcher
         while kill -0 "$WATCHER_PID" 2>/dev/null; do
-            sleep "$POLL_INTERVAL" || true
+            sleep "$POLL_INTERVAL" 8>&- 9>&- || true
             [[ -S "$PARENT_DISPLAY" ]] || break
             supervise_idle_notifier
             poll_parent_when_idle
@@ -418,18 +417,21 @@ run_bridge() {
             warn "the WSLg Wayland socket disappeared; stopping"
             break
         }
+        if (( SECONDS - WATCHER_STARTED_AT >= RESTART_RESET_AFTER )); then
+            restarts=0
+        fi
         restarts=$((restarts + 1))
         if (( restarts > MAX_RESTARTS )); then
             warn "the nested watcher kept exiting; giving up after $MAX_RESTARTS restarts"
             break
         fi
         warn "the nested watcher exited; restarting ($restarts/$MAX_RESTARTS)"
-        sleep 1
+        sleep 1 8>&- 9>&-
     done
 }
 
 case "${1:-}" in
     '')       run_bridge ;;
-    __mirror) mirror_selection "${2:-}" ;;
+    __mirror) mirror_selection ;;
     *)        die "unknown argument: $1" ;;
 esac

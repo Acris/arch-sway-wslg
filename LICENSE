@@ -3,6 +3,7 @@ MIT License (software and configuration files)
 Copyright (c) 2026 Acris Liu
 Copyright (c) 2024 Jordan Koehn (sway-wsl2 portions)
 Copyright (c) yazi-rs/flavors contributors (Yazi theme portions)
+Copyright (c) 2021 Catppuccin (bundled wallpaper)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -30,12 +31,10 @@ https://github.com/catppuccin/bat
 
 It is distributed under the MIT license and is covered by the grant above.
 
-Bundled wallpaper notice
+Bundled wallpaper
 
-.config/sway/wallpapers/dark-star.jpg is sourced from the
-orangci/walls-catppuccin-mocha wallpaper collection:
-https://github.com/orangci/walls-catppuccin-mocha
+.config/sway/wallpapers/arch-black-4k.png is taken from the
+zhichaoh/catppuccin-wallpapers collection:
+https://github.com/zhichaoh/catppuccin-wallpapers
 
-The wallpaper is not covered by the MIT license grant above. Its upstream
-collection does not state a redistribution license; distributors must verify
-permission before redistributing the image.
+It is distributed under the MIT license and is covered by the grant above.

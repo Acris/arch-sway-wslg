@@ -6,7 +6,7 @@
 # Terminal font: Maple Mono NF CN (configured by Foot)
 # Theme:         Catppuccin Mocha
 # Scale:         answered during installation
-# Mod:           Alt / Mod1 (avoids Windows/Super conflicts; use Mod3 if Alt conflicts with applications)
+# Mod:           Alt / Mod1 (avoids Windows/Super conflicts; change set $mod below)
 # Overrides:     config.d/*.conf (never replaced by the installer)
 # =============================================================================
 
@@ -19,6 +19,9 @@ xwayland enable
 # -----------------------------------------------------------------------------
 # Variables
 # -----------------------------------------------------------------------------
+# Sway expands a variable while it parses each line, so the bindings below are
+# resolved with this value. Changing the modifier means changing it here;
+# setting $mod again from config.d comes too late.
 set $mod Mod1
 set $left  h
 set $down  j
@@ -56,7 +59,7 @@ client.urgent           $peach    $base $peach $overlay0  $peach
 output * {
     # install.sh replaces this marker with the scale answered during setup.
     scale __ARCH_SWAY_WSLG_SCALE__
-    # Bundled Catppuccin Mocha wallpaper; use the base color if it is unavailable.
+    # Bundled wallpaper; use the base color if it is unavailable.
     bg $wallpaper fill $base
 }
 

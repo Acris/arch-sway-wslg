@@ -48,6 +48,7 @@ X11_PRIVATE_DIR="$RUNTIME_DIR/x11-unix"
 CLIPBOARD_STATE_DIR="$RUNTIME_DIR/clipboard"
 CLIPBOARD_LOCK_FILE="$CLIPBOARD_STATE_DIR/bridge.lock"
 CLIPBOARD_PID_FILE="$CLIPBOARD_STATE_DIR/bridge.pid"
+CLIPBOARD_STATUS_FILE="$CLIPBOARD_STATE_DIR/status"
 SWAY_CONFIG="$CONFIG_HOME/sway/config"
 BROWSER_FILE="$CONFIG_HOME/$NAME/browser"
 START_TIMEOUT=8
@@ -65,11 +66,16 @@ SESSION_OUTPUTS="${ARCH_SWAY_WSLG_OUTPUTS:-1}"
 # install already provides through util-linux, coreutils and systemd. The
 # clipboard bridge and its idle gate belong to the session, so they are listed
 # with the compositor rather than checked later.
-SESSION_COMMANDS=(sway Xwayland swaymsg swayidle systemd-run sudo wl-copy wl-paste)
+SESSION_COMMANDS=(sway Xwayland swaymsg swayidle systemd-run sudo timeout wl-copy wl-paste)
 
 # Started by the Sway configuration itself. A missing one only shows up in the
 # session log, so `doctor` reports them instead.
-SESSION_APPLICATIONS=(swaybg waybar swaync foot fuzzel)
+SESSION_APPLICATIONS=(swaybg waybar swaync swaync-client foot fuzzel yazi swaynag)
+
+# Used by the media keys only. No installed package provides them directly:
+# they arrive with Waybar's own dependencies, so `doctor` mentions them without
+# failing over a binding that does nothing.
+SESSION_MEDIA_COMMANDS=(pactl playerctl)
 
 note() { printf '%s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -215,17 +221,23 @@ clipboard_pid() {
     printf '%s\n' "$pid"
 }
 
-# The bridge reads the Windows clipboard only while the session is quiet and
-# runs its own swayidle to know when that is. That child is therefore the
-# visible part of a state the bridge otherwise keeps in memory.
-clipboard_gated() {
-    local pid
-    pid="$(clipboard_pid)" || return 1
-    pgrep -P "$pid" -x swayidle >/dev/null 2>&1
+clipboard_status() {
+    local status
+    [[ -r "$CLIPBOARD_STATUS_FILE" ]] || return 1
+    IFS= read -r status < "$CLIPBOARD_STATUS_FILE" || return 1
+    case "$status" in
+        both|to-windows|off|degraded) printf '%s\n' "$status" ;;
+        *) return 1 ;;
+    esac
 }
 
 clipboard_state() {
-    local pid
+    local pid status
+    status="$(clipboard_status || true)"
+    if [[ "$status" == off ]]; then
+        printf 'disabled by ARCH_SWAY_WSLG_CLIPBOARD=off\n'
+        return 0
+    fi
     if ! clipboard_running; then
         if clipboard_available; then
             printf "not running; see '%s logs'\n" "$NAME"
@@ -236,11 +248,20 @@ clipboard_state() {
     fi
 
     pid="$(clipboard_pid)" || pid="unknown"
-    if clipboard_gated; then
-        printf 'running (PID %s; Windows clipboard read while the session is idle)\n' "$pid"
-    else
-        printf 'running (PID %s; Windows clipboard not read automatically)\n' "$pid"
-    fi
+    case "$status" in
+        both)
+            printf 'running (PID %s; Windows clipboard read while the session is idle)\n' "$pid"
+            ;;
+        to-windows)
+            printf 'running (PID %s; forwarding to Windows only by configuration)\n' "$pid"
+            ;;
+        degraded)
+            printf 'running (PID %s; Windows clipboard reads stopped after swayidle failures)\n' "$pid"
+            ;;
+        *)
+            printf 'running (PID %s; clipboard state unavailable)\n' "$pid"
+            ;;
+    esac
 }
 
 # -----------------------------------------------------------------------------
@@ -284,9 +305,10 @@ prepare_environment() {
     export XDG_SESSION_TYPE="wayland"
     export XDG_CURRENT_DESKTOP="sway"
 
-    # An inherited backend override can prevent nested-Wayland auto-selection.
+    # An inherited backend override can prevent nested-Wayland auto-selection,
+    # and an inherited output count would outvote the one this session resolved.
     # Preserve renderer and application-specific workarounds set by the user.
-    unset WLR_BACKENDS
+    unset WLR_BACKENDS WLR_WL_OUTPUTS
     if (( SESSION_OUTPUTS > 1 )); then
         export WLR_WL_OUTPUTS="$SESSION_OUTPUTS"
     fi
@@ -436,12 +458,19 @@ cleanup_failed_start() {
     cleanup_session_state
 }
 
+# `start` and `status` describe the same running session, so both report it the
+# same way. Only reached with the session scope active.
 report_running_session() {
-    note "Systemd scope: $SESSION_SCOPE"
-    note "IPC: $SWAYSOCK_PATH"
+    note "Systemd scope: active ($SESSION_SCOPE)"
     note "D-Bus: $USER_BUS_ADDRESS (shared user bus)"
-    note "XWayland: configured (lazy; runtime errors are logged)"
+    if ipc_ready; then
+        note "IPC: ready ($SWAYSOCK_PATH)"
+    else
+        note "IPC: not ready ($SWAYSOCK_PATH)"
+    fi
+    note "XWayland: configured (lazy; see logs for runtime errors)"
     note "Clipboard: $(clipboard_state)"
+    note "Log: $LOG_FILE"
 }
 
 start_session() {
@@ -480,7 +509,6 @@ start_session() {
         0)
             note "Sway started successfully."
             report_running_session
-            note "Log: $LOG_FILE"
             ;;
         1)
             cleanup_failed_start
@@ -498,8 +526,9 @@ start_session() {
     esac
 }
 
+# Sway IPC is the graceful path; without it the session scope is stopped
+# directly, so a missing swaymsg must not keep the session running.
 stop_session() {
-    need swaymsg
     ensure_dirs
     take_control_lock
 
@@ -536,10 +565,12 @@ stop_session() {
     note "Sway stopped."
 }
 
+# Observation only. Removing stale state here would race a start that has not
+# entered its scope yet, and the installer calls this while holding the control
+# lock, so it must neither take that lock nor change anything.
 status_session() {
-    need swaymsg
-    ensure_dirs
-    cleanup_stale_state
+    systemd_user_usable || \
+        die "systemd user runtime is unavailable: $SYSTEMD_RUNTIME_DIR"
 
     if ! session_scope_active; then
         note "Sway: stopped"
@@ -547,16 +578,7 @@ status_session() {
     fi
 
     note "Sway: running"
-    note "Systemd scope: active ($SESSION_SCOPE)"
-    note "D-Bus: $USER_BUS_ADDRESS (shared user bus)"
-    if ipc_ready; then
-        note "IPC: ready ($SWAYSOCK_PATH)"
-    else
-        note "IPC: not ready ($SWAYSOCK_PATH)"
-    fi
-    note "XWayland: configured (lazy; see logs for runtime errors)"
-    note "Clipboard: $(clipboard_state)"
-    note "Log: $LOG_FILE"
+    report_running_session
 }
 
 restart_session() {
@@ -566,9 +588,10 @@ restart_session() {
     start_session --outputs "$SESSION_OUTPUTS"
 }
 
+# A session that refuses to start is exactly when the log has to be readable,
+# so this command depends on nothing but the file itself.
 show_logs() {
-    ensure_dirs
-    touch "$LOG_FILE"
+    [[ -r "$LOG_FILE" ]] || die "no session log yet: $LOG_FILE"
     exec tail -F "$LOG_FILE"
 }
 
@@ -579,7 +602,6 @@ doctor() {
     note "-----------------------------"
 
     if systemd_user_usable; then
-        ensure_dirs
         note "OK   systemd user manager"
         note "OK   systemd user runtime: $SYSTEMD_RUNTIME_DIR"
     else
@@ -605,13 +627,14 @@ doctor() {
                 ;;
         esac
 
+        # The bus is shared, so the listing cannot say which process owns a
+        # name. Report the state and leave the conclusion to the reader.
         case "$(bus_name_state "$bus_names" org.freedesktop.Notifications || true)" in
             owned)
-                if session_scope_active; then
-                    note "OK   notifications: org.freedesktop.Notifications held by the session"
-                else
-                    note "INFO org.freedesktop.Notifications is held outside the session; stop that service before starting Sway"
-                fi
+                note "INFO notifications: org.freedesktop.Notifications is already owned on this bus"
+                ;;
+            activatable)
+                note "INFO notifications: org.freedesktop.Notifications is activatable on this bus"
                 ;;
             *)
                 note "OK   notifications: org.freedesktop.Notifications is free for SwayNC"
@@ -640,6 +663,14 @@ doctor() {
         else
             note "FAIL command: $cmd"
             failed=1
+        fi
+    done
+
+    for cmd in "${SESSION_MEDIA_COMMANDS[@]}"; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            note "OK   command: $cmd"
+        else
+            note "INFO command: $cmd is missing; its media keys do nothing"
         fi
     done
 

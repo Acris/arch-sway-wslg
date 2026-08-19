@@ -74,18 +74,24 @@ still hold.
 - Override an inherited environment value only where the session must own it. Toolkit, Java, VS Code and browser
   defaults are filled in only when the user has set nothing.
 - Validate the nested output count wherever it enters, `--outputs` and `ARCH_SWAY_WSLG_OUTPUTS` alike; one through four
-  outputs are supported.
-- Keep `status` and `doctor` truthful. `doctor` only inspects: it never asks for sudo, changes nothing, and covers the
-  commands the session needs, the applications the Sway configuration starts, and the clipboard bridge.
+  outputs are supported, and an inherited count never reaches the compositor unchecked.
+- Keep `status` and `doctor` truthful, and keep both of them observers: they never ask for sudo, take the control lock,
+  or change anything, because the installer also runs `status` while holding that lock. `doctor` covers the commands the
+  session needs, the applications the Sway configuration starts, and the clipboard bridge, and it reports names on the
+  shared bus as they are instead of inferring who owns them. A command no installed package provides directly is
+  reported without failing the check.
+- `logs` reads an ordinary file, and a session that refuses to start is exactly when it is needed, so it must not depend
+  on systemd, the bus, or any other part of the session.
 - Bound every wait around systemd, the user bus, WSLg, IPC, locks, and the clipboard.
 - Out of scope: portals, Flatpak integration, screen sharing, moving WSLg windows, and recovering automatically after
   WSLg itself fails.
 
 ### Installer
 
-- Run as the normal user and delegate package changes to `paru`. Preflight only the commands the installer or the
-  session actually uses.
-- Refresh the package databases only; upgrading installed packages belongs to the user's own schedule.
+- Run as the normal user and delegate package changes to `paru`. Preflight the commands an installation run depends on,
+  `paru`'s own included; it is not an audit of every call the script makes.
+- Refresh the package databases only; upgrading installed packages belongs to the user's own schedule. Arch does not
+  support partial upgrades, so ask for confirmation when the refresh shows the installed system is behind.
 - Ask for a browser once, mark the ones already installed, do not reinstall those, record the choice for `BROWSER`, and
   remove a previously recorded choice when the user declines a browser.
 - When `oo7` is present, enable and start its user unit and offer to store the keyring password as an encrypted systemd
@@ -94,13 +100,18 @@ still hold.
   payload. Reject a configuration root the Sway configuration cannot express instead of mangling it.
 - Ask once for a scale from `1` to `4`, defaulting to `1`. Do not try to detect Windows scaling: WSLg performs it on the
   Windows side and reports a scale of 1.
-- Stage and check the whole payload on the same filesystem before replacing any managed directory. Preserve the user
-  override paths, seed them on a first installation, and remove optional choices the user has revoked.
+- Stage and check the whole payload on the same filesystem before replacing any managed directory, and remove the
+  staging directories on every exit, an interrupt included. The check covers the files the session cannot start without,
+  the imported override stylesheets among them. Preserve the user override paths, seed them on a first installation, and
+  remove optional choices the user has revoked.
+- Report a failed write instead of continuing: a helper called in a condition runs without `errexit`, so every step in
+  it reports its own failure.
 - Offer a timestamped backup on every run, default to yes, and keep it the single documented way back: it replaces the
   removed rollback machinery.
 - Apply approved GSettings through the explicitly bound persistent user bus after the payload commits, then read the
   values back.
-- Hold the control lock around the payload replacement only, never around package installation.
+- Take the control lock once the questions and the package installation are done, and hold it to the end of the run: the
+  backup, the replacement and the recorded choices have to describe one installation. Never hold it across `paru`.
 
 ### Clipboard
 
@@ -110,14 +121,16 @@ still hold.
   add a Windows helper process.
 - Serialise forwarding, echo suppression, and parent reads under one lock, and record a selection as mirrored only after
   the peer really holds it.
-- Any visit to the parent takes focus away from the session, whichever direction causes it, so none of them may overlap
-  typing. Automatic reads require the supervised quiet-period notifier, and a forward waits for the shortcut that
-  triggered it to be released, which also collapses a burst of copies into the newest one. A notifier that cannot be
-  kept alive stops those reads loudly instead of releasing them, and `status` reports which of the two applies.
+- Any visit to the parent takes focus away from the session, whichever direction causes it, so keep them away from
+  typing as far as the platform allows: automatic reads wait for the supervised quiet-period notifier, and a forward
+  waits through a short settling period, which normally means the shortcut that triggered it is already released. A
+  notifier that cannot be kept alive stops those reads loudly instead of releasing them, and `status` distinguishes that
+  failure from a direction disabled by configuration.
 - Automatic reads back off the longer the session stays quiet, and any input restores the configured interval.
-- Bound bridge and notifier restarts, every clipboard read, and the poll interval, which is rejected below an explicit
-  floor. A restarted watcher keeps what has already been mirrored, so it cannot push a stale selection back over the
-  peer. The bridge is started by Sway and stays inside the session scope.
+- Bound bridge and notifier restarts, every clipboard operation, and the poll interval, which is rejected below an
+  explicit floor. Restart budgets reset after stable operation, and a restarted watcher keeps what has already been
+  mirrored, so it cannot push a stale selection back over the peer. The bridge is started by Sway and stays inside the
+  session scope.
 
 ### Configuration
 
@@ -132,6 +145,8 @@ still hold.
   pixels.
 - Start Sway's children directly. `swaybar_command` is executed without a shell, so it takes no shell syntax, and
   nothing publishes an activation environment: on the shared user bus that would outlive the session.
+- Sway expands a variable while it parses the line that uses it, so `config.d` can add and re-bind, but it cannot retune
+  a value the managed configuration has already consumed. Do not document it as if it could.
 - This project does not validate Sway configuration; runtime errors belong in the managed session log.
 
 ## Code style
@@ -153,8 +168,7 @@ still hold.
 ## Change checklist
 
 - Inspect the worktree first and preserve unrelated changes.
-- Keep the launcher's command lists aligned with what `start`, `stop`, the clipboard, and `doctor` really use, and the
-  installer's preflight aligned with the commands the installer runs.
+- Keep the launcher's command lists aligned with what `start`, `stop`, the clipboard, and `doctor` really use.
 - Bump `VERSION` when the package list changes, and update the uninstall list in both READMEs at the same time.
 - Update `README.md` for user-visible behaviour first, then translate it into `README_CN.md`. Delete stale documentation
   instead of describing behaviour the code no longer has.

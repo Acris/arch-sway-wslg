@@ -37,8 +37,12 @@ MANAGED_CONFIG_DIRS=(sway waybar swaync swaynag foot fuzzel yazi)
 # Files and directories inside the managed configuration that belong to the
 # user. They survive every reinstall and are read after the managed files.
 LOCAL_OVERRIDE_PATHS=(sway/config.d foot/local.ini fuzzel/local.ini waybar/local.css swaync/local.css)
+# The subset of those paths the managed stylesheets import. GTK drops a whole
+# stylesheet whose import is missing, so these two have to exist after every
+# installation, not only after the first one.
+LOCAL_STYLESHEETS=(waybar/local.css swaync/local.css)
 # Bundled wallpaper, relative to the managed configuration root.
-WALLPAPER_RELATIVE="sway/wallpapers/dark-star.jpg"
+WALLPAPER_RELATIVE="sway/wallpapers/arch-black-4k.png"
 # Bundled syntax highlighting theme for the Yazi file preview.
 YAZI_THEME_RELATIVE="yazi/Catppuccin-mocha.tmTheme"
 
@@ -100,7 +104,6 @@ declare -A BROWSER_COMMANDS=(
 BROWSER_CHOICE="firefox"
 declare -A BROWSER_INSTALLED=()
 
-SWAY_SCALE_MAX=4
 SWAY_SCALE=1
 SYSTEMD_RUNTIME_DIR="/run/user/$EUID"
 # GSettings and every systemd call have to reach the persistent user manager,
@@ -125,9 +128,10 @@ Installs the package set and the $NAME user configuration.
 Managed configuration directories are replaced exactly, except for the local
 override paths (${LOCAL_OVERRIDE_PATHS[*]}), which are always preserved.
 
-The installer asks for a backup of the current state, the Sway output scale, a
-browser, the optional desktop-entry masks, automatic oo7 keyring unlocking and
-the GTK appearance defaults. Backups are written to $BACKUP_BASE.
+The installer asks about the optional desktop-entry masks, a browser, the Sway
+output scale and a backup, then installs the packages, and asks about automatic
+oo7 keyring unlocking and the GTK appearance defaults afterwards. Backups are
+written to $BACKUP_BASE.
 EOF2
 }
 
@@ -237,7 +241,7 @@ preflight() {
     (( EUID != 0 )) || die "run this installer as your normal Arch user, not as root"
 
     local command_name config_name
-    for command_name in paru flock sudo systemctl; do
+    for command_name in paru pacman flock sudo systemctl timeout; do
         command -v "$command_name" >/dev/null 2>&1 || \
             die "required command not found: $command_name"
     done
@@ -272,24 +276,45 @@ prompt_scale() {
     note "  100% -> 1    125% -> 1.25    150% -> 1.5    175% -> 1.75    200% -> 2"
 
     while true; do
-        printf 'Sway output scale [1-%d, default: 1]: ' "$SWAY_SCALE_MAX" >&2
+        printf 'Sway output scale [1-4, default: 1]: ' >&2
         if ! IFS= read -r answer; then
             printf '\n' >&2
             die "input closed before the scale was answered"
         fi
         [[ -n "$answer" ]] || answer=1
+        # Fractional values below 4 and 4 itself; the two messages around this
+        # test state the same range, so they have to change together.
         if [[ "$answer" =~ ^[1-3]([.][0-9]+)?$ || "$answer" =~ ^4([.]0+)?$ ]]; then
             SWAY_SCALE="$answer"
             note "Change it any time in $CONFIG_HOME/sway/config.d/, for example: output * scale 1.5"
             return 0
         fi
-        warn "enter a number from 1 through $SWAY_SCALE_MAX, for example: 1, 1.25, 1.5, 2"
+        warn "enter a number from 1 through 4, for example: 1, 1.25, 1.5, 2"
     done
 }
 
 # -----------------------------------------------------------------------------
 # Packages
 # -----------------------------------------------------------------------------
+# Arch supports no partial upgrades: installing against databases that are newer
+# than the installed system can pull in packages built for libraries this system
+# does not have. The installer never upgrades, so it reports what the refresh
+# just revealed and lets the user upgrade first.
+confirm_no_partial_upgrade() {
+    local -a outdated=()
+
+    mapfile -t outdated < <(pacman -Qu 2>/dev/null || true)
+    (( ${#outdated[@]} )) || return 0
+
+    note ""
+    warn "${#outdated[@]} installed packages are older than the refreshed databases."
+    note "Arch does not support partial upgrades: installing now can pull in packages"
+    note "that need newer libraries than this system has."
+    note "Upgrade with 'paru -Syu' first, then start this installer again."
+    prompt_yes_no "Continue without upgrading?" no || \
+        die "installation cancelled; run 'paru -Syu' first"
+}
+
 install_packages() {
     local package
     local -a selected_bootstrap=()
@@ -305,11 +330,16 @@ install_packages() {
     fi
 
     note ""
-    note "Refreshing the package databases and installing ${#selected_bootstrap[@]} bootstrap packages..."
+    note "Refreshing the package databases..."
     note "Paru may request sudo to install packages."
     # Refresh the databases only. Upgrading the whole system belongs to the
     # user's own schedule, not to a desktop installation.
-    paru -Sy --needed "${selected_bootstrap[@]}"
+    paru -Sy
+    confirm_no_partial_upgrade
+
+    note ""
+    note "Installing ${#selected_bootstrap[@]} bootstrap packages..."
+    paru -S --needed "${selected_bootstrap[@]}"
 
     if paru -T org.freedesktop.secrets >/dev/null 2>&1; then
         selected_main=()
@@ -317,6 +347,9 @@ install_packages() {
             [[ "$package" == oo7 ]] || selected_main+=("$package")
         done
         note "An org.freedesktop.secrets credential manager is already installed; skipping oo7."
+        # configure_oo7 finds no oo7 and returns early, so the summary would
+        # otherwise claim this system has no Secret Service at all.
+        OO7_SUMMARY="another Secret Service provider is installed"
     fi
     if [[ "$BROWSER_CHOICE" != none ]]; then
         if (( ${BROWSER_INSTALLED[$BROWSER_CHOICE]:-0} )); then
@@ -450,8 +483,10 @@ stop_active_session() {
     "$installed_launcher" stop || die "failed to stop the managed Sway session"
 }
 
-# The launcher control lock is only held around the payload replacement, so a
-# long package update never blocks another terminal from starting Sway.
+# Taken once the questions and the package installation are done, and held to
+# the end of the run: the backup, the payload replacement and the recorded
+# choices all have to describe the same installation. A long package update
+# therefore never blocks another terminal from starting Sway.
 take_control_lock() {
     local installed_launcher="$LOCAL_BIN_DIR/$NAME"
 
@@ -624,11 +659,17 @@ sway_wallpaper_value() {
     printf '%s\n' "${path//\$/\$\$}"
 }
 
+# Reports its own failure, because the caller runs inside a condition, which
+# turns off errexit: an unchecked write would be swallowed and the payload would
+# be committed without the override file.
 seed_local_override() {
     local target="$1"
     shift
     [[ -e "$target" ]] && return 0
-    printf '%s\n' "$@" > "$target"
+    printf '%s\n' "$@" > "$target" || {
+        warn "failed to create the override file: $target"
+        return 1
+    }
 }
 
 # Keep the user's own override files and create them on a first installation.
@@ -655,29 +696,29 @@ stage_local_overrides() {
         '# Do not add dbus-update-activation-environment here. The session runs' \
         '# on your persistent user bus, where that call reaches the systemd user' \
         '# manager: the nested display values would outlive the session and could' \
-        '# not be removed again. Programs started by Sway inherit them already.'
+        '# not be removed again. Programs started by Sway inherit them already.' || return 1
     seed_local_override "$STAGE_CONFIG/foot/local.ini" \
         '# Personal Foot configuration; never replaced by arch-sway-wslg.' \
         '# Options set here win, for example:' \
         '#   [main]' \
-        '#   font=Maple Mono NF CN:size=12'
+        '#   font=Maple Mono NF CN:size=12' || return 1
     seed_local_override "$STAGE_CONFIG/fuzzel/local.ini" \
         '# Personal Fuzzel configuration; never replaced by arch-sway-wslg.' \
         '# Options set here win, for example:' \
         '#   [main]' \
-        '#   lines=12'
+        '#   lines=12' || return 1
     # Both stylesheets import their local.css last. GTK drops the whole
     # stylesheet when an import is missing, so these files always exist.
     seed_local_override "$STAGE_CONFIG/waybar/local.css" \
         '/* Personal Waybar styling; never replaced by arch-sway-wslg.' \
         ' * Rules set here win, for example:' \
         ' *   * { font-size: 16px; }' \
-        ' * Keep this file even when it is empty. */'
+        ' * Keep this file even when it is empty. */' || return 1
     seed_local_override "$STAGE_CONFIG/swaync/local.css" \
         '/* Personal SwayNC styling; never replaced by arch-sway-wslg.' \
         ' * Rules set here win, for example:' \
         ' *   :root { --font-size-body: 17px; }' \
-        ' * Keep this file even when it is empty. */'
+        ' * Keep this file even when it is empty. */' || return 1
 }
 
 render_staged_payload() {
@@ -698,6 +739,8 @@ render_staged_payload() {
 }
 
 check_staged_payload() {
+    local stylesheet
+
     [[ -s "$STAGE_CONFIG/$WALLPAPER_RELATIVE" ]] || {
         warn "staged Sway wallpaper payload is missing"
         return 1
@@ -706,12 +749,24 @@ check_staged_payload() {
         warn "staged Yazi syntax highlighting theme is missing"
         return 1
     }
+    # A missing import costs the whole stylesheet, so this is checked here as
+    # well and not only where the file is created.
+    for stylesheet in "${LOCAL_STYLESHEETS[@]}"; do
+        [[ -e "$STAGE_CONFIG/$stylesheet" ]] || {
+            warn "staged override stylesheet is missing: $stylesheet"
+            return 1
+        }
+    done
     bash -n "$STAGE_LOCAL/bin/$NAME" || return 1
     bash -n "$STAGE_LOCAL/libexec/$NAME/clipboard-bridge" || return 1
 }
 
 install_payload() {
     local include_desktop_overrides="$1" config_name source_file basename
+
+    # An interrupt between staging and the replacement would otherwise leave
+    # temporary directories inside the user's own configuration.
+    trap cleanup_staging EXIT
 
     note ""
     note "Staging and checking the configuration payload before installation..."
@@ -912,11 +967,11 @@ main() {
     prompt_scale
     prompt_backup
 
-    stop_active_session
     install_packages
     configure_oo7
     prompt_appearance_defaults
 
+    stop_active_session
     take_control_lock
     backup_existing_files "$install_desktop_overrides"
     install_payload "$install_desktop_overrides"

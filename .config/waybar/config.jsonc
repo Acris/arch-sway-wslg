@@ -106,8 +106,8 @@
     "tooltip-format": "{desc}\nVolume: {volume}%"
   },
   "tray": {
-    // 22 is one of the sizes the Papirus icon theme ships, so tray icons are
-    // never rescaled.
+    // Request a standard Papirus size; applications may still supply their own
+    // StatusNotifierItem pixmap instead of an icon from the theme.
     "icon-size": 22,
     "spacing": 10,
     "show-passive-items": false
