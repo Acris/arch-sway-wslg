@@ -109,25 +109,25 @@ then run as the normal user. `stop` needs no sudo and ends everything the sessio
 
 ## Key Bindings
 
-| Key                           | Action                                   |
-|-------------------------------|------------------------------------------|
-| `Alt+Enter`                   | Open Foot                                |
-| `Alt+D`                       | Open Fuzzel                              |
-| `Alt+Y`                       | Open Yazi in Foot                        |
-| `Alt+H/J/K/L` or arrows       | Move focus                               |
-| `Alt+Shift+H/J/K/L` or arrows | Move the focused container               |
-| `Alt+1..0`                    | Switch to workspace 1–10                 |
-| `Alt+Shift+1..0`              | Move a container to workspace 1–10       |
-| `Alt+B/V`                     | Select a horizontal or vertical split    |
-| `Alt+S/W/E`                   | Select stacking, tabbed, or split layout |
-| `Alt+F`                       | Toggle fullscreen                        |
-| `Alt+Shift+F`                 | Toggle floating                          |
-| `Alt+R`                       | Enter resize mode                        |
-| `Alt+Shift+N`                 | Toggle the SwayNC control center         |
-| `Alt+Ctrl+N`                  | Toggle Do Not Disturb                    |
-| `Alt+Shift+Q`                 | Close the focused window                 |
-| `Alt+Shift+C`                 | Reload Sway configuration                |
-| `Alt+Shift+E`                 | Confirm and exit the Sway session        |
+| Key                     | Action                                   |
+|-------------------------|------------------------------------------|
+| `Alt+Enter`             | Open Foot                                |
+| `Alt+D`                 | Open Fuzzel                              |
+| `Alt+Y`                 | Open Yazi in Foot                        |
+| `Alt+H/J/K/L`           | Move focus                               |
+| `Alt+Shift+H/J/K/L`     | Move the focused container               |
+| `Alt+1..0`              | Switch to workspace 1–10                 |
+| `Alt+Shift+1..0`        | Move a container to workspace 1–10       |
+| `Alt+B/V`               | Select a horizontal or vertical split    |
+| `Alt+S/W/E`             | Select stacking, tabbed, or split layout |
+| `Alt+F`                 | Toggle fullscreen                        |
+| `Alt+Shift+F`           | Toggle floating                          |
+| `Alt+R`, then `H/J/K/L` | Enter resize mode                        |
+| `Alt+Shift+N`           | Toggle the SwayNC control center         |
+| `Alt+Ctrl+N`            | Toggle Do Not Disturb                    |
+| `Alt+Shift+Q`           | Close the focused window                 |
+| `Alt+Shift+C`           | Reload Sway configuration                |
+| `Alt+Shift+E`           | Confirm and exit the Sway session        |
 
 Windows owns `Alt+Tab` and `Alt+Space`, so the configuration avoids those combinations, and screenshots stay on Windows
 `Win+Shift+S`.

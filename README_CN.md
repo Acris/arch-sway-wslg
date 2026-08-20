@@ -102,25 +102,25 @@ sudo，且会结束会话启动的所有进程。
 
 ## 快捷键
 
-| 按键                         | 动作                     |
-|------------------------------|--------------------------|
-| `Alt+Enter`                  | 打开 Foot                |
-| `Alt+D`                      | 打开 Fuzzel              |
-| `Alt+Y`                      | 在 Foot 中打开 Yazi      |
-| `Alt+H/J/K/L` 或方向键       | 移动焦点                 |
-| `Alt+Shift+H/J/K/L` 或方向键 | 移动当前容器             |
-| `Alt+1..0`                   | 切换到工作区 1–10        |
-| `Alt+Shift+1..0`             | 把容器移动到工作区 1–10  |
-| `Alt+B/V`                    | 选择水平或垂直分割       |
-| `Alt+S/W/E`                  | 选择堆叠、标签或分割布局 |
-| `Alt+F`                      | 切换全屏                 |
-| `Alt+Shift+F`                | 切换浮动                 |
-| `Alt+R`                      | 进入调整大小模式         |
-| `Alt+Shift+N`                | 切换 SwayNC 控制中心     |
-| `Alt+Ctrl+N`                 | 切换勿扰模式             |
-| `Alt+Shift+Q`                | 关闭当前窗口             |
-| `Alt+Shift+C`                | 重载 Sway 配置           |
-| `Alt+Shift+E`                | 确认并退出 Sway 会话     |
+| 按键                    | 动作                     |
+|-------------------------|--------------------------|
+| `Alt+Enter`             | 打开 Foot                |
+| `Alt+D`                 | 打开 Fuzzel              |
+| `Alt+Y`                 | 在 Foot 中打开 Yazi      |
+| `Alt+H/J/K/L`           | 移动焦点                 |
+| `Alt+Shift+H/J/K/L`     | 移动当前容器             |
+| `Alt+1..0`              | 切换到工作区 1–10        |
+| `Alt+Shift+1..0`        | 把容器移动到工作区 1–10  |
+| `Alt+B/V`               | 选择水平或垂直分割       |
+| `Alt+S/W/E`             | 选择堆叠、标签或分割布局 |
+| `Alt+F`                 | 切换全屏                 |
+| `Alt+Shift+F`           | 切换浮动                 |
+| `Alt+R`，再按 `H/J/K/L` | 进入调整大小模式         |
+| `Alt+Shift+N`           | 切换 SwayNC 控制中心     |
+| `Alt+Ctrl+N`            | 切换勿扰模式             |
+| `Alt+Shift+Q`           | 关闭当前窗口             |
+| `Alt+Shift+C`           | 重载 Sway 配置           |
+| `Alt+Shift+E`           | 确认并退出 Sway 会话     |
 
 Windows 占用 `Alt+Tab` 与 `Alt+Space`，因此配置避开了这些组合；截图仍使用 Windows 的 `Win+Shift+S`。
 
