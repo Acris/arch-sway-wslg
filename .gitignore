@@ -1,2 +1,4 @@
 .idea/
 *.iml
+# Rust build output; release payloads under .local/libexec remain tracked.
+clipboard/target/

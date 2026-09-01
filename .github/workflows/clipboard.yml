@@ -1,0 +1,54 @@
+name: clipboard
+
+on:
+  push:
+    paths:
+      - "clipboard/**"
+      - ".local/libexec/arch-sway-wslg/**"
+      - ".github/workflows/clipboard.yml"
+  pull_request:
+    paths:
+      - "clipboard/**"
+      - ".local/libexec/arch-sway-wslg/**"
+      - ".github/workflows/clipboard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clipboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo build --release --locked -p clipboard-broker
+      - name: verify checked-in Linux payload
+        run: |
+          (cd ../.local/libexec/arch-sway-wslg && sha256sum -c clipboard.sha256)
+          ../.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard --probe
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: clipboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: x86_64-pc-windows-msvc
+      - run: cargo check --locked -p clipboard-agent-win --target x86_64-pc-windows-msvc
+      - run: cargo clippy --locked -p clipboard-agent-win --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo build --release --locked -p clipboard-agent-win --target x86_64-pc-windows-msvc
+      - run: target/x86_64-pc-windows-msvc/release/arch-sway-wslg-clipboard-agent.exe --probe
+      - name: verify checked-in Windows payload
+        run: ..\.local\libexec\arch-sway-wslg\arch-sway-wslg-clipboard-agent.exe --probe

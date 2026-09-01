@@ -6,59 +6,75 @@
 is not a bare-metal Sway distribution. A supported environment has WSLg, systemd with a working user manager, and a
 normal default user with `sudo` and `paru`. The installer neither checks nor changes locales.
 
-`README.md` is the user-facing contract and is written for users, not for maintainers: it describes what the session
-does, not how it is built. Keep `README_CN.md` section-for-section equivalent with it and update the English document
-first. Do not duplicate user instructions here unless an agent needs the rule to change the project safely.
+`README.md` is the user-facing contract: install, use, customise, update, uninstall, troubleshoot. It describes
+behaviour the user can observe and stays free of implementation detail. Keep `README_CN.md` section-for-section
+equivalent with it and update the English document first. Contributor material lives here and in
+`clipboard/README.md`; do not put it into the user documents.
+
+The project uses CalVer `YYYY.M.RELEASE`: the release counter starts at `1` for the first release in each month and
+increments for subsequent releases in that month. Keep this policy consistent in `VERSION` and both READMEs.
 
 ## Repository layout
 
-| Path                             | Contents                                                                   |
-|----------------------------------|----------------------------------------------------------------------------|
-| `install.sh`                     | Prompts, package lists, oo7 setup, backups, payload staging, and GSettings |
-| `.local/bin/arch-sway-wslg`      | Public launcher: session lifecycle, `status`, and `doctor`                 |
-| `.local/libexec/arch-sway-wslg/` | Private session helpers; currently the clipboard bridge                    |
-| `.config/`                       | Configuration payload installed into the user's configuration home         |
-| `extras/desktop-overrides/`      | Optional desktop entry masks                                               |
-| `VERSION`                        | Release version rendered into the installed launcher                       |
-| `LICENSE`                        | Project and wallpaper notices                                              |
+| Path                             | Contents                                                                    |
+|----------------------------------|-----------------------------------------------------------------------------|
+| `install.sh`                     | Prompts, package lists, oo7 setup, backups, payload staging, and GSettings  |
+| `.local/bin/arch-sway-wslg`      | Public launcher: session lifecycle, `status`, `doctor`, and `logs`          |
+| `.local/libexec/arch-sway-wslg/` | Prebuilt Linux clipboard broker, Win32 agent, and `clipboard.sha256`        |
+| `clipboard/`                     | Rust workspace for the clipboard data plane; see `clipboard/README.md`      |
+| `.config/`                       | Configuration payload installed into the user's configuration home          |
+| `extras/desktop-overrides/`      | Optional desktop entry masks                                                |
+| `.github/workflows/`             | CI for the Rust workspace; verifies the checked-in payload, uploads nothing |
+| `VERSION`                        | Release version rendered into the installed launcher                        |
+| `LICENSE`                        | Project and wallpaper notices                                               |
 
 There is no separate package manifest: the package lists live in `install.sh`, and dependencies pacman resolves on its
 own are not listed. The installer replaces markers such as `__ARCH_SWAY_WSLG_VERSION__` in the staged payload, so the
 files under `.config/` and `.local/` are templates rather than the installed result.
 
-## Setup and validation
+## Setup commands
 
-Static shell checks are the whole test suite. Do not add Sway configuration validation or end-to-end WSLg tests unless
-asked. On Arch Linux:
+- Shell checks need `bash` and `shellcheck`; on a non-Arch host use a disposable Arch container (see below).
+- Rust checks need the stable toolchain with `clippy` and `rustfmt`, plus the `x86_64-pc-windows-msvc` target.
+- Rebuilding the Windows agent needs `cargo-xwin`: `cargo install cargo-xwin --locked`.
+- There is no automated end-to-end WSLg test and no Sway configuration validation; do not add either unless asked.
+
+## Testing instructions
+
+Run every command below and report the results. All of them must pass; `shellcheck -S warning` and Clippy must stay
+clean. The only intentional ShellCheck `-S info` findings are `SC1003` and `SC2016`.
 
 ```bash
 bash -n install.sh
 bash -n .local/bin/arch-sway-wslg
-bash -n .local/libexec/arch-sway-wslg/clipboard-bridge
-shellcheck -S warning install.sh .local/bin/arch-sway-wslg \
-  .local/libexec/arch-sway-wslg/clipboard-bridge
+shellcheck -S warning install.sh .local/bin/arch-sway-wslg
 git diff --check
+cd clipboard
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check -p clipboard-agent-win --target x86_64-pc-windows-msvc
 ```
 
-`shellcheck -S warning` must stay clean. The remaining `-S info` findings are the intentional `SC1003` and `SC2016`
-only. On a non-Arch host use a disposable Arch container; pacman's download user has to be disabled inside that
-container, and only there:
+On a non-Arch host run the shell checks in a disposable Arch container. Pacman's download user has to be disabled
+inside that container, and only there:
 
 ```bash
 docker run --rm -v "$PWD:/workspace:ro" -w /workspace archlinux:latest bash -lc '
   bash -n install.sh
   bash -n .local/bin/arch-sway-wslg
-  bash -n .local/libexec/arch-sway-wslg/clipboard-bridge
   sed -i "s/^#\?DownloadUser.*/#DownloadUser = alpm/" /etc/pacman.conf
   pacman -Sy --noconfirm shellcheck >/dev/null
-  shellcheck -S warning install.sh .local/bin/arch-sway-wslg \
-    .local/libexec/arch-sway-wslg/clipboard-bridge'
+  shellcheck -S warning install.sh .local/bin/arch-sway-wslg'
 ```
 
-Run the exact commands above and report their results. Implementations may change freely as long as the contracts below
-still hold.
+Whenever any Rust file under `clipboard/` changes, rebuild both release binaries, replace the files under
+`.local/libexec/arch-sway-wslg/`, regenerate `clipboard.sha256`, and run `sha256sum -c` before finishing. The exact
+commands are in `clipboard/README.md`. Never leave a payload built from older source in the worktree.
 
 ## Behavioural contracts
+
+Implementations may change freely as long as these hold. Preserve them unless the user changes them explicitly.
 
 ### Session
 
@@ -77,8 +93,8 @@ still hold.
   outputs are supported, and an inherited count never reaches the compositor unchecked.
 - Keep `status` and `doctor` truthful, and keep both of them observers: they never ask for sudo, take the control lock,
   or change anything, because the installer also runs `status` while holding that lock. `doctor` covers the commands the
-  session needs, the applications the Sway configuration starts, and the clipboard bridge, and it reports names on the
-  shared bus as they are instead of inferring who owns them. A command no installed package provides directly is
+  session needs, the applications the Sway configuration starts, and both clipboard binaries, and it reports names on
+  the shared bus as they are instead of inferring who owns them. A command no installed package provides directly is
   reported without failing the check.
 - `logs` reads an ordinary file, and a session that refuses to start is exactly when it is needed, so it must not depend
   on systemd, the bus, or any other part of the session.
@@ -115,22 +131,41 @@ still hold.
 
 ### Clipboard
 
-- Synchronise UTF-8 plain text only; images, HTML, and file lists are out of scope, and selections marked sensitive stay
-  excluded unless the user opts in.
-- Mirror between the nested Sway selection and the parent WSLg socket, which WSLg already exchanges with Windows. Do not
-  add a Windows helper process.
-- Serialise forwarding, echo suppression, and parent reads under one lock, and record a selection as mirrored only after
-  the peer really holds it.
-- Any visit to the parent takes focus away from the session, whichever direction causes it, so keep them away from
-  typing as far as the platform allows: automatic reads wait for the supervised quiet-period notifier, and a forward
-  waits through a short settling period, which normally means the shortcut that triggered it is already released. A
-  notifier that cannot be kept alive stops those reads loudly instead of releasing them, and `status` distinguishes that
-  failure from a direction disabled by configuration.
-- Automatic reads back off the longer the session stays quiet, and any input restores the configured interval.
-- Bound bridge and notifier restarts, every clipboard operation, and the poll interval, which is rejected below an
-  explicit floor. Restart budgets reset after stable operation, and a restarted watcher keeps what has already been
-  mirrored, so it cannot push a stale selection back over the peer. The bridge is started by Sway and stays inside the
-  session scope.
+- Synchronise UTF-8 plain text only; images, HTML, and file lists are out of scope. Text over 16 MiB, malformed UTF-8,
+  embedded NUL, and empty selections are never forwarded: an empty or unreadable selection on one side leaves the other
+  side untouched. Selections carrying the KDE password-manager sensitivity hint stay excluded unless the user opts in
+  with `ARCH_SWAY_WSLG_SYNC_SENSITIVE=1`. Do not claim detection of arbitrary hints.
+- Line endings are normalised in one pass: CRLF towards Windows, LF towards Sway, a lone CR becomes a line break. The
+  conversion is documented in the READMEs; keep them in step.
+- The Linux broker talks directly to Sway's `ext-data-control-v1` protocol and the single persistent Win32 agent uses
+  the native Windows clipboard API; neither direction visits the parent WSLg Wayland socket, and the agent creates only
+  a message-only window. Nothing is installed on the Windows side.
+- The broker fails fast instead of waiting forever: a compositor without `ext_data_control_manager_v1` or a seat, an
+  agent that never sends `Hello` within `HELLO_TIMEOUT`, a missed heartbeat, and an exhausted restart budget are all
+  errors. An exhausted budget or a vanished data-control device exits non-zero so the transient unit's
+  `Restart=on-failure` and start-limit properties in the launcher form the outer bound; the compositor closing the
+  connection (Sway exiting) is a clean exit.
+- Both directions are serialised in the broker state machine with `SyncSlots` (one pending text per direction) and
+  `MirrorState` (echo suppression). A Windows write commits only after its request ACK, a Wayland publish commits only
+  after the compositor processes a display sync roundtrip, and the SHA-256 of the text is the identity of a publish.
+  Echoes are suppressed by sequence numbers and committed hashes, never by wall-clock comparisons, and clipboard
+  payloads never touch the disk or the log.
+- Cold startup gives an existing Windows text selection priority, including a Windows change that arrives while the
+  Wayland side is still initialising; the agent's startup snapshot pairs the sequence number with the text it read.
+- Text that cannot be delivered is queued, not dropped: a Sway selection made while the agent is unavailable is sent
+  once it is back, a failed Windows write is retried once before the broker reports `degraded`, and an agent restart
+  cannot push an old Sway selection over a Windows change made while it was unavailable.
+- `degraded` means a transport failure (agent or Wayland). Rejecting a single selection is logged but does not change
+  the health. The status file under the clipboard state directory is rewritten only when its content changes.
+- Bound clipboard access, IPC payloads, heartbeats, transfers, shutdown, and restarts. The restart budget resets after
+  stable operation. A replaced data source keeps serving `send` requests until the compositor cancels it, so a paste
+  that races a new copy never receives empty data.
+- Sway starts only the short-lived internal launcher command (`__start_clipboard`) that knows the nested display. The
+  broker itself is a transient systemd user service bound to the session scope, and the Win32 agent exits when its
+  inherited pipe closes: shutdown closes the agent's stdin first, waits a bounded grace period, and only then kills.
+- The agent pipe carries length-prefixed frames with a 28-byte header (`PROTOCOL_VERSION` in `clipboard-core`). Any
+  change to the frame layout or message set must bump the version, and both binaries must be rebuilt and deployed
+  together. The installer refuses a payload that fails `clipboard.sha256`, and `doctor` runs `--probe` on both binaries.
 
 ### Configuration
 
@@ -157,6 +192,10 @@ still hold.
   in functions. Prefer built-ins and small, targeted `grep` and `sed` calls.
 - Match the surrounding comment density and explain why, not what.
 - Keep the compatibility surface small: no code for unsupported distributions or shells, and no fixed `/mnt/c` paths.
+- Rust targets stable edition 2024. Keep platform APIs behind target-specific modules (`wayland.rs`, `windows.rs`),
+  share protocol, text, and state logic through `clipboard-core`, deny Clippy warnings in validation, bound every
+  allocation derived from IPC, and keep `unsafe` Win32 blocks as small as practical.
+- Bounded pipe I/O goes through `clipboard-broker/src/io.rs`; do not add a second deadline helper.
 
 ## Safety
 
@@ -169,14 +208,19 @@ still hold.
 
 - Inspect the worktree first and preserve unrelated changes.
 - Keep the launcher's command lists aligned with what `start`, `stop`, the clipboard, and `doctor` really use.
+- After changing anything under `clipboard/`, rebuild both binaries and refresh `clipboard.sha256` as described in
+  "Testing instructions".
 - Bump `VERSION` when the package list changes, and update the uninstall list in both READMEs at the same time.
 - Update `README.md` for user-visible behaviour first, then translate it into `README_CN.md`. Delete stale documentation
-  instead of describing behaviour the code no longer has.
+  instead of describing behaviour the code no longer has, and keep implementation detail out of both.
 - Preserve the contracts above unless the user changes them explicitly, and report the validation commands you ran.
 
-## Commit and pull request guidelines
+## PR instructions
 
-Use Conventional Commits: `<type>[optional scope]: <imperative description>`, lower case after the colon, no trailing
-period, and no more than 72 characters in the subject. The project types are `feat`, `fix`, `refactor`, `perf`, `docs`,
-`style`, and `chore`; scopes follow the affected subsystem. Explain why in a wrapped body, and mark a broken contract
-with `!` or a `BREAKING CHANGE:` footer that states the action the user has to take.
+- Use Conventional Commits: `<type>[optional scope]: <imperative description>`, lower case after the colon, no trailing
+  period, and no more than 72 characters in the subject.
+- The project types are `feat`, `fix`, `refactor`, `perf`, `docs`, `style`, and `chore`; scopes follow the affected
+  subsystem, for example `installer` or `clipboard`.
+- Explain why in a wrapped body. Mark a broken contract with `!` or a `BREAKING CHANGE:` footer that states the action
+  the user has to take.
+- Run the full "Testing instructions" list before opening a pull request and mention the results.

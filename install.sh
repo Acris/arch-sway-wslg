@@ -55,7 +55,7 @@ BOOTSTRAP_PACKAGES=(noto-fonts jack2 ttf-nerd-fonts-symbols-mono)
 # Remaining top-level packages. Ordinary dependencies are left to pacman.
 MAIN_PACKAGES=(
     # Desktop stack
-    sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look
+    sway xorg-xwayland swaybg waybar swaync foot fuzzel nwg-look
     qt5-wayland qt6-wayland
     # Terminal file manager
     yazi
@@ -65,7 +65,7 @@ MAIN_PACKAGES=(
     adw-gtk-theme papirus-icon-theme ttf-sarasa-gothic
     maplemono-nf-cn-unhinted noto-fonts-emoji
     # WSLg integration and desktop plumbing
-    wl-clipboard xdg-utils
+    xdg-utils
 )
 
 YAZI_INTEGRATION_PACKAGES=(fd ripgrep fzf zoxide jq 7zip)
@@ -241,7 +241,7 @@ preflight() {
     (( EUID != 0 )) || die "run this installer as your normal Arch user, not as root"
 
     local command_name config_name
-    for command_name in paru pacman flock sudo systemctl timeout; do
+    for command_name in paru pacman flock sha256sum sudo systemctl timeout; do
         command -v "$command_name" >/dev/null 2>&1 || \
             die "required command not found: $command_name"
     done
@@ -257,8 +257,14 @@ preflight() {
             die "managed configuration payload is missing: $ROOT/.config/$config_name"
     done
     [[ -x "$ROOT/.local/bin/$NAME" ]] || die "launcher payload is missing: $ROOT/.local/bin/$NAME"
-    [[ -x "$LIBEXEC_PAYLOAD_DIR/clipboard-bridge" ]] || \
-        die "clipboard bridge payload is missing: $LIBEXEC_PAYLOAD_DIR/clipboard-bridge"
+    [[ -x "$LIBEXEC_PAYLOAD_DIR/arch-sway-wslg-clipboard" ]] || \
+        die "clipboard broker payload is missing: $LIBEXEC_PAYLOAD_DIR/arch-sway-wslg-clipboard"
+    [[ -x "$LIBEXEC_PAYLOAD_DIR/arch-sway-wslg-clipboard-agent.exe" ]] || \
+        die "clipboard agent payload is missing: $LIBEXEC_PAYLOAD_DIR/arch-sway-wslg-clipboard-agent.exe"
+    [[ -r "$LIBEXEC_PAYLOAD_DIR/clipboard.sha256" ]] || \
+        die "clipboard checksum manifest is missing: $LIBEXEC_PAYLOAD_DIR/clipboard.sha256"
+    (cd "$LIBEXEC_PAYLOAD_DIR" && sha256sum -c clipboard.sha256 >/dev/null) || \
+        die "clipboard payload checksum verification failed"
     ((${#DESKTOP_OVERRIDE_FILES[@]})) || die "desktop-entry overrides are missing"
 }
 
@@ -758,7 +764,18 @@ check_staged_payload() {
         }
     done
     bash -n "$STAGE_LOCAL/bin/$NAME" || return 1
-    bash -n "$STAGE_LOCAL/libexec/$NAME/clipboard-bridge" || return 1
+    [[ -x "$STAGE_LOCAL/libexec/$NAME/arch-sway-wslg-clipboard" ]] || {
+        warn "staged clipboard broker is missing or not executable"
+        return 1
+    }
+    [[ -x "$STAGE_LOCAL/libexec/$NAME/arch-sway-wslg-clipboard-agent.exe" ]] || {
+        warn "staged Windows clipboard agent is missing or not executable"
+        return 1
+    }
+    (cd "$STAGE_LOCAL/libexec/$NAME" && sha256sum -c clipboard.sha256 >/dev/null) || {
+        warn "staged clipboard payload checksum verification failed"
+        return 1
+    }
 }
 
 install_payload() {

@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/clipboard-agent-win",
+    "crates/clipboard-broker",
+    "crates/clipboard-core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/acris/arch-sway-wslg"
+
+[workspace.dependencies]
+clipboard-core = { path = "crates/clipboard-core" }
+sha2 = "0.10.9"
+thiserror = "2.0.16"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+

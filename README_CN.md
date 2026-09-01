@@ -24,7 +24,7 @@ Sway 发行版。
 
 请先完成 [ArchWiki 上的 WSL Arch Linux 安装指南](https://wiki.archlinux.org/title/Install_Arch_Linux_on_WSL)。安装程序要求：
 
-1. Arch Linux 运行在启用了 WSLg 的 WSL2 中，并保持 Windows 与 GPU 驱动为最新。
+1. Arch Linux 运行在启用了 WSLg 与 WSL 互操作的 WSL2 中，并保持 Windows 与 GPU 驱动为最新。
 2. 已将一个普通用户配置为默认 WSL 用户，并拥有正常的 `sudo` 权限。
 3. 已启用 systemd，且该用户的 systemd 用户管理器正常运行。
 4. 已安装 `base-devel`、Git 与 `paru`。
@@ -70,10 +70,11 @@ cd arch-sway-wslg
 ```
 
 安装程序会先询问桌面条目屏蔽、浏览器、输出缩放与备份，然后安装软件包；钥匙串解锁与 GTK
-外观设置在装包之后才会询问，因此软件包安装完成后仍需再次留意。只有在整套载荷完成暂存与检查后，才会替换托管配置。在接受
+外观设置在装包之后才会询问，因此软件包安装完成后仍需再次留意。只有在全部内容准备并检查完毕后，才会替换现有配置，因此中途被打断的运行不会改动它。在接受
 `paru` 展示的 AUR PKGBUILD 前请先审阅。
 
-系统升级应使用 `paru -Syu`，因为 Arch 不支持部分升级：当刷新后的软件包数据库显示系统落后时，安装程序会报告并停止，除非明确确认继续。
+安装程序只刷新软件包数据库，不会升级系统。Arch 不支持部分升级，因此当刷新结果显示系统落后时，安装程序会提示并停止，除非明确确认继续；请先运行
+`paru -Syu`。
 
 然后启动桌面：
 
@@ -98,7 +99,7 @@ arch-sway-wslg version
 ```
 
 `start` 与 `restart` 在配置会话时会请求一次 sudo 密码；随后 Sway 及所有桌面应用均以普通用户身份运行。`stop` 不需要
-sudo，且会结束会话启动的所有进程。
+sudo，且会结束会话启动的所有进程。`status` 与 `doctor` 只做报告，不会做任何改动。
 
 ## 快捷键
 
@@ -193,21 +194,17 @@ include 机制，属于完全托管，因此请将个人版本存放在托管目
 在 Sway 中复制的文本可以在 Windows 中粘贴，在 Windows 中复制的文本也可以在 Sway 中粘贴。共享功能随会话启动而开启，随会话停止而关闭。
 
 - 仅共享纯文本：不支持图片、HTML 与文件列表。
-- 默认跳过被应用标记为敏感的选区，例如来自密码管理器的条目。
+- 默认跳过带有 KDE 密码管理器敏感提示的选区；无法识别其他私有敏感提示。
+- 拒绝超过 16 MiB 的文本、格式错误的 Unicode，以及包含内嵌 NUL 的文本。
+- 空选区不会被共享，因此一侧清空或丢失剪贴板时，另一侧保持原样。
+- 换行符会被转换：送往 Windows 的文本使用 CRLF，送往 Sway 的文本使用 LF，单独的 CR 在传输中会变成换行。
 
-两个方向都不是即时的，因为共享的时机刻意避开了输入。在 Sway 中复制的内容会在片刻后到达 Windows。反方向则会先等待输入出现停顿，再去查看
-Windows 剪贴板，且会话闲置越久查看越稀；在 Windows 中复制的文本通常在切回 Sway 窗口时已经就位，如果粘贴得更早，稍作停顿即可。执行
-`arch-sway-wslg status` 可查看当前状态。
+共享由事件驱动，通常会立即完成。Windows 侧不会安装任何东西，不会出现窗口，也不会抢占焦点。需要 Sway 1.11 或更高版本。执行
+`arch-sway-wslg status` 可查看共享是否正常工作。
 
 在执行 `arch-sway-wslg start` 前导出以下任意变量；在会话内的终端设置它们不会生效：
 
 ```bash
-# 输入停顿后检查 Windows 剪贴板的间隔，单位为秒（最小 0.2）
-export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
-
-# 需要等待的输入停顿时长，单位为整数秒（最小 1）
-export ARCH_SWAY_WSLG_CLIPBOARD_IDLE=5
-
 # 只把 Sway 的内容送往 Windows，不再取回 Windows 剪贴板
 export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
 
@@ -265,6 +262,9 @@ git pull --ff-only
 更新可能会增加软件包，因此请再次回答安装程序的问题，然后运行 `arch-sway-wslg restart`。每次运行都会在替换托管文件前提供一次带时间戳的备份；备份包含
 `RESTORE-INFO.txt` 且永远不会被自动删除。
 
+`arch-sway-wslg version` 会打印已安装的版本。发布版本采用日历版本格式 `YYYY.M.RELEASE`：每月首个版本的 `RELEASE` 从 `1`
+开始，同月后续版本递增，因此 `2026.9.1` 表示 2026 年 9 月的首个版本。
+
 ## 卸载
 
 以下路径为默认值；若设置了 `XDG_CONFIG_HOME` 或 `XDG_STATE_HOME`，请相应调整。
@@ -281,10 +281,10 @@ rm -f ~/.config/credstore.encrypted/oo7.keyring-encryption-password
 `microsoft-edge-stable-bin` 或 `brave-bin`）：
 
 ```bash
-paru -Rns sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look \
+paru -Rns sway xorg-xwayland swaybg waybar swaync foot fuzzel nwg-look \
   qt5-wayland qt6-wayland yazi oo7 seahorse adw-gtk-theme papirus-icon-theme \
   ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
-  ttf-nerd-fonts-symbols-mono wl-clipboard xdg-utils jack2
+  ttf-nerd-fonts-symbols-mono xdg-utils jack2
 ```
 
 如果 pacman 报告某个软件包仍被需要，请将其从命令中删除并重新运行；例如，保留的浏览器仍需要 `xdg-utils` 和字体包。
@@ -313,8 +313,11 @@ arch-sway-wslg doctor
 
 如果缺少 WSLg 的 Wayland、PulseAudio 或 X11 映射，请先关闭 WSL 并在 Windows 中运行 `wsl --shutdown`，然后重试。
 
-如果按键有时会产生两个字符，说明 Windows 剪贴板的读取时机不当。请检查 `arch-sway-wslg status` 中的剪贴板相关行以及
-`arch-sway-wslg logs` 中的警告；使用 `ARCH_SWAY_WSLG_CLIPBOARD=to-windows` 启动会话可关闭该方向。
+如果 `arch-sway-wslg status` 显示剪贴板为 degraded 或 not running，请检查 `arch-sway-wslg logs` 并运行
+`arch-sway-wslg doctor`。剪贴板共享需要 WSL 互操作：如果 `/etc/wsl.conf` 中设置了 `interop=false`，请将其移除，然后在
+Windows 中运行 `wsl --shutdown`。AppLocker、WDAC 或安全软件也可能阻止随附的未签名 Windows
+可执行文件运行；几次尝试失败后共享会放弃，日志会说明原因。共享还需要 Sway 1.11 或更高版本。在启动会话前设置
+`ARCH_SWAY_WSLG_CLIPBOARD=off` 可以关闭剪贴板共享，且不影响 Sway。
 
 如果通知始终不显示，请运行 `arch-sway-wslg doctor`。当另一个进程已占用 `org.freedesktop.Notifications` 时，请使用
 `systemctl --user stop swaync.service` 停止它并重启会话。
@@ -349,6 +352,11 @@ WSLg 恢复健康后再次启动会话。
 - 钥匙串、通知及其他桌面服务与 WSL 用户共享，这正是它们能在此工作的原因。在会话外启动的服务在执行 `stop` 后仍会继续运行。
 - 不支持 portal、Flatpak 集成以及屏幕共享。
 - 使用 XWayland 的应用可能不如原生 Wayland 应用清晰。
+
+## 参与开发
+
+开发说明、验证命令以及重新构建随附剪贴板程序的步骤保存在 [AGENTS.md](AGENTS.md) 与
+[clipboard/README.md](clipboard/README.md) 中。用户不需要安装 Rust 工具链。
 
 ## 致谢
 

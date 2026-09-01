@@ -27,7 +27,7 @@ Complete
 the [ArchWiki installation guide for Arch Linux on WSL](https://wiki.archlinux.org/title/Install_Arch_Linux_on_WSL)
 first. The installer expects:
 
-1. Arch Linux on WSL2 with WSLg enabled, on an up-to-date Windows and GPU driver.
+1. Arch Linux on WSL2 with WSLg and WSL interoperability enabled, on an up-to-date Windows and GPU driver.
 2. A normal user configured as the default WSL user, with working `sudo` access.
 3. Systemd enabled, including a working systemd user manager for that user.
 4. `base-devel`, Git, and `paru` installed for that user.
@@ -76,11 +76,12 @@ cd arch-sway-wslg
 
 The installer asks about desktop entry masks, a browser, the output scale, and a backup, then installs the packages.
 Keyring unlocking and GTK appearance are asked afterwards, so the run needs attention again once the packages are in
-place. The managed configuration is replaced only after the whole payload has been staged and checked. Review AUR
-PKGBUILDs shown by `paru` before accepting them.
+place. Existing configuration is replaced only after everything has been prepared and checked, so an interrupted run
+leaves it untouched. Review AUR PKGBUILDs shown by `paru` before accepting them.
 
-Upgrading the system stays with `paru -Syu`, because Arch does not support partial upgrades: when the refreshed package
-databases show that this system is behind, the installer reports it and stops unless continuing is confirmed.
+The installer refreshes the package databases but does not upgrade the system. Arch does not support partial upgrades,
+so when the refresh shows that the system is behind, the installer says so and stops unless continuing is confirmed;
+run `paru -Syu` first.
 
 Then start the desktop:
 
@@ -105,7 +106,8 @@ arch-sway-wslg version
 ```
 
 `start` and `restart` ask for the sudo password once while setting the session up; Sway and all desktop applications
-then run as the normal user. `stop` needs no sudo and ends everything the session started.
+then run as the normal user. `stop` needs no sudo and ends everything the session started. `status` and `doctor` only
+report and never change anything.
 
 ## Key Bindings
 
@@ -206,23 +208,20 @@ Text copied in Sway can be pasted in Windows, and text copied in Windows can be 
 with the session.
 
 - Only plain text is shared: images, HTML, and file lists are not.
-- Selections an application marks as sensitive, such as an entry from a password manager, are skipped by default.
+- Selections carrying KDE's password-manager sensitivity hint are skipped by default. Other private sensitivity hints
+  cannot be detected.
+- Text larger than 16 MiB, malformed Unicode, and text containing an embedded NUL are rejected.
+- An empty selection is not shared, so clearing or losing the clipboard on one side leaves the other side as it was.
+- Line endings are converted: text arriving in Windows uses CRLF, text arriving in Sway uses LF, and a lone CR becomes a
+  line break on the way.
 
-Neither direction is instant, because sharing is timed to stay out of the way of typing. A copy made in Sway reaches
-Windows a moment later. The other direction waits for a short pause in typing and then looks at the Windows clipboard,
-less often the longer the session goes untouched; text copied in Windows is usually already there once the Sway window
-is back in focus, and a brief pause is enough if a paste comes sooner. `arch-sway-wslg status` reports the current
-state.
+Sharing is event driven and normally completes immediately. Nothing is installed on the Windows side, no window appears
+there, and focus is never taken. Sway 1.11 or newer is required. `arch-sway-wslg status` shows whether sharing is
+working.
 
 Export any of these before `arch-sway-wslg start`; setting them in a terminal inside the session has no effect:
 
 ```bash
-# how often the Windows clipboard is checked once typing pauses, in seconds (minimum 0.2)
-export ARCH_SWAY_WSLG_CLIPBOARD_POLL=5
-
-# how long a pause in typing to wait for, in whole seconds (minimum 1)
-export ARCH_SWAY_WSLG_CLIPBOARD_IDLE=5
-
 # only send Sway -> Windows, never bring the Windows clipboard in
 export ARCH_SWAY_WSLG_CLIPBOARD=to-windows
 
@@ -287,6 +286,10 @@ An update can add packages, so answer the installer's questions again, then run 
 offers a timestamped backup of the managed files before replacing them; backups include `RESTORE-INFO.txt` and are never
 deleted automatically.
 
+`arch-sway-wslg version` prints the installed release. Releases use the calendar-based `YYYY.M.RELEASE` format:
+`RELEASE` starts at `1` for the first release in a month and increments for later releases in that month, so `2026.9.1`
+is the first September 2026 release.
+
 ## Uninstalling
 
 The paths below are the defaults; adjust them when `XDG_CONFIG_HOME` or `XDG_STATE_HOME` is set.
@@ -303,10 +306,10 @@ Remove the packages this project installed. Drop anything worth keeping and appe
 (`firefox`, `chromium`, `google-chrome`, `microsoft-edge-stable-bin`, or `brave-bin`):
 
 ```bash
-paru -Rns sway xorg-xwayland swaybg swayidle waybar swaync foot fuzzel nwg-look \
+paru -Rns sway xorg-xwayland swaybg waybar swaync foot fuzzel nwg-look \
   qt5-wayland qt6-wayland yazi oo7 seahorse adw-gtk-theme papirus-icon-theme \
   ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
-  ttf-nerd-fonts-symbols-mono wl-clipboard xdg-utils jack2
+  ttf-nerd-fonts-symbols-mono xdg-utils jack2
 ```
 
 If pacman reports that a package is still needed, drop it from the command and run it again; a kept browser, for
@@ -338,9 +341,12 @@ It checks systemd, the programs the desktop needs, WSLg integration, and audio, 
 If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run `wsl --shutdown` from Windows before
 trying again.
 
-If a keystroke sometimes produces two characters, the Windows clipboard is being read at the wrong moment. Check the
-clipboard line in `arch-sway-wslg status` and any warnings in `arch-sway-wslg logs`; starting the session with
-`ARCH_SWAY_WSLG_CLIPBOARD=to-windows` switches that direction off.
+If `arch-sway-wslg status` reports the clipboard as degraded or not running, check `arch-sway-wslg logs` and run
+`arch-sway-wslg doctor`. Clipboard sharing needs WSL interoperability: remove `interop=false` from `/etc/wsl.conf` if it
+was disabled, then run `wsl --shutdown` from Windows. AppLocker, WDAC, or security software can also block the bundled
+unsigned Windows executable; after a few failed attempts sharing gives up and the log says why. Sharing also needs Sway
+1.11 or newer. Setting `ARCH_SWAY_WSLG_CLIPBOARD=off` before starting the session disables clipboard sharing without
+affecting Sway.
 
 If notifications never appear, run `arch-sway-wslg doctor`. When another process already holds
 `org.freedesktop.Notifications`, stop it with `systemctl --user stop swaync.service` and restart the session.
@@ -379,6 +385,11 @@ If a session is stuck, `arch-sway-wslg stop` always ends it. Never delete `/tmp/
   them work here. One that was started outside the session keeps running after `stop`.
 - Portals, Flatpak integration, and screen sharing are not supported.
 - Applications using XWayland may look less sharp than native Wayland ones.
+
+## Contributing
+
+Development notes, the validation commands, and the steps for rebuilding the bundled clipboard programs are kept in
+[AGENTS.md](AGENTS.md) and [clipboard/README.md](clipboard/README.md). Users do not need a Rust toolchain.
 
 ## Credits
 

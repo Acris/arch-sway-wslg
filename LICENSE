@@ -31,6 +31,12 @@ https://github.com/catppuccin/bat
 
 It is distributed under the MIT license and is covered by the grant above.
 
+Bundled clipboard binaries
+
+The Rust crates linked into the bundled Linux clipboard broker and Win32 agent
+are listed in clipboard/THIRD-PARTY-NOTICES.md. Their exact versions are locked
+in clipboard/Cargo.lock.
+
 Bundled wallpaper
 
 .config/sway/wallpapers/arch-black-4k.png is taken from the
