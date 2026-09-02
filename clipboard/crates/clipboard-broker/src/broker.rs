@@ -11,8 +11,7 @@ use clipboard_core::protocol::{Frame, HELLO_HAS_TEXT, HELLO_READ_ERROR, MessageK
 use clipboard_core::state::{MirrorState, TextHash};
 use clipboard_core::text::validate_utf8;
 use thiserror::Error;
-use wayland_client::protocol::wl_callback;
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, QueueHandle};
 
 use crate::agent::{AgentProcess, RESTART_DELAY, RESTART_LIMIT, RESTART_RESET_AFTER};
 use crate::status::{Health, StatusWriter};
@@ -65,7 +64,6 @@ pub(crate) struct BrokerState {
     mirror: MirrorState,
     pub(crate) wayland: WaylandState,
     qh: QueueHandle<BrokerState>,
-    connection: Connection,
     handle: LoopHandle<'static, BrokerState>,
     status: StatusWriter,
     agent_executable: PathBuf,
@@ -78,20 +76,15 @@ pub(crate) struct BrokerState {
     last_agent_response: Instant,
     wayland_ready: bool,
     latest_wayland_generation: u64,
-    initial_sync: bool,
     ever_synced: bool,
     slots: SyncSlots,
     // The Sway text the agent is writing right now, kept until its ACK so that a
-    // refused or interrupted write can be queued again.
+    // refused or interrupted write can be queued again. After a refusal it stays
+    // here until the retry timer fires or something newer supersedes it.
     in_flight: Option<WindowsWrite>,
     retry_scheduled: bool,
-    fatal: Option<String>,
+    fatal: Option<BrokerError>,
     stop: LoopSignal,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PublishAck {
-    hash: TextHash,
 }
 
 /// A text and its digest, computed once when the text enters the broker.
@@ -137,26 +130,21 @@ impl WindowsSelection {
 struct SyncSlots {
     to_windows: Option<HashedText>,
     to_wayland: Option<WindowsSelection>,
-    // A Windows write that failed once; any newer selection on either side
-    // makes it obsolete.
-    retry_to_windows: Option<HashedText>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum Delivery {
-    ToWindows { text: HashedText, retry: bool },
+    ToWindows(HashedText),
     ToWayland(WindowsSelection),
 }
 
 impl SyncSlots {
     fn wayland_text(&mut self, text: HashedText) {
         self.to_windows = Some(text);
-        self.retry_to_windows = None;
     }
 
     fn wayland_non_text(&mut self) {
         self.to_windows = None;
-        self.retry_to_windows = None;
     }
 
     fn windows_selection(&mut self, selection: WindowsSelection) {
@@ -175,14 +163,6 @@ impl SyncSlots {
         }
     }
 
-    fn retry_windows_write(&mut self, text: HashedText) -> bool {
-        if self.to_windows.is_some() {
-            return false;
-        }
-        self.retry_to_windows = Some(text);
-        true
-    }
-
     // A Windows selection observed before our own write landed is stale.
     fn windows_write_committed(&mut self, sequence: u32) {
         if self
@@ -194,23 +174,26 @@ impl SyncSlots {
         }
     }
 
-    fn take(&mut self, allow_retry: bool) -> Option<Delivery> {
+    const fn is_empty(&self) -> bool {
+        self.to_windows.is_none() && self.to_wayland.is_none()
+    }
+
+    fn take(&mut self) -> Option<Delivery> {
         if let Some(selection) = self.to_wayland.take() {
             self.to_windows = None;
-            self.retry_to_windows = None;
             return Some(Delivery::ToWayland(selection));
         }
-        if let Some(text) = self.to_windows.take() {
-            self.retry_to_windows = None;
-            return Some(Delivery::ToWindows { text, retry: false });
-        }
-        if !allow_retry {
-            return None;
-        }
-        self.retry_to_windows
-            .take()
-            .map(|text| Delivery::ToWindows { text, retry: true })
+        self.to_windows.take().map(Delivery::ToWindows)
     }
+}
+
+/// What to do with a Windows write the agent has just refused.
+#[derive(Debug, Eq, PartialEq)]
+enum WriteFailure {
+    Retry,
+    /// A newer selection on either side is about to replace the text anyway.
+    Superseded,
+    Exhausted,
 }
 
 #[derive(Debug, Error)]
@@ -219,10 +202,26 @@ pub enum BrokerError {
     Configuration(String),
     #[error("Wayland connection failed: {0}")]
     Wayland(String),
+    #[error("{0}")]
+    Exhausted(String),
     #[error("event loop failed: {0}")]
     EventLoop(String),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl BrokerError {
+    /// Exit status for a failure another start would only repeat; the launcher
+    /// excludes it from `Restart=on-failure` so the clipboard stays down instead
+    /// of cycling through the start limit for the rest of the session.
+    pub const GAVE_UP: i32 = 3;
+
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::Configuration(_) | Self::Wayland(_) | Self::Exhausted(_) => Self::GAVE_UP,
+            Self::EventLoop(_) | Self::Io(_) => 1,
+        }
+    }
 }
 
 pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
@@ -244,7 +243,6 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         mirror: MirrorState::default(),
         wayland: WaylandState::new(handle.clone(), config.sync_sensitive),
         qh,
-        connection: connection.clone(),
         handle: handle.clone(),
         status,
         agent_executable: config.agent,
@@ -257,7 +255,6 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         last_agent_response: Instant::now(),
         wayland_ready: false,
         latest_wayland_generation: 0,
-        initial_sync: false,
         ever_synced: false,
         slots: SyncSlots::default(),
         in_flight: None,
@@ -289,8 +286,13 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
 
     state.start_agent();
     let result = event_loop.run(None, &mut state, |_| {});
+    // Reap the agent before the exit status tells systemd the broker is gone,
+    // whichever way the loop ended.
+    if let Some(agent) = state.agent.take() {
+        agent.shutdown_now(&state.handle);
+    }
     if let Some(error) = state.fatal.take() {
-        return Err(BrokerError::EventLoop(error));
+        return Err(error);
     }
     match result {
         Ok(()) => Ok(()),
@@ -331,7 +333,6 @@ impl BrokerState {
                 if generation != self.latest_wayland_generation {
                     return;
                 }
-                self.wayland_ready = true;
                 match accept_wayland_text(text) {
                     Ok(text) => {
                         // An echo forwards nothing but still makes Sway ready.
@@ -342,21 +343,47 @@ impl BrokerState {
                     }
                     Err(error) => self.withdraw_wayland_selection(error.as_deref()),
                 }
-                self.drain();
+                self.wayland_described();
             }
             WaylandEvent::Unusable { generation, error } => {
                 if generation == self.latest_wayland_generation {
-                    self.wayland_ready = true;
                     self.withdraw_wayland_selection(error.as_deref());
-                    self.drain();
+                    self.wayland_described();
                 }
             }
-            WaylandEvent::DeviceLost(error) => self.fail(error),
+            WaylandEvent::Published { generation, hash } => {
+                self.latest_wayland_generation = generation;
+                self.mirror.observe_wayland(hash);
+                if self.agent_ready {
+                    self.write_status(Health::Running, None);
+                }
+                self.wayland_described();
+            }
+            WaylandEvent::DeviceLost => self.fail(BrokerError::EventLoop(
+                "ext-data-control device was removed".into(),
+            )),
         }
     }
 
+    // Sway has described its selection, so its side can be served from now on.
+    fn wayland_described(&mut self) {
+        if !self.wayland_ready {
+            self.wayland_ready = true;
+            if self.agent_ready {
+                self.sides_ready();
+            }
+        }
+        self.drain();
+    }
+
+    // Both sides have described their selection: the mirror is running.
+    fn sides_ready(&mut self) {
+        self.ever_synced = true;
+        self.write_status(Health::Running, None);
+    }
+
     fn withdraw_wayland_selection(&mut self, error: Option<&str>) {
-        self.mirror.reject_wayland_selection();
+        self.mirror.invalidate_wayland();
         self.slots.wayland_non_text();
         if let Some(error) = error {
             self.reject(error);
@@ -424,7 +451,6 @@ impl BrokerState {
         }
         self.agent_pid = None;
         self.agent_ready = false;
-        self.initial_sync = false;
         self.slots.agent_lost();
         self.mirror.reset_windows_transport();
         if let Some(write) = self.in_flight.take() {
@@ -439,9 +465,9 @@ impl BrokerState {
         }
         self.agent_restarts += 1;
         if self.agent_restarts > RESTART_LIMIT {
-            self.fail(format!(
+            self.fail(BrokerError::Exhausted(format!(
                 "Windows clipboard agent restart budget exhausted: {reason}"
-            ));
+            )));
             return;
         }
         self.restart_scheduled = true;
@@ -452,9 +478,9 @@ impl BrokerState {
                     TimeoutAction::Drop
                 });
         if let Err(error) = restart {
-            self.fail(format!(
+            self.fail(BrokerError::EventLoop(format!(
                 "cannot schedule Windows clipboard agent restart: {error}"
-            ));
+            )));
         }
     }
 
@@ -567,32 +593,31 @@ impl BrokerState {
         {
             self.slots.windows_selection(selection);
         }
+        if self.wayland_ready {
+            self.sides_ready();
+        }
         self.drain();
     }
 
     // Delivery
 
     fn drain(&mut self) {
-        if !self.wayland_ready || !self.agent_ready {
+        if !self.wayland_ready || !self.agent_ready || self.mirror.has_pending_windows_write() {
             return;
         }
-        if !self.initial_sync {
-            self.initial_sync = true;
-            self.ever_synced = true;
-            self.write_status(Health::Running, None);
-        }
-        if self.mirror.has_pending_windows_write() {
+        let Some(delivery) = self.slots.take() else {
             return;
-        }
-        match self.slots.take(!self.retry_scheduled) {
-            Some(Delivery::ToWayland(WindowsSelection::Text(text, sequence))) => {
+        };
+        // Whatever leaves now postdates a refused write still waiting for its retry.
+        self.in_flight = None;
+        match delivery {
+            Delivery::ToWayland(WindowsSelection::Text(text, sequence)) => {
                 self.publish_windows_text(text, sequence);
             }
-            Some(Delivery::ToWayland(WindowsSelection::Unavailable(sequence))) => {
+            Delivery::ToWayland(WindowsSelection::Unavailable(sequence)) => {
                 self.mirror.invalidate_windows(sequence);
             }
-            Some(Delivery::ToWindows { text, retry }) => self.forward_wayland_text(text, retry),
-            None => {}
+            Delivery::ToWindows(text) => self.forward_wayland_text(text, false),
         }
     }
 
@@ -607,14 +632,9 @@ impl BrokerState {
         if wayland_echo {
             return;
         }
-        match self.wayland.publish_text(text.text, &self.qh) {
-            Ok(()) => {
-                self.mirror.begin_wayland_publish(text.hash, sequence);
-                self.connection
-                    .display()
-                    .sync(&self.qh, PublishAck { hash: text.hash });
-            }
-            Err(error) => self.degrade(&error),
+        // The compositor answers with our own `selection`, which commits the hash.
+        if let Err(error) = self.wayland.publish_text(text.text, text.hash, &self.qh) {
+            self.degrade(&error);
         }
     }
 
@@ -639,16 +659,21 @@ impl BrokerState {
     }
 
     // Win32 refuses the clipboard while another process holds it open, which is
-    // routine rather than a transport failure: try once more before degrading.
+    // routine rather than a transport failure: try once more before degrading,
+    // and do not even count a refusal against a text that is obsolete already.
     fn windows_write_failed(&mut self, error: &str) {
-        if let Some(write) = self.in_flight.take()
-            && !write.retried
-            && self.slots.retry_windows_write(write.text)
-        {
-            self.reject(&format!("{error}; retrying once"));
-            self.schedule_retry();
-        } else {
-            self.degrade(error);
+        let Some(mut write) = self.in_flight.take() else {
+            return;
+        };
+        match write_failure(write.retried, &self.slots) {
+            WriteFailure::Retry => {
+                write.retried = true;
+                self.in_flight = Some(write);
+                self.reject(&format!("{error}; retrying once"));
+                self.schedule_retry();
+            }
+            WriteFailure::Superseded => self.reject(error),
+            WriteFailure::Exhausted => self.degrade(error),
         }
     }
 
@@ -660,7 +685,7 @@ impl BrokerState {
             Timer::from_duration(WINDOWS_WRITE_RETRY_DELAY),
             |_, _, state| {
                 state.retry_scheduled = false;
-                state.drain();
+                state.retry_windows_write();
                 TimeoutAction::Drop
             },
         );
@@ -670,10 +695,26 @@ impl BrokerState {
         }
     }
 
+    fn retry_windows_write(&mut self) {
+        // A write in flight now is a newer one; the refused text is gone already.
+        if self.mirror.has_pending_windows_write() {
+            return;
+        }
+        if let Some(write) = self.in_flight.take()
+            && self.agent_ready
+            && self.slots.is_empty()
+        {
+            self.forward_wayland_text(write.text, true);
+        }
+        self.drain();
+    }
+
     // Health
 
-    fn fail(&mut self, error: String) {
-        self.degrade(&error);
+    // `main` reports the error once the loop has ended; only the status file
+    // needs it here.
+    fn fail(&mut self, error: BrokerError) {
+        self.write_status(Health::Degraded, Some(&error.to_string()));
         self.fatal = Some(error);
         self.stop.stop();
     }
@@ -729,32 +770,25 @@ fn startup_windows_selection(
     }
 }
 
-fn sequence_is_newer(candidate: u32, current: u32) -> bool {
-    candidate != current && candidate.wrapping_sub(current) < (1 << 31)
+fn write_failure(retried: bool, slots: &SyncSlots) -> WriteFailure {
+    if !slots.is_empty() {
+        WriteFailure::Superseded
+    } else if retried {
+        WriteFailure::Exhausted
+    } else {
+        WriteFailure::Retry
+    }
 }
 
-impl Dispatch<wl_callback::WlCallback, PublishAck> for BrokerState {
-    fn event(
-        state: &mut Self,
-        _: &wl_callback::WlCallback,
-        event: wl_callback::Event,
-        ack: &PublishAck,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if matches!(event, wl_callback::Event::Done { .. })
-            && state.mirror.commit_wayland_publish(&ack.hash)
-        {
-            state.write_status(Health::Running, None);
-        }
-    }
+fn sequence_is_newer(candidate: u32, current: u32) -> bool {
+    candidate != current && candidate.wrapping_sub(current) < (1 << 31)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Delivery, HashedText, SyncSlots, WindowsSelection, accept_wayland_text, sequence_is_newer,
-        startup_windows_selection,
+        Delivery, HashedText, SyncSlots, WindowsSelection, WriteFailure, accept_wayland_text,
+        sequence_is_newer, startup_windows_selection, write_failure,
     };
 
     fn text(bytes: &[u8]) -> HashedText {
@@ -822,10 +856,10 @@ mod tests {
         slots.windows_selection(windows_text(b"hello", 5));
         slots.windows_selection(windows_text(b"newer", 6));
         assert_eq!(
-            slots.take(true),
+            slots.take(),
             Some(Delivery::ToWayland(windows_text(b"newer", 6)))
         );
-        assert_eq!(slots.take(true), None);
+        assert_eq!(slots.take(), None);
     }
 
     #[test]
@@ -835,11 +869,8 @@ mod tests {
         slots.wayland_text(text(b"copied while agent was down"));
         slots.agent_lost();
         assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWindows {
-                text: text(b"copied while agent was down"),
-                retry: false
-            })
+            slots.take(),
+            Some(Delivery::ToWindows(text(b"copied while agent was down")))
         );
     }
 
@@ -847,60 +878,26 @@ mod tests {
     fn interrupted_write_is_requeued_behind_newer_sway_text() {
         let mut slots = SyncSlots::default();
         slots.requeue_windows_write(text(b"in flight"));
-        assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWindows {
-                text: text(b"in flight"),
-                retry: false
-            })
-        );
+        assert_eq!(slots.take(), Some(Delivery::ToWindows(text(b"in flight"))));
 
         slots.wayland_text(text(b"newer"));
         slots.requeue_windows_write(text(b"in flight"));
-        assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWindows {
-                text: text(b"newer"),
-                retry: false
-            })
-        );
+        assert_eq!(slots.take(), Some(Delivery::ToWindows(text(b"newer"))));
     }
 
     #[test]
     fn failed_write_retries_once_unless_superseded() {
         let mut slots = SyncSlots::default();
-        assert!(slots.retry_windows_write(text(b"refused")));
-        assert_eq!(slots.take(false), None);
-        assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWindows {
-                text: text(b"refused"),
-                retry: true
-            })
-        );
+        assert_eq!(write_failure(false, &slots), WriteFailure::Retry);
+        assert_eq!(write_failure(true, &slots), WriteFailure::Exhausted);
 
-        assert!(slots.retry_windows_write(text(b"refused")));
         slots.wayland_text(text(b"newer"));
-        assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWindows {
-                text: text(b"newer"),
-                retry: false
-            })
-        );
-        assert_eq!(slots.take(true), None);
-
-        slots.wayland_text(text(b"queued"));
-        assert!(!slots.retry_windows_write(text(b"refused")));
+        assert_eq!(write_failure(false, &slots), WriteFailure::Superseded);
+        assert_eq!(write_failure(true, &slots), WriteFailure::Superseded);
 
         let mut slots = SyncSlots::default();
-        assert!(slots.retry_windows_write(text(b"refused")));
         slots.windows_selection(windows_text(b"windows moved on", 4));
-        assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWayland(windows_text(b"windows moved on", 4)))
-        );
-        assert_eq!(slots.take(true), None);
+        assert_eq!(write_failure(false, &slots), WriteFailure::Superseded);
     }
 
     #[test]
@@ -909,18 +906,12 @@ mod tests {
         slots.windows_selection(windows_text(b"before our write", 9));
         slots.wayland_text(text(b"queued"));
         slots.windows_write_committed(10);
-        assert_eq!(
-            slots.take(true),
-            Some(Delivery::ToWindows {
-                text: text(b"queued"),
-                retry: false
-            })
-        );
+        assert_eq!(slots.take(), Some(Delivery::ToWindows(text(b"queued"))));
 
         slots.windows_selection(windows_text(b"after our write", 11));
         slots.windows_write_committed(10);
         assert_eq!(
-            slots.take(true),
+            slots.take(),
             Some(Delivery::ToWayland(windows_text(b"after our write", 11)))
         );
     }
@@ -930,6 +921,6 @@ mod tests {
         let mut slots = SyncSlots::default();
         slots.wayland_text(text(b"old"));
         slots.wayland_non_text();
-        assert_eq!(slots.take(true), None);
+        assert_eq!(slots.take(), None);
     }
 }

@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::io::{self, BufReader, BufWriter};
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -24,8 +24,9 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG,
-    PostMessageW, RegisterClassW, TranslateMessage, WM_APP, WM_CLIPBOARDUPDATE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HWND_MESSAGE, KillTimer, MSG,
+    PostMessageW, RegisterClassW, SetTimer, TranslateMessage, WM_APP, WM_CLIPBOARDUPDATE, WM_TIMER,
+    WNDCLASSW,
 };
 
 const CF_UNICODETEXT: u32 = 13;
@@ -33,6 +34,10 @@ const WM_AGENT_COMMAND: u32 = WM_APP + 1;
 // The broker closing its end of the pipe is the only shutdown signal.
 const WM_AGENT_QUIT: u32 = WM_APP + 2;
 const CLIPBOARD_RETRIES: usize = 8;
+// Another process can hold the clipboard open for longer than the retries above
+// cover; the update is read once more after this pause before it is given up on.
+const READ_RETRY_TIMER: usize = 1;
+const READ_RETRY_DELAY_MS: u32 = 250;
 const MAX_WINDOWS_TEXT_BYTES: usize = (MAX_TEXT_BYTES + 1) * size_of::<u16>();
 
 #[derive(Debug, Error)]
@@ -62,7 +67,7 @@ pub fn run() -> Result<(), AgentError> {
     }
     let write_only = matches!(argument.as_deref(), Some(value) if value == "--write-only");
 
-    let (sender, receiver) = mpsc::sync_channel(8);
+    let (sender, receiver) = mpsc::channel();
     let window = create_message_window()?;
     let reader_window = window as usize;
     thread::spawn(move || read_commands(reader_window as HWND, sender));
@@ -106,7 +111,7 @@ pub fn run() -> Result<(), AgentError> {
     result
 }
 
-fn read_commands(window: HWND, sender: SyncSender<Frame>) {
+fn read_commands(window: HWND, sender: Sender<Frame>) {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     loop {
@@ -146,21 +151,31 @@ fn message_loop(
                 if unsafe { GetClipboardSequenceNumber() } == last_sequence {
                     continue;
                 }
-                // Unsupported or temporarily unavailable clipboard data must not take
-                // down the listener. Advance the sequence and let the broker treat this
+                match clipboard_snapshot(window) {
+                    Ok((sequence, text)) => {
+                        unsafe { KillTimer(window, READ_RETRY_TIMER) };
+                        last_sequence = report_selection(writer, sequence, text)?;
+                    }
+                    // Whoever holds the clipboard usually lets go within moments;
+                    // reporting the text unavailable now would lose it for good.
+                    Err(_) => unsafe {
+                        SetTimer(window, READ_RETRY_TIMER, READ_RETRY_DELAY_MS, None);
+                    },
+                }
+            }
+            WM_TIMER if message.wParam == READ_RETRY_TIMER => {
+                unsafe { KillTimer(window, READ_RETRY_TIMER) };
+                if unsafe { GetClipboardSequenceNumber() } == last_sequence {
+                    continue;
+                }
+                // Unsupported or still unavailable clipboard data must not take down
+                // the listener. Advance the sequence and let the broker treat this
                 // selection as unavailable.
                 let (sequence, text) = match clipboard_snapshot(window) {
                     Ok(snapshot) => snapshot,
                     Err(_) => (unsafe { GetClipboardSequenceNumber() }, None),
                 };
-                last_sequence = sequence;
-                let mut frame = Frame::new(match text {
-                    Some(_) => MessageKind::WindowsText,
-                    None => MessageKind::WindowsUnavailable,
-                });
-                frame.sequence = sequence;
-                frame.payload = text.unwrap_or_default();
-                frame.write_to(writer)?;
+                last_sequence = report_selection(writer, sequence, text)?;
             }
             WM_AGENT_COMMAND => {
                 while let Ok(frame) = receiver.try_recv() {
@@ -203,6 +218,23 @@ fn message_loop(
             },
         }
     }
+}
+
+/// Tells the broker what the clipboard holds and returns the sequence number the
+/// report describes.
+fn report_selection(
+    writer: &mut BufWriter<impl io::Write>,
+    sequence: u32,
+    text: Option<Vec<u8>>,
+) -> Result<u32, AgentError> {
+    let mut frame = Frame::new(match text {
+        Some(_) => MessageKind::WindowsText,
+        None => MessageKind::WindowsUnavailable,
+    });
+    frame.sequence = sequence;
+    frame.payload = text.unwrap_or_default();
+    frame.write_to(writer)?;
+    Ok(sequence)
 }
 
 /// Reads the clipboard text together with the sequence number it belongs to; a

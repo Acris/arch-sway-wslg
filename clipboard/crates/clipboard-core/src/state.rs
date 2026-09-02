@@ -12,6 +12,10 @@ pub struct PendingWrite {
 ///
 /// Callers hash a text once with [`MirrorState::hash`] and pass the hash around;
 /// a 16 MiB selection would otherwise be digested several times per hop.
+///
+/// The Wayland side needs no pending state: the compositor announces the
+/// broker's own selection back to it, and that announcement carries the hash
+/// the publish was made with.
 #[derive(Debug, Default)]
 pub struct MirrorState {
     next_request_id: u64,
@@ -19,9 +23,6 @@ pub struct MirrorState {
     windows_hash: Option<TextHash>,
     windows_sequence: Option<u32>,
     pending_windows: Option<PendingWrite>,
-    // The hash is the identity of a publish: two publishes of the same text are
-    // interchangeable, so the first roundtrip may commit either.
-    pending_wayland: Option<TextHash>,
 }
 
 impl MirrorState {
@@ -32,7 +33,7 @@ impl MirrorState {
 
     #[must_use]
     pub fn is_wayland_echo(&self, hash: &TextHash) -> bool {
-        self.wayland_hash.as_ref() == Some(hash) || self.pending_wayland.as_ref() == Some(hash)
+        self.wayland_hash.as_ref() == Some(hash)
     }
 
     #[must_use]
@@ -45,16 +46,10 @@ impl MirrorState {
     }
 
     pub fn observe_wayland(&mut self, hash: TextHash) {
-        self.pending_wayland = None;
         self.wayland_hash = Some(hash);
     }
 
     pub fn invalidate_wayland(&mut self) {
-        self.wayland_hash = None;
-    }
-
-    pub fn reject_wayland_selection(&mut self) {
-        self.pending_wayland = None;
         self.wayland_hash = None;
     }
 
@@ -108,20 +103,6 @@ impl MirrorState {
         true
     }
 
-    pub fn begin_wayland_publish(&mut self, hash: TextHash, sequence: u32) {
-        self.observe_windows(hash, sequence);
-        self.pending_wayland = Some(hash);
-    }
-
-    pub fn commit_wayland_publish(&mut self, hash: &TextHash) -> bool {
-        if self.pending_wayland.as_ref() != Some(hash) {
-            return false;
-        }
-        self.pending_wayland = None;
-        self.wayland_hash = Some(*hash);
-        true
-    }
-
     #[must_use]
     pub fn windows_changed_since(&self, sequence: u32) -> bool {
         self.windows_sequence != Some(sequence)
@@ -152,17 +133,6 @@ mod tests {
         assert!(state.commit_windows_write(pending.request_id, 10));
         assert!(state.is_windows_echo(&h(b"new")));
         assert!(!state.windows_changed_since(10));
-    }
-
-    #[test]
-    fn wayland_publish_commits_only_after_matching_roundtrip() {
-        let mut state = MirrorState::default();
-        state.begin_wayland_publish(h(b"from Windows"), 11);
-        assert!(state.is_wayland_echo(&h(b"from Windows")));
-        assert!(!state.commit_wayland_publish(&h(b"something else")));
-        assert!(state.commit_wayland_publish(&h(b"from Windows")));
-        assert!(!state.commit_wayland_publish(&h(b"from Windows")));
-        assert!(!state.windows_changed_since(11));
     }
 
     #[test]
@@ -207,20 +177,9 @@ mod tests {
         state.observe_wayland(h(b"same text"));
         state.observe_windows(h(b"same text"), 7);
 
-        state.reject_wayland_selection();
+        state.invalidate_wayland();
 
         assert!(!state.is_wayland_echo(&h(b"same text")));
-    }
-
-    #[test]
-    fn external_wayland_selection_cancels_stale_publish_ack() {
-        let mut state = MirrorState::default();
-        state.begin_wayland_publish(h(b"from Windows"), 12);
-
-        state.observe_wayland(h(b"new in Sway"));
-
-        assert!(!state.commit_wayland_publish(&h(b"from Windows")));
-        assert!(state.is_wayland_echo(&h(b"new in Sway")));
-        assert!(!state.is_wayland_echo(&h(b"from Windows")));
+        assert!(state.is_windows_echo(&h(b"same text")));
     }
 }

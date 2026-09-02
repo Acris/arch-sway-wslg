@@ -286,11 +286,15 @@ start_clipboard_service() {
     clipboard_available || die "bundled clipboard binaries are missing"
     clipboard_running && return 0
 
+    # The broker exits with status 3 when another start would only repeat the
+    # failure (no data-control protocol, agent restart budget exhausted); the
+    # start limit bounds everything else.
     user_bus_command systemd-run --user --collect --quiet \
         --unit="$CLIPBOARD_SERVICE" --service-type=exec \
         --property="BindsTo=$SESSION_SCOPE" \
         --property="After=$SESSION_SCOPE" \
         --property="Restart=on-failure" \
+        --property="RestartPreventExitStatus=3" \
         --property="RestartSec=1s" \
         --property="StartLimitBurst=5" \
         --property="StartLimitIntervalSec=60s" \

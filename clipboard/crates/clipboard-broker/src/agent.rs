@@ -52,9 +52,11 @@ impl AgentProcess {
         let output = File::from(OwnedFd::from(
             child.stdout.take().expect("piped agent stdout"),
         ));
-        // The level-triggered source reads one chunk per wakeup and must never
-        // block the loop on a pipe that only looked readable.
+        // Both pipes are driven from the event loop: the level-triggered source
+        // reads one chunk per wakeup and must never block on a pipe that only
+        // looked readable, and writes are bounded by `write_with_deadline`.
         set_nonblocking(&output)?;
+        set_nonblocking(&input)?;
         let token = handle
             .insert_source(
                 Generic::new(output, Interest::READ, Mode::Level),
@@ -95,21 +97,29 @@ impl AgentProcess {
     }
 
     /// Closes the agent's pipe, which is its shutdown signal, and reaps it off the
-    /// event loop. The interop stub only gets killed when the agent ignores the pipe.
+    /// event loop so a replacement can start right away.
     pub fn shutdown(self, handle: &LoopHandle<'static, BrokerState>) {
         handle.remove(self.token);
-        let mut child = self.child;
-        let input = self.input;
-        thread::spawn(move || {
-            drop(input);
-            let deadline = Instant::now() + EXIT_GRACE;
-            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                thread::sleep(EXIT_POLL_INTERVAL);
-            }
-            // Both are no-ops for a child that already exited, and `wait` is what
-            // keeps a stubborn or unpollable child from lingering as a zombie.
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+        let (child, input) = (self.child, self.input);
+        thread::spawn(move || reap(child, input));
     }
+
+    /// The same shutdown, waited for: used once the event loop has ended.
+    pub fn shutdown_now(self, handle: &LoopHandle<'static, BrokerState>) {
+        handle.remove(self.token);
+        reap(self.child, self.input);
+    }
+}
+
+// The interop stub only gets killed when the agent ignores its closed pipe.
+fn reap(mut child: Child, input: ChildStdin) {
+    drop(input);
+    let deadline = Instant::now() + EXIT_GRACE;
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+        thread::sleep(EXIT_POLL_INTERVAL);
+    }
+    // Both are no-ops for a child that already exited, and `wait` is what keeps
+    // a stubborn or unpollable child from lingering as a zombie.
+    let _ = child.kill();
+    let _ = child.wait();
 }

@@ -344,9 +344,9 @@ trying again.
 If `arch-sway-wslg status` reports the clipboard as degraded or not running, check `arch-sway-wslg logs` and run
 `arch-sway-wslg doctor`. Clipboard sharing needs WSL interoperability: remove `interop=false` from `/etc/wsl.conf` if it
 was disabled, then run `wsl --shutdown` from Windows. AppLocker, WDAC, or security software can also block the bundled
-unsigned Windows executable; after a few failed attempts sharing gives up and the log says why. Sharing also needs Sway
-1.11 or newer. Setting `ARCH_SWAY_WSLG_CLIPBOARD=off` before starting the session disables clipboard sharing without
-affecting Sway.
+unsigned Windows executable; after a few failed attempts sharing gives up for the rest of the session and the log says
+why, and `arch-sway-wslg restart` tries again once the cause is fixed. Sharing also needs Sway 1.11 or newer. Setting
+`ARCH_SWAY_WSLG_CLIPBOARD=off` before starting the session disables clipboard sharing without affecting Sway.
 
 If notifications never appear, run `arch-sway-wslg doctor`. When another process already holds
 `org.freedesktop.Notifications`, stop it with `systemctl --user stop swaync.service` and restart the session.

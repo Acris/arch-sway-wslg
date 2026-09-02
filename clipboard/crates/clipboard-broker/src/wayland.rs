@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use clipboard_core::MAX_TEXT_BYTES;
+use clipboard_core::state::TextHash;
 use rustix::pipe::{PipeFlags, pipe_with};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{wl_registry, wl_seat};
@@ -34,6 +35,10 @@ const SENSITIVE_MIME_TYPES: [&str; 2] = [
 ];
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_ACTIVE_TRANSFERS: usize = 8;
+// A replaced source is kept until the compositor cancels it. Two publishes in
+// one compositor dispatch cycle can leave two of them waiting; a third is not
+// realistic, so the oldest goes then.
+const MAX_RETIRING_SOURCES: usize = 2;
 
 #[derive(Debug)]
 pub enum WaylandEvent {
@@ -47,7 +52,13 @@ pub enum WaylandEvent {
         generation: u64,
         error: Option<String>,
     },
-    DeviceLost(String),
+    /// The compositor announced the broker's own selection: the publish made
+    /// with `hash` is now what Sway holds.
+    Published {
+        generation: u64,
+        hash: TextHash,
+    },
+    DeviceLost,
 }
 
 pub struct WaylandState {
@@ -58,10 +69,13 @@ pub struct WaylandState {
     // Every offer is consumed by the selection event that follows it, so this
     // holds at most the regular and the primary offer in flight.
     offers: HashMap<ObjectId, OfferInfo>,
-    // The source owning the selection, and the one it replaced: the compositor
-    // may still deliver `send` for the latter until it has seen the new selection.
+    // The source owning the selection, and the ones it replaced: the compositor
+    // may still deliver `send` for those until it has seen the new selection.
     active_source: Option<ActiveSource>,
-    retiring_source: Option<ActiveSource>,
+    retiring_sources: Vec<ActiveSource>,
+    // The compositor announces every selection back, our own included, in the
+    // order it processed them; the front entry names the next such announcement.
+    pending_publishes: VecDeque<TextHash>,
     // Only the newest selection is ever read; a newer one cancels this read.
     offer_read: Option<OfferRead>,
     transfer_slots: Arc<AtomicUsize>,
@@ -96,7 +110,8 @@ impl WaylandState {
             device: None,
             offers: HashMap::new(),
             active_source: None,
-            retiring_source: None,
+            retiring_sources: Vec::new(),
+            pending_publishes: VecDeque::new(),
             offer_read: None,
             transfer_slots: Arc::default(),
             sync_sensitive,
@@ -118,6 +133,7 @@ impl WaylandState {
     pub fn publish_text(
         &mut self,
         text: Vec<u8>,
+        hash: TextHash,
         qh: &QueueHandle<BrokerState>,
     ) -> Result<(), String> {
         let manager = self
@@ -133,14 +149,16 @@ impl WaylandState {
             source.offer((*mime).into());
         }
         device.set_selection(Some(&source));
-        // The previous source keeps serving until its `cancelled` arrives; the one
-        // before that has necessarily been cancelled already.
+        self.pending_publishes.push_back(hash);
+        // The previous source keeps serving until its `cancelled` arrives.
         if let Some(previous) = self.active_source.replace(ActiveSource {
             proxy: source,
             text: Arc::new(text),
-        }) && let Some(retired) = self.retiring_source.replace(previous)
-        {
-            retired.proxy.destroy();
+        }) {
+            self.retiring_sources.push(previous);
+            if self.retiring_sources.len() > MAX_RETIRING_SOURCES {
+                self.retiring_sources.remove(0).proxy.destroy();
+            }
         }
         Ok(())
     }
@@ -283,17 +301,18 @@ impl WaylandState {
         &self,
         source: &ext_data_control_source_v1::ExtDataControlSourceV1,
     ) -> Option<Arc<Vec<u8>>> {
-        [&self.active_source, &self.retiring_source]
-            .into_iter()
-            .flatten()
+        self.active_source
+            .iter()
+            .chain(&self.retiring_sources)
             .find(|candidate| candidate.proxy.id() == source.id())
             .map(|candidate| Arc::clone(&candidate.text))
     }
 
     fn forget_source(&mut self, source: &ext_data_control_source_v1::ExtDataControlSourceV1) {
-        for slot in [&mut self.active_source, &mut self.retiring_source] {
-            slot.take_if(|candidate| candidate.proxy.id() == source.id());
-        }
+        self.active_source
+            .take_if(|candidate| candidate.proxy.id() == source.id());
+        self.retiring_sources
+            .retain(|candidate| candidate.proxy.id() != source.id());
     }
 }
 
@@ -373,12 +392,19 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for Broker
             }
             ext_data_control_device_v1::Event::Selection { id: Some(offer) } => {
                 let generation = broker.wayland.begin_selection();
-                broker.handle_wayland_event(WaylandEvent::SelectionStarted(generation));
                 let info = broker
                     .wayland
                     .offers
                     .remove(&offer.id())
                     .unwrap_or_default();
+                // Our own text is not read back through a pipe: the announcement
+                // itself is the proof that the compositor took the publish.
+                if let Some(hash) = broker.wayland.pending_publishes.pop_front() {
+                    offer.destroy();
+                    broker.handle_wayland_event(WaylandEvent::Published { generation, hash });
+                    return;
+                }
+                broker.handle_wayland_event(WaylandEvent::SelectionStarted(generation));
                 let mime = info
                     .text_rank
                     .filter(|_| broker.wayland.sync_sensitive || !info.sensitive)
@@ -413,9 +439,7 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for Broker
                 offer.destroy();
             }
             ext_data_control_device_v1::Event::Finished => {
-                broker.handle_wayland_event(WaylandEvent::DeviceLost(
-                    "ext-data-control device was removed".into(),
-                ));
+                broker.handle_wayland_event(WaylandEvent::DeviceLost);
             }
             _ => {}
         }
@@ -445,7 +469,10 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for Broker
                     return;
                 }
                 thread::spawn(move || {
-                    let _ = write_with_deadline(&File::from(fd), &text, TRANSFER_TIMEOUT);
+                    let file = File::from(fd);
+                    if set_nonblocking(&file).is_ok() {
+                        let _ = write_with_deadline(&file, &text, TRANSFER_TIMEOUT);
+                    }
                     slots.fetch_sub(1, Ordering::AcqRel);
                 });
             }

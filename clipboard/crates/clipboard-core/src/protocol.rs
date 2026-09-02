@@ -7,9 +7,6 @@ use crate::{MAX_TEXT_BYTES, PROTOCOL_VERSION};
 const MAGIC: [u8; 4] = *b"ASWC";
 const HEADER_LEN: usize = 28;
 const MAX_CONTROL_BYTES: usize = 1024;
-// A drained decoder keeps at most this much capacity, so one large frame does
-// not pin its allocation for the life of the agent.
-const DECODER_IDLE_CAPACITY: usize = 64 * 1024;
 
 pub const HELLO_HAS_TEXT: u32 = 1;
 /// The agent could not obtain a stable startup snapshot.
@@ -169,7 +166,8 @@ impl Frame {
 /// Incremental decoder for a non-blocking byte stream of frames.
 ///
 /// The header is validated before its payload is buffered, so the buffer never
-/// grows beyond one frame's declared size plus the caller's read chunk.
+/// grows beyond one frame's declared size plus the caller's read chunk, and a
+/// completed frame takes its allocation with it instead of pinning it here.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
@@ -189,11 +187,10 @@ impl FrameDecoder {
         if self.buffer.len() < total {
             return Ok(None);
         }
-        let payload = self.buffer[HEADER_LEN..total].to_vec();
-        self.buffer.drain(..total);
-        if self.buffer.is_empty() {
-            self.buffer.shrink_to(DECODER_IDLE_CAPACITY);
-        }
+        // Splitting moves the payload once; a drain would copy it and then shift
+        // whatever follows it.
+        let mut payload = self.buffer.split_off(HEADER_LEN);
+        self.buffer = payload.split_off(header.payload_len);
         Ok(Some(header.into_frame(payload)))
     }
 }

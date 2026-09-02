@@ -8,16 +8,16 @@ use std::path::PathBuf;
 
 use clipboard_core::PROTOCOL_VERSION;
 
-use crate::broker::{BrokerConfig, ClipboardMode};
+use crate::broker::{BrokerConfig, BrokerError, ClipboardMode};
 
 fn main() {
     if let Err(error) = run() {
         eprintln!("clipboard: {error}");
-        std::process::exit(1);
+        std::process::exit(error.exit_code());
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), BrokerError> {
     let mut args = std::env::args_os();
     let _program = args.next();
     if matches!(args.next().as_deref(), Some(value) if value == "--probe") {
@@ -32,12 +32,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mode = ClipboardMode::from_env()?;
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .ok_or("XDG_RUNTIME_DIR is not set")?
+        .ok_or_else(|| BrokerError::Configuration("XDG_RUNTIME_DIR is not set".into()))?
         .join("arch-sway-wslg/clipboard");
     let executable = std::env::current_exe()?;
     let agent = executable
         .parent()
-        .ok_or("clipboard executable has no parent directory")?
+        .ok_or_else(|| {
+            BrokerError::Configuration("clipboard executable has no parent directory".into())
+        })?
         .join("arch-sway-wslg-clipboard-agent.exe");
 
     let config = BrokerConfig {
@@ -47,6 +49,5 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_dir,
         agent,
     };
-    broker::run(config)?;
-    Ok(())
+    broker::run(config)
 }

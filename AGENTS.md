@@ -142,27 +142,34 @@ Implementations may change freely as long as these hold. Preserve them unless th
   a message-only window. Nothing is installed on the Windows side.
 - The broker fails fast instead of waiting forever: a compositor without `ext_data_control_manager_v1` or a seat, an
   agent that never sends `Hello` within `HELLO_TIMEOUT`, a missed heartbeat, and an exhausted restart budget are all
-  errors. An exhausted budget or a vanished data-control device exits non-zero so the transient unit's
-  `Restart=on-failure` and start-limit properties in the launcher form the outer bound; the compositor closing the
-  connection (Sway exiting) is a clean exit.
+  errors. Failures another start would only repeat (a configuration error, a compositor without the globals, an
+  exhausted restart budget) exit with status `3`, which the launcher lists in `RestartPreventExitStatus` so the
+  clipboard stays down for the rest of the session instead of cycling; a vanished data-control device exits `1` and is
+  retried within the unit's start limit; the compositor closing the connection (Sway exiting) is a clean exit. Keep
+  `BrokerError::exit_code` and the launcher property in step.
 - Both directions are serialised in the broker state machine with `SyncSlots` (one pending text per direction) and
-  `MirrorState` (echo suppression). A Windows write commits only after its request ACK, a Wayland publish commits only
-  after the compositor processes a display sync roundtrip, and the SHA-256 of the text is the identity of a publish.
-  Echoes are suppressed by sequence numbers and committed hashes, never by wall-clock comparisons, and clipboard
-  payloads never touch the disk or the log.
+  `MirrorState` (echo suppression). A Windows write commits only after its request ACK. A Wayland publish commits when
+  the compositor announces the broker's own selection back to it, which wlroots does for every data-control device
+  including the one that set it: the broker never reads its own text back, and the SHA-256 of the text is the identity
+  of a publish. Echoes are suppressed by sequence numbers and committed hashes, never by wall-clock comparisons, and
+  clipboard payloads never touch the disk or the log.
 - Cold startup gives an existing Windows text selection priority, including a Windows change that arrives while the
   Wayland side is still initialising; the agent's startup snapshot pairs the sequence number with the text it read.
 - Text that cannot be delivered is queued, not dropped: a Sway selection made while the agent is unavailable is sent
-  once it is back, a failed Windows write is retried once before the broker reports `degraded`, and an agent restart
-  cannot push an old Sway selection over a Windows change made while it was unavailable.
-- `degraded` means a transport failure (agent or Wayland). Rejecting a single selection is logged but does not change
-  the health. The status file under the clipboard state directory is rewritten only when its content changes.
+  once it is back, a refused Windows write is retried once after a short delay unless a newer selection on either side
+  has superseded it, and an agent restart cannot push an old Sway selection over a Windows change made while it was
+  unavailable. The agent likewise reads a Windows update it could not open once more before reporting the selection
+  unavailable.
+- `degraded` means a transport failure (agent or Wayland). Rejecting a single selection, and a refused write that a
+  newer selection replaces anyway, is logged but does not change the health; only the second refusal of the same text
+  does. The status file under the clipboard state directory is rewritten only when its content changes.
 - Bound clipboard access, IPC payloads, heartbeats, transfers, shutdown, and restarts. The restart budget resets after
   stable operation. A replaced data source keeps serving `send` requests until the compositor cancels it, so a paste
   that races a new copy never receives empty data.
 - Sway starts only the short-lived internal launcher command (`__start_clipboard`) that knows the nested display. The
   broker itself is a transient systemd user service bound to the session scope, and the Win32 agent exits when its
   inherited pipe closes: shutdown closes the agent's stdin first, waits a bounded grace period, and only then kills.
+  The broker reaps the agent the same way before it exits itself, whichever way its loop ended.
 - The agent pipe carries length-prefixed frames with a 28-byte header (`PROTOCOL_VERSION` in `clipboard-core`). Any
   change to the frame layout or message set must bump the version, and both binaries must be rebuilt and deployed
   together. The installer refuses a payload that fails `clipboard.sha256`, and `doctor` runs `--probe` on both binaries.
@@ -195,7 +202,8 @@ Implementations may change freely as long as these hold. Preserve them unless th
 - Rust targets stable edition 2024. Keep platform APIs behind target-specific modules (`wayland.rs`, `windows.rs`),
   share protocol, text, and state logic through `clipboard-core`, deny Clippy warnings in validation, bound every
   allocation derived from IPC, and keep `unsafe` Win32 blocks as small as practical.
-- Bounded pipe I/O goes through `clipboard-broker/src/io.rs`; do not add a second deadline helper.
+- Bounded pipe I/O goes through `clipboard-broker/src/io.rs`; do not add a second deadline helper. Its callers make a
+  descriptor non-blocking once, when they obtain it, rather than per call.
 
 ## Safety
 

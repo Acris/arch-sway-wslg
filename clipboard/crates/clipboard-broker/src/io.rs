@@ -1,5 +1,7 @@
 //! Bounded, non-blocking pipe helpers shared by the agent pipe and the Wayland
-//! transfers. Every call here returns within the deadline it was given.
+//! transfers. Every call here returns within the deadline it was given, and
+//! every descriptor handed in must already be non-blocking (see
+//! [`set_nonblocking`]).
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
@@ -8,7 +10,8 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
-const CHUNK: usize = 8192;
+// The agent reads its pipe in chunks of the same size.
+const CHUNK: usize = 64 * 1024;
 
 pub fn set_nonblocking(fd: impl AsFd) -> io::Result<()> {
     let flags = fcntl_getfl(&fd)?;
@@ -22,7 +25,6 @@ pub fn write_with_deadline(
     mut input: &[u8],
     timeout: Duration,
 ) -> io::Result<()> {
-    set_nonblocking(&writer)?;
     let deadline = Instant::now() + timeout;
     while !input.is_empty() {
         wait_for_fd(&writer, PollFlags::OUT, deadline)?;
@@ -121,6 +123,7 @@ mod tests {
     #[test]
     fn bounded_write_times_out_when_reader_stalls() {
         let (_reader, writer) = pipe();
+        set_nonblocking(&writer).unwrap();
         let input = vec![0_u8; 1024 * 1024];
         let error = write_with_deadline(&writer, &input, Duration::from_millis(10)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -129,6 +132,7 @@ mod tests {
     #[test]
     fn bounded_write_delivers_to_a_live_reader() {
         let (reader, writer) = pipe();
+        set_nonblocking(&writer).unwrap();
         let input = vec![7_u8; 256 * 1024];
         let expected = input.clone();
         let consumer = thread::spawn(move || {

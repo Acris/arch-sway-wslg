@@ -316,8 +316,9 @@ arch-sway-wslg doctor
 如果 `arch-sway-wslg status` 显示剪贴板为 degraded 或 not running，请检查 `arch-sway-wslg logs` 并运行
 `arch-sway-wslg doctor`。剪贴板共享需要 WSL 互操作：如果 `/etc/wsl.conf` 中设置了 `interop=false`，请将其移除，然后在
 Windows 中运行 `wsl --shutdown`。AppLocker、WDAC 或安全软件也可能阻止随附的未签名 Windows
-可执行文件运行；几次尝试失败后共享会放弃，日志会说明原因。共享还需要 Sway 1.11 或更高版本。在启动会话前设置
-`ARCH_SWAY_WSLG_CLIPBOARD=off` 可以关闭剪贴板共享，且不影响 Sway。
+可执行文件运行；几次尝试失败后，共享会在本次会话的剩余时间内放弃，日志会说明原因；排除原因后运行 `arch-sway-wslg restart`
+即可再次尝试。共享还需要 Sway 1.11 或更高版本。在启动会话前设置 `ARCH_SWAY_WSLG_CLIPBOARD=off`
+可以关闭剪贴板共享，且不影响 Sway。
 
 如果通知始终不显示，请运行 `arch-sway-wslg doctor`。当另一个进程已占用 `org.freedesktop.Notifications` 时，请使用
 `systemctl --user stop swaync.service` 停止它并重启会话。
