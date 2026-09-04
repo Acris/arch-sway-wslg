@@ -695,6 +695,32 @@ doctor() {
                 note "OK   notifications: org.freedesktop.Notifications is free for SwayNC"
                 ;;
         esac
+
+        case "$(bus_name_state "$bus_names" org.freedesktop.portal.Desktop || true)" in
+            owned)
+                note "OK   desktop portal is running"
+                ;;
+            activatable)
+                note "OK   desktop portal can be activated"
+                ;;
+            *)
+                note "FAIL desktop portal is unavailable"
+                failed=1
+                ;;
+        esac
+
+        case "$(bus_name_state "$bus_names" org.freedesktop.impl.portal.desktop.gtk || true)" in
+            owned)
+                note "OK   GTK portal backend is running"
+                ;;
+            activatable)
+                note "OK   GTK portal backend can be activated"
+                ;;
+            *)
+                note "FAIL GTK portal backend is unavailable"
+                failed=1
+                ;;
+        esac
     else
         note "FAIL session bus is not reachable: $USER_BUS_ADDRESS"
         failed=1

@@ -65,7 +65,7 @@ MAIN_PACKAGES=(
     adw-gtk-theme papirus-icon-theme ttf-sarasa-gothic
     maplemono-nf-cn-unhinted noto-fonts-emoji
     # WSLg integration and desktop plumbing
-    xdg-utils
+    xdg-utils xdg-desktop-portal-gtk
 )
 
 YAZI_INTEGRATION_PACKAGES=(fd ripgrep fzf zoxide jq 7zip)

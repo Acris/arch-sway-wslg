@@ -99,8 +99,8 @@ Implementations may change freely as long as these hold. Preserve them unless th
 - `logs` reads an ordinary file, and a session that refuses to start is exactly when it is needed, so it must not depend
   on systemd, the bus, or any other part of the session.
 - Bound every wait around systemd, the user bus, WSLg, IPC, locks, and the clipboard.
-- Out of scope: portals, Flatpak integration, screen sharing, moving WSLg windows, and recovering automatically after
-  WSLg itself fails.
+- Portal support is limited to GTK file choosers shown as separate WSLg windows. Flatpak integration, screenshot
+  portals, screen sharing, moving WSLg windows, and recovering automatically after WSLg itself fails are out of scope.
 
 ### Installer
 

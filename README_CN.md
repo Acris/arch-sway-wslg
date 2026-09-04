@@ -13,6 +13,7 @@ Sway 发行版。
 - Catppuccin Mocha 配色方案，界面使用 Sarasa UI SC 字体，终端使用 Maple Mono NF CN 字体
 - 通过 XWayland 支持 X11 应用，通过 WSLg 支持声音
 - 在 Sway 中复制的纯文本可以在 Windows 中粘贴，反之亦然
+- 为使用 portal 的应用程序提供 GTK 文件选择对话框
 - 最多支持四块 Sway 屏幕，每块屏幕都在独立的 Windows 窗口中运行
 - 可选浏览器，以及支持自动解锁的密码钥匙串
 - 个人设置存放在覆盖文件中，更新时原样保留
@@ -284,7 +285,7 @@ rm -f ~/.config/credstore.encrypted/oo7.keyring-encryption-password
 paru -Rns sway xorg-xwayland swaybg waybar swaync foot fuzzel nwg-look \
   qt5-wayland qt6-wayland yazi oo7 seahorse adw-gtk-theme papirus-icon-theme \
   ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
-  ttf-nerd-fonts-symbols-mono xdg-utils jack2
+  ttf-nerd-fonts-symbols-mono xdg-utils xdg-desktop-portal-gtk jack2
 ```
 
 如果 pacman 报告某个软件包仍被需要，请将其从命令中删除并重新运行；例如，保留的浏览器仍需要 `xdg-utils` 和字体包。
@@ -309,7 +310,7 @@ dconf 中；如有需要，请使用 `gsettings reset-recursively org.gnome.desk
 arch-sway-wslg doctor
 ```
 
-该命令会检查 systemd、桌面所需的程序、WSLg 集成以及音频，且不会做任何改动。
+该命令会检查 systemd、桌面所需的程序、GTK 文件选择 portal、WSLg 集成以及音频，且不会做任何改动。
 
 如果缺少 WSLg 的 Wayland、PulseAudio 或 X11 映射，请先关闭 WSL 并在 Windows 中运行 `wsl --shutdown`，然后重试。
 
@@ -351,7 +352,8 @@ WSLg 恢复健康后再次启动会话。
 
 - Windows 负责处理截图、任务栏行为以及桌面窗口的定位。本项目不会移动它们，且在 WSLg 自身停止工作时不会自动恢复。
 - 钥匙串、通知及其他桌面服务与 WSL 用户共享，这正是它们能在此工作的原因。在会话外启动的服务在执行 `stop` 后仍会继续运行。
-- 不支持 portal、Flatpak 集成以及屏幕共享。
+- GTK 文件选择 portal 可用，但其对话框是独立的 WSLg 窗口，而不是嵌套桌面的一部分。不支持 Flatpak
+  集成、截图 portal 以及屏幕共享。
 - 使用 XWayland 的应用可能不如原生 Wayland 应用清晰。
 
 ## 参与开发

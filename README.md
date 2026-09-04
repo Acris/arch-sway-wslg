@@ -13,6 +13,7 @@ and is not a general bare-metal Sway distribution.
 - Catppuccin Mocha styling, Sarasa UI SC for the interface and Maple Mono NF CN for the terminal
 - X11 applications through XWayland, and sound through WSLg
 - Plain text copied in Sway can be pasted in Windows, and the other way round
+- GTK portal file choosers for applications that use them
 - Up to four Sway screens, each in its own Windows window
 - A browser of choice, and a password keyring that can unlock itself
 - Personal settings in override files that updates keep in place
@@ -309,7 +310,7 @@ Remove the packages this project installed. Drop anything worth keeping and appe
 paru -Rns sway xorg-xwayland swaybg waybar swaync foot fuzzel nwg-look \
   qt5-wayland qt6-wayland yazi oo7 seahorse adw-gtk-theme papirus-icon-theme \
   ttf-sarasa-gothic maplemono-nf-cn-unhinted noto-fonts-emoji noto-fonts \
-  ttf-nerd-fonts-symbols-mono xdg-utils jack2
+  ttf-nerd-fonts-symbols-mono xdg-utils xdg-desktop-portal-gtk jack2
 ```
 
 If pacman reports that a package is still needed, drop it from the command and run it again; a kept browser, for
@@ -336,7 +337,8 @@ Run diagnostics first:
 arch-sway-wslg doctor
 ```
 
-It checks systemd, the programs the desktop needs, WSLg integration, and audio, and it changes nothing.
+It checks systemd, the programs the desktop needs, the GTK file chooser portal, WSLg integration, and audio, and it
+changes nothing.
 
 If the WSLg Wayland, PulseAudio, or X11 mappings are missing, close WSL and run `wsl --shutdown` from Windows before
 trying again.
@@ -383,7 +385,8 @@ If a session is stuck, `arch-sway-wslg stop` always ends it. Never delete `/tmp/
   it does not recover on its own when WSLg itself stops working.
 - The keyring, notifications, and other desktop services are shared with the rest of the WSL user, which is what makes
   them work here. One that was started outside the session keeps running after `stop`.
-- Portals, Flatpak integration, and screen sharing are not supported.
+- GTK file chooser portals are available, but their dialogs are separate WSLg windows rather than part of the nested
+  desktop. Flatpak integration, screenshot portals, and screen sharing are not supported.
 - Applications using XWayland may look less sharp than native Wayland ones.
 
 ## Contributing
