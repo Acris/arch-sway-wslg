@@ -138,6 +138,13 @@ enum Delivery {
     ToWayland(WindowsSelection),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum WaylandTextDisposition {
+    Duplicate,
+    WindowsEcho,
+    Forwarded,
+}
+
 impl SyncSlots {
     fn wayland_text(&mut self, text: HashedText) {
         self.to_windows = Some(text);
@@ -184,6 +191,23 @@ impl SyncSlots {
             return Some(Delivery::ToWayland(selection));
         }
         self.to_windows.take().map(Delivery::ToWindows)
+    }
+}
+
+fn observe_wayland_text(
+    mirror: &mut MirrorState,
+    slots: &mut SyncSlots,
+    text: HashedText,
+) -> WaylandTextDisposition {
+    if mirror.is_wayland_echo(&text.hash) {
+        return WaylandTextDisposition::Duplicate;
+    }
+    mirror.observe_wayland(text.hash);
+    if mirror.is_windows_echo(&text.hash) {
+        WaylandTextDisposition::WindowsEcho
+    } else {
+        slots.wayland_text(text);
+        WaylandTextDisposition::Forwarded
     }
 }
 
@@ -328,6 +352,9 @@ impl BrokerState {
             WaylandEvent::SelectionStarted(generation) => {
                 self.latest_wayland_generation = generation;
                 self.mirror.invalidate_wayland();
+                // A newer selection supersedes queued Sway text even while its
+                // offer is still being read.
+                self.slots.wayland_non_text();
             }
             WaylandEvent::Text { generation, text } => {
                 if generation != self.latest_wayland_generation {
@@ -335,10 +362,14 @@ impl BrokerState {
                 }
                 match accept_wayland_text(text) {
                     Ok(text) => {
-                        // An echo forwards nothing but still makes Sway ready.
-                        if !self.mirror.is_wayland_echo(&text.hash) {
-                            self.mirror.observe_wayland(text.hash);
-                            self.slots.wayland_text(text);
+                        // Every offer is read, including the announcement of a
+                        // selection this broker published. The text hash, not
+                        // cross-client event order, identifies an echo.
+                        if observe_wayland_text(&mut self.mirror, &mut self.slots, text)
+                            == WaylandTextDisposition::WindowsEcho
+                            && self.agent_ready
+                        {
+                            self.write_status(Health::Running, None);
                         }
                     }
                     Err(error) => self.withdraw_wayland_selection(error.as_deref()),
@@ -350,14 +381,6 @@ impl BrokerState {
                     self.withdraw_wayland_selection(error.as_deref());
                     self.wayland_described();
                 }
-            }
-            WaylandEvent::Published { generation, hash } => {
-                self.latest_wayland_generation = generation;
-                self.mirror.observe_wayland(hash);
-                if self.agent_ready {
-                    self.write_status(Health::Running, None);
-                }
-                self.wayland_described();
             }
             WaylandEvent::DeviceLost => self.fail(BrokerError::EventLoop(
                 "ext-data-control device was removed".into(),
@@ -632,8 +655,9 @@ impl BrokerState {
         if wayland_echo {
             return;
         }
-        // The compositor answers with our own `selection`, which commits the hash.
-        if let Err(error) = self.wayland.publish_text(text.text, text.hash, &self.qh) {
+        // The compositor serves the selection back through the ordinary offer
+        // path, whose text hash commits it without relying on event order.
+        if let Err(error) = self.wayland.publish_text(text.text, &self.qh) {
             self.degrade(&error);
         }
     }
@@ -786,9 +810,12 @@ fn sequence_is_newer(candidate: u32, current: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use clipboard_core::state::MirrorState;
+
     use super::{
-        Delivery, HashedText, SyncSlots, WindowsSelection, WriteFailure, accept_wayland_text,
-        sequence_is_newer, startup_windows_selection, write_failure,
+        Delivery, HashedText, SyncSlots, WaylandTextDisposition, WindowsSelection, WriteFailure,
+        accept_wayland_text, observe_wayland_text, sequence_is_newer, startup_windows_selection,
+        write_failure,
     };
 
     fn text(bytes: &[u8]) -> HashedText {
@@ -921,6 +948,28 @@ mod tests {
         let mut slots = SyncSlots::default();
         slots.wayland_text(text(b"old"));
         slots.wayland_non_text();
+        assert_eq!(slots.take(), None);
+    }
+
+    #[test]
+    fn wayland_offers_are_classified_by_hash_not_arrival_order() {
+        let mut mirror = MirrorState::default();
+        let mut slots = SyncSlots::default();
+        let windows = text(b"published from Windows");
+        mirror.observe_windows(windows.hash, 7);
+
+        assert_eq!(
+            observe_wayland_text(&mut mirror, &mut slots, text(b"external Sway text")),
+            WaylandTextDisposition::Forwarded
+        );
+        // The later announcement supersedes the earlier queued selection before
+        // its hash is classified.
+        slots.wayland_non_text();
+        mirror.invalidate_wayland();
+        assert_eq!(
+            observe_wayland_text(&mut mirror, &mut slots, windows),
+            WaylandTextDisposition::WindowsEcho
+        );
         assert_eq!(slots.take(), None);
     }
 }

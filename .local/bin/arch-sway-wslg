@@ -382,9 +382,9 @@ prepare_environment() {
     : "${_JAVA_AWT_WM_NONREPARENTING:=1}"
     export _JAVA_AWT_WM_NONREPARENTING
 
-    # xdg-open reports XDG_CURRENT_DESKTOP=sway as a generic desktop and then
-    # honours BROWSER first, so publishing the browser chosen at install time is
-    # enough to keep links inside this session.
+    # Publish the browser chosen at install time for applications that honour
+    # BROWSER. Current xdg-open releases may instead use their WSL-specific
+    # handler, so this is a preference rather than a routing guarantee.
     if [[ -z "${BROWSER:-}" && -r "$BROWSER_FILE" ]]; then
         local browser
         IFS= read -r browser < "$BROWSER_FILE" || browser=""

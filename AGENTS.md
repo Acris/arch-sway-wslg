@@ -118,8 +118,8 @@ Implementations may change freely as long as these hold. Preserve them unless th
   Windows side and reports a scale of 1.
 - Stage and check the whole payload on the same filesystem before replacing any managed directory, and remove the
   staging directories on every exit, an interrupt included. The check covers the files the session cannot start without,
-  the imported override stylesheets among them. Preserve the user override paths, seed them on a first installation, and
-  remove optional choices the user has revoked.
+  the imported override stylesheets among them. Preserve the user override paths and seed them on a first installation.
+  Declining the optional desktop-entry masks leaves any existing same-named files unchanged.
 - Report a failed write instead of continuing: a helper called in a condition runs without `errexit`, so every step in
   it reports its own failure.
 - Offer a timestamped backup on every run, default to yes, and keep it the single documented way back: it replaces the
@@ -149,10 +149,10 @@ Implementations may change freely as long as these hold. Preserve them unless th
   `BrokerError::exit_code` and the launcher property in step.
 - Both directions are serialised in the broker state machine with `SyncSlots` (one pending text per direction) and
   `MirrorState` (echo suppression). A Windows write commits only after its request ACK. A Wayland publish commits when
-  the compositor announces the broker's own selection back to it, which wlroots does for every data-control device
-  including the one that set it: the broker never reads its own text back, and the SHA-256 of the text is the identity
-  of a publish. Echoes are suppressed by sequence numbers and committed hashes, never by wall-clock comparisons, and
-  clipboard payloads never touch the disk or the log.
+  the compositor announces and serves the selection back to it, which wlroots does for every data-control device
+  including the one that set it. Every offer follows the same bounded read path, and its SHA-256 identifies a publish
+  without assuming an order between clients. Echoes are suppressed by sequence numbers and committed hashes, never by
+  wall-clock comparisons, and clipboard payloads never touch the disk or the log.
 - Cold startup gives an existing Windows text selection priority, including a Windows change that arrives while the
   Wayland side is still initialising; the agent's startup snapshot pairs the sequence number with the text it read.
 - Text that cannot be delivered is queued, not dropped: a Sway selection made while the agent is unavailable is sent

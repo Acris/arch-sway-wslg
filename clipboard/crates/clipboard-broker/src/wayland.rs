@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -10,7 +10,6 @@ use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use clipboard_core::MAX_TEXT_BYTES;
-use clipboard_core::state::TextHash;
 use rustix::pipe::{PipeFlags, pipe_with};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{wl_registry, wl_seat};
@@ -52,12 +51,6 @@ pub enum WaylandEvent {
         generation: u64,
         error: Option<String>,
     },
-    /// The compositor announced the broker's own selection: the publish made
-    /// with `hash` is now what Sway holds.
-    Published {
-        generation: u64,
-        hash: TextHash,
-    },
     DeviceLost,
 }
 
@@ -73,9 +66,6 @@ pub struct WaylandState {
     // may still deliver `send` for those until it has seen the new selection.
     active_source: Option<ActiveSource>,
     retiring_sources: Vec<ActiveSource>,
-    // The compositor announces every selection back, our own included, in the
-    // order it processed them; the front entry names the next such announcement.
-    pending_publishes: VecDeque<TextHash>,
     // Only the newest selection is ever read; a newer one cancels this read.
     offer_read: Option<OfferRead>,
     transfer_slots: Arc<AtomicUsize>,
@@ -111,7 +101,6 @@ impl WaylandState {
             offers: HashMap::new(),
             active_source: None,
             retiring_sources: Vec::new(),
-            pending_publishes: VecDeque::new(),
             offer_read: None,
             transfer_slots: Arc::default(),
             sync_sensitive,
@@ -133,7 +122,6 @@ impl WaylandState {
     pub fn publish_text(
         &mut self,
         text: Vec<u8>,
-        hash: TextHash,
         qh: &QueueHandle<BrokerState>,
     ) -> Result<(), String> {
         let manager = self
@@ -149,7 +137,6 @@ impl WaylandState {
             source.offer((*mime).into());
         }
         device.set_selection(Some(&source));
-        self.pending_publishes.push_back(hash);
         // The previous source keeps serving until its `cancelled` arrives.
         if let Some(previous) = self.active_source.replace(ActiveSource {
             proxy: source,
@@ -185,7 +172,7 @@ impl WaylandState {
         mime: &str,
     ) {
         let info = self.offers.entry(offer.id()).or_default();
-        if SENSITIVE_MIME_TYPES.contains(&mime) {
+        if is_sensitive_mime(mime) {
             info.sensitive = true;
         }
         // MIME types and their parameters are case-insensitive; the X11 atoms in
@@ -316,6 +303,12 @@ impl WaylandState {
     }
 }
 
+fn is_sensitive_mime(mime: &str) -> bool {
+    SENSITIVE_MIME_TYPES
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(mime))
+}
+
 enum OfferProgress {
     Pending,
     Finished(Option<WaylandEvent>),
@@ -397,13 +390,6 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for Broker
                     .offers
                     .remove(&offer.id())
                     .unwrap_or_default();
-                // Our own text is not read back through a pipe: the announcement
-                // itself is the proof that the compositor took the publish.
-                if let Some(hash) = broker.wayland.pending_publishes.pop_front() {
-                    offer.destroy();
-                    broker.handle_wayland_event(WaylandEvent::Published { generation, hash });
-                    return;
-                }
                 broker.handle_wayland_event(WaylandEvent::SelectionStarted(generation));
                 let mime = info
                     .text_rank
@@ -482,5 +468,18 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for Broker
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sensitive_mime;
+
+    #[test]
+    fn kde_sensitive_hint_is_case_insensitive() {
+        assert!(is_sensitive_mime("application/x-kde-passwordManagerHint"));
+        assert!(is_sensitive_mime("APPLICATION/X-KDE-PASSWORDMANAGERHINT"));
+        assert!(is_sensitive_mime("X-KDE-PASSWORDMANAGERHINT"));
+        assert!(!is_sensitive_mime("application/x-private-selection"));
     }
 }

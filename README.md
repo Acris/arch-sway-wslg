@@ -78,7 +78,8 @@ cd arch-sway-wslg
 The installer asks about desktop entry masks, a browser, the output scale, and a backup, then installs the packages.
 Keyring unlocking and GTK appearance are asked afterwards, so the run needs attention again once the packages are in
 place. Existing configuration is replaced only after everything has been prepared and checked, so an interrupted run
-leaves it untouched. Review AUR PKGBUILDs shown by `paru` before accepting them.
+leaves it untouched. Declining the desktop entry masks leaves any existing same-named files unchanged; remove old masks
+as described under [Uninstalling](#uninstalling). Review AUR PKGBUILDs shown by `paru` before accepting them.
 
 The installer refreshes the package databases but does not upgrade the system. Arch does not support partial upgrades,
 so when the refresh shows that the system is behind, the installer says so and stops unless continuing is confirmed;
@@ -200,8 +201,9 @@ These directories are replaced (with `XDG_CONFIG_HOME` set, they live under it i
 ~/.config/yazi
 ```
 
-The browser chosen at install time is recorded in `~/.config/arch-sway-wslg/browser` and opens the links followed inside
-the session. Editing that file, which holds a single executable name, or exporting `BROWSER` changes it.
+The browser chosen at install time is recorded in `~/.config/arch-sway-wslg/browser` and exported as `BROWSER` inside
+the session for applications that honour it. Editing that file, which holds a single executable name, or exporting
+`BROWSER` changes the value.
 
 ## Clipboard
 
