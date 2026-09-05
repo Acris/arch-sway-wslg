@@ -22,6 +22,7 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 // A first start of the unsigned agent can sit in a security scan for a while;
 // counting that against the restart budget would take the clipboard down for good.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
+const PUBLICATION_TIMEOUT: Duration = Duration::from_secs(6);
 const WINDOWS_WRITE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,8 @@ pub(crate) struct BrokerState {
     wayland_ready: bool,
     latest_wayland_generation: u64,
     ever_synced: bool,
+    publication: Option<Publication>,
+    reading_selection: bool,
     slots: SyncSlots,
     // The Sway text the agent is writing right now, kept until its ACK so that a
     // refused or interrupted write can be queued again. After a refusal it stays
@@ -101,7 +104,14 @@ impl HashedText {
     }
 }
 
+struct Publication {
+    hash: TextHash,
+    synchronized: bool,
+    started: Instant,
+}
+
 struct WindowsWrite {
+    generation: u64,
     text: HashedText,
     retried: bool,
 }
@@ -198,12 +208,13 @@ fn observe_wayland_text(
     mirror: &mut MirrorState,
     slots: &mut SyncSlots,
     text: HashedText,
+    publication_hash: Option<&TextHash>,
 ) -> WaylandTextDisposition {
     if mirror.is_wayland_echo(&text.hash) {
         return WaylandTextDisposition::Duplicate;
     }
     mirror.observe_wayland(text.hash);
-    if mirror.is_windows_echo(&text.hash) {
+    if publication_hash == Some(&text.hash) || mirror.is_windows_echo(&text.hash) {
         WaylandTextDisposition::WindowsEcho
     } else {
         slots.wayland_text(text);
@@ -280,6 +291,8 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         wayland_ready: false,
         latest_wayland_generation: 0,
         ever_synced: false,
+        publication: None,
+        reading_selection: false,
         slots: SyncSlots::default(),
         in_flight: None,
         retry_scheduled: false,
@@ -351,6 +364,10 @@ impl BrokerState {
         match event {
             WaylandEvent::SelectionStarted(generation) => {
                 self.latest_wayland_generation = generation;
+                self.reading_selection = true;
+                // Keep the protocol ACK slot until the agent replies, but never
+                // retry or requeue a write from an older selection.
+                self.in_flight = None;
                 self.mirror.invalidate_wayland();
                 // A newer selection supersedes queued Sway text even while its
                 // offer is still being read.
@@ -365,8 +382,14 @@ impl BrokerState {
                         // Every offer is read, including the announcement of a
                         // selection this broker published. The text hash, not
                         // cross-client event order, identifies an echo.
-                        if observe_wayland_text(&mut self.mirror, &mut self.slots, text)
-                            == WaylandTextDisposition::WindowsEcho
+                        if observe_wayland_text(
+                            &mut self.mirror,
+                            &mut self.slots,
+                            text,
+                            self.publication
+                                .as_ref()
+                                .map(|publication| &publication.hash),
+                        ) == WaylandTextDisposition::WindowsEcho
                             && self.agent_ready
                         {
                             self.write_status(Health::Running, None);
@@ -382,6 +405,13 @@ impl BrokerState {
                     self.wayland_described();
                 }
             }
+            WaylandEvent::PublicationSynchronized => {
+                if let Some(publication) = self.publication.as_mut() {
+                    publication.synchronized = true;
+                }
+                self.finish_publication();
+                self.drain();
+            }
             WaylandEvent::DeviceLost => self.fail(BrokerError::EventLoop(
                 "ext-data-control device was removed".into(),
             )),
@@ -390,6 +420,8 @@ impl BrokerState {
 
     // Sway has described its selection, so its side can be served from now on.
     fn wayland_described(&mut self) {
+        self.reading_selection = false;
+        self.finish_publication();
         if !self.wayland_ready {
             self.wayland_ready = true;
             if self.agent_ready {
@@ -397,6 +429,19 @@ impl BrokerState {
             }
         }
         self.drain();
+    }
+
+    // A sync callback fences the selection announcements caused by our publish.
+    // Its current offer must also finish (or be rejected) before the next write.
+    fn finish_publication(&mut self) {
+        if !self.reading_selection
+            && self
+                .publication
+                .as_ref()
+                .is_some_and(|publication| publication.synchronized)
+        {
+            self.publication = None;
+        }
     }
 
     // Both sides have described their selection: the mirror is running.
@@ -476,7 +521,9 @@ impl BrokerState {
         self.agent_ready = false;
         self.slots.agent_lost();
         self.mirror.reset_windows_transport();
-        if let Some(write) = self.in_flight.take() {
+        if let Some(write) = self.in_flight.take()
+            && write.generation == self.latest_wayland_generation
+        {
             self.slots.requeue_windows_write(write.text);
         }
         self.degrade(&reason);
@@ -521,6 +568,16 @@ impl BrokerState {
     }
 
     fn heartbeat(&mut self) {
+        if self
+            .publication
+            .as_ref()
+            .is_some_and(|publication| publication.started.elapsed() >= PUBLICATION_TIMEOUT)
+        {
+            self.fail(BrokerError::EventLoop(
+                "Wayland publication confirmation timed out".into(),
+            ));
+            return;
+        }
         if self.agent.is_none() {
             return;
         }
@@ -625,7 +682,11 @@ impl BrokerState {
     // Delivery
 
     fn drain(&mut self) {
-        if !self.wayland_ready || !self.agent_ready || self.mirror.has_pending_windows_write() {
+        if !self.wayland_ready
+            || !self.agent_ready
+            || self.mirror.has_pending_windows_write()
+            || self.publication.is_some()
+        {
             return;
         }
         let Some(delivery) = self.slots.take() else {
@@ -657,8 +718,15 @@ impl BrokerState {
         }
         // The compositor serves the selection back through the ordinary offer
         // path, whose text hash commits it without relying on event order.
-        if let Err(error) = self.wayland.publish_text(text.text, &self.qh) {
-            self.degrade(&error);
+        match self.wayland.publish_text(text.text, &self.qh) {
+            Ok(()) => {
+                self.publication = Some(Publication {
+                    hash: text.hash,
+                    synchronized: false,
+                    started: Instant::now(),
+                })
+            }
+            Err(error) => self.degrade(&error),
         }
     }
 
@@ -676,7 +744,11 @@ impl BrokerState {
             hash: text.hash,
         };
         if sent {
-            self.in_flight = Some(WindowsWrite { text, retried });
+            self.in_flight = Some(WindowsWrite {
+                text,
+                retried,
+                generation: self.latest_wayland_generation,
+            });
         } else {
             self.slots.requeue_windows_write(text);
         }
@@ -689,6 +761,9 @@ impl BrokerState {
         let Some(mut write) = self.in_flight.take() else {
             return;
         };
+        if write.generation != self.latest_wayland_generation {
+            return;
+        }
         match write_failure(write.retried, &self.slots) {
             WriteFailure::Retry => {
                 write.retried = true;
@@ -727,6 +802,8 @@ impl BrokerState {
         if let Some(write) = self.in_flight.take()
             && self.agent_ready
             && self.slots.is_empty()
+            && self.publication.is_none()
+            && write.generation == self.latest_wayland_generation
         {
             self.forward_wayland_text(write.text, true);
         }
@@ -959,7 +1036,7 @@ mod tests {
         mirror.observe_windows(windows.hash, 7);
 
         assert_eq!(
-            observe_wayland_text(&mut mirror, &mut slots, text(b"external Sway text")),
+            observe_wayland_text(&mut mirror, &mut slots, text(b"external Sway text"), None),
             WaylandTextDisposition::Forwarded
         );
         // The later announcement supersedes the earlier queued selection before
@@ -967,9 +1044,179 @@ mod tests {
         slots.wayland_non_text();
         mirror.invalidate_wayland();
         assert_eq!(
-            observe_wayland_text(&mut mirror, &mut slots, windows),
+            observe_wayland_text(&mut mirror, &mut slots, windows, None),
             WaylandTextDisposition::WindowsEcho
         );
         assert_eq!(slots.take(), None);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    // Exercise the real event handlers without a compositor or a Windows agent.
+    fn state() -> (BrokerState, EventLoop<'static, BrokerState>, UnixStream) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let queue = connection.new_event_queue::<BrokerState>();
+        let event_loop = EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+        let state = BrokerState {
+            mode: ClipboardMode::Both,
+            mirror: MirrorState::default(),
+            wayland: WaylandState::new(handle.clone(), false),
+            qh: queue.handle(),
+            handle,
+            status: StatusWriter::new(
+                &std::env::temp_dir().join(format!(
+                    "clipboard-review-{}-{}",
+                    std::process::id(),
+                    std::thread::current().name().unwrap_or("test")
+                )),
+                "both",
+            )
+            .unwrap(),
+            agent_executable: PathBuf::from("/nonexistent-agent"),
+            agent: None,
+            agent_pid: None,
+            agent_ready: true,
+            agent_started: Instant::now(),
+            agent_restarts: 0,
+            restart_scheduled: false,
+            last_agent_response: Instant::now(),
+            wayland_ready: true,
+            latest_wayland_generation: 1,
+            ever_synced: true,
+            publication: None,
+            reading_selection: false,
+            slots: SyncSlots::default(),
+            in_flight: None,
+            retry_scheduled: false,
+            fatal: None,
+            stop: event_loop.get_signal(),
+        };
+        (state, event_loop, server)
+    }
+
+    fn publication(state: &mut BrokerState) {
+        let hash = MirrorState::hash(b"A");
+        state.mirror.observe_windows(hash, 10);
+        state.publication = Some(Publication {
+            hash,
+            synchronized: false,
+            started: Instant::now(),
+        });
+    }
+
+    #[test]
+    fn publication_holds_newer_windows_text_until_sync_and_readback() {
+        for sync_first in [false, true] {
+            let (mut state, _event_loop, _server) = state();
+            publication(&mut state);
+            let mut newer = Frame::new(MessageKind::WindowsText);
+            newer.sequence = 11;
+            newer.payload = b"B".to_vec();
+            state.handle_agent_frame(newer);
+            assert!(!state.mirror.windows_changed_since(10));
+            state.handle_wayland_event(WaylandEvent::SelectionStarted(2));
+            if sync_first {
+                state.handle_wayland_event(WaylandEvent::PublicationSynchronized);
+                assert!(state.publication.is_some());
+            }
+            // Stop delivery after confirmation so the queued B can be inspected.
+            state.agent_ready = false;
+            state.handle_wayland_event(WaylandEvent::Text {
+                generation: 2,
+                text: b"A".to_vec(),
+            });
+            assert!(state.slots.to_windows.is_none());
+            if !sync_first {
+                assert!(state.publication.is_some());
+                state.handle_wayland_event(WaylandEvent::PublicationSynchronized);
+            }
+            assert!(state.publication.is_none());
+            assert_eq!(
+                state.slots.take(),
+                Some(Delivery::ToWayland(WindowsSelection::Text(
+                    HashedText::new(b"B".to_vec()),
+                    11
+                )))
+            );
+            assert!(state.mirror.is_wayland_echo(&MirrorState::hash(b"A")));
+        }
+    }
+
+    #[test]
+    fn publication_echo_survives_windows_transport_state_change() {
+        let (mut state, _event_loop, _server) = state();
+        publication(&mut state);
+        state.mirror.observe_windows(MirrorState::hash(b"B"), 11);
+        state.handle_wayland_event(WaylandEvent::SelectionStarted(2));
+        state.handle_wayland_event(WaylandEvent::Text {
+            generation: 2,
+            text: b"A".to_vec(),
+        });
+        assert!(state.slots.to_windows.is_none());
+    }
+
+    #[test]
+    fn superseding_non_text_selection_finishes_publication_after_sync() {
+        let (mut state, _event_loop, _server) = state();
+        publication(&mut state);
+        state.handle_wayland_event(WaylandEvent::SelectionStarted(2));
+        state.handle_wayland_event(WaylandEvent::SelectionStarted(3));
+        state.handle_wayland_event(WaylandEvent::PublicationSynchronized);
+        state.handle_wayland_event(WaylandEvent::Unusable {
+            generation: 3,
+            error: None,
+        });
+        assert!(state.publication.is_none());
+        assert!(state.slots.is_empty());
+    }
+
+    #[test]
+    fn new_selection_cancels_refused_text_before_and_after_error() {
+        for refusal_first in [false, true] {
+            let (mut state, _event_loop, _server) = state();
+            let text = HashedText::new(b"old".to_vec());
+            let pending = state.mirror.begin_windows_write(text.hash);
+            state.in_flight = Some(WindowsWrite {
+                generation: 1,
+                text,
+                retried: false,
+            });
+            let mut refusal = Frame::new(MessageKind::SetWindowsError);
+            refusal.request_id = pending.request_id;
+            if refusal_first {
+                state.handle_agent_frame(refusal.clone());
+                assert!(state.in_flight.is_some());
+            }
+            state.handle_wayland_event(WaylandEvent::SelectionStarted(2));
+            // This also covers slow offers: cancellation happens before reading.
+            assert!(state.in_flight.is_none());
+            if !refusal_first {
+                state.handle_agent_frame(refusal);
+            }
+            state.handle_wayland_event(WaylandEvent::Unusable {
+                generation: 2,
+                error: None,
+            });
+            state.retry_windows_write();
+            assert!(state.in_flight.is_none());
+            assert!(state.slots.is_empty());
+            assert!(!state.mirror.has_pending_windows_write());
+        }
+    }
+
+    #[test]
+    fn stalled_publication_has_a_bounded_failure() {
+        let (mut state, _event_loop, _server) = state();
+        publication(&mut state);
+        state.publication.as_mut().unwrap().started = Instant::now() - PUBLICATION_TIMEOUT;
+        state.heartbeat();
+        assert!(matches!(state.fatal, Some(BrokerError::EventLoop(_))));
     }
 }

@@ -218,6 +218,9 @@ with the session.
 - Line endings are converted: text arriving in Windows uses CRLF, text arriving in Sway uses LF, and a lone CR becomes a
   line break on the way.
 
+Rapid updates are serialized through Sway publication and readback so an older echo cannot replace newer Windows text.
+A newer Sway selection cancels retries of older text, including when the new selection cannot be shared.
+
 Sharing is event driven and normally completes immediately. Nothing is installed on the Windows side, no window appears
 there, and focus is never taken. Sway 1.11 or newer is required. `arch-sway-wslg status` shows whether sharing is
 working.
@@ -279,6 +282,9 @@ Image previews are rendered through Sixel. The
 project does not edit shell startup files.
 
 ## Updating
+
+Before replacing files, the installer confirms that the managed session scope has stopped. If its state cannot be
+queried, installation stops; restore access to the user manager and retry.
 
 ```bash
 git pull --ff-only

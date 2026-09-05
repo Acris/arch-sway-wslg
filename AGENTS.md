@@ -133,6 +133,7 @@ bash -n install.sh
 bash -n .local/bin/arch-sway-wslg
 shellcheck -S warning install.sh .local/bin/arch-sway-wslg
 git diff --check
+bash tests/install-session.sh
 cd clipboard
 cargo fmt --all -- --check
 cargo test --workspace

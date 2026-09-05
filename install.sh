@@ -477,13 +477,26 @@ store_oo7_credential() {
 # -----------------------------------------------------------------------------
 # Session protection
 # -----------------------------------------------------------------------------
+# Query the authority directly: launcher status also fails when the bus is
+# unreachable, which must never be mistaken for permission to replace files.
+managed_session_running() {
+    local state
+    state="$(systemctl_user show --property=ActiveState --value "${NAME}-session.scope")" || \
+        die "cannot determine managed session state; restore the systemd user manager connection and retry"
+    case "$state" in
+        inactive|failed) return 1 ;;
+        active|activating|deactivating|reloading|refreshing|maintenance) return 0 ;;
+        *) die "cannot determine managed session state: ${state:-empty response}" ;;
+    esac
+}
+
 stop_active_session() {
-    local installed_launcher="$LOCAL_BIN_DIR/$NAME" status_output
+    local installed_launcher="$LOCAL_BIN_DIR/$NAME"
 
-    [[ -x "$installed_launcher" ]] || return 0
-    status_output="$("$installed_launcher" status 2>&1)" || return 0
+    managed_session_running || return 0
+    [[ -x "$installed_launcher" ]] || \
+        die "managed session is running but its launcher is missing; stop ${NAME}-session.scope before installing"
 
-    note "$status_output"
     prompt_yes_no "A managed Sway session is running. Stop it before installing?" yes || \
         die "installation cannot replace launcher files while Sway is running"
     "$installed_launcher" stop || die "failed to stop the managed Sway session"
@@ -494,15 +507,13 @@ stop_active_session() {
 # choices all have to describe the same installation. A long package update
 # therefore never blocks another terminal from starting Sway.
 take_control_lock() {
-    local installed_launcher="$LOCAL_BIN_DIR/$NAME"
-
     mkdir -p "$STATE_HOME/$NAME"
     chmod 700 "$STATE_HOME/$NAME"
     exec 8>"$CONTROL_LOCK_FILE"
     flock -w "$CONTROL_LOCK_TIMEOUT" 8 || \
         die "another $NAME command has held the control lock for more than ${CONTROL_LOCK_TIMEOUT}s"
 
-    if [[ -x "$installed_launcher" ]] && "$installed_launcher" status >/dev/null 2>&1; then
+    if managed_session_running; then
         die "a managed Sway session started while the installer was preparing; stop it and retry"
     fi
 }

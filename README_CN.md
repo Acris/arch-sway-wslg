@@ -200,6 +200,8 @@ include 机制，属于完全托管，因此请将个人版本存放在托管目
 - 空选区不会被共享，因此一侧清空或丢失剪贴板时，另一侧保持原样。
 - 换行符会被转换：送往 Windows 的文本使用 CRLF，送往 Sway 的文本使用 LF，单独的 CR 在传输中会变成换行。
 
+连续更新会依次完成向 Sway 发布和回读，避免旧回声覆盖较新的 Windows 文本。新的 Sway 选区会取消旧文本的重试，即使新选区无法共享。
+
 共享由事件驱动，通常会立即完成。Windows 侧不会安装任何东西，不会出现窗口，也不会抢占焦点。需要 Sway 1.11 或更高版本。执行
 `arch-sway-wslg status` 可查看共享是否正常工作。
 
@@ -254,6 +256,8 @@ paru -S --needed ffmpeg poppler resvg imagemagick     # 丰富预览
 启动文件，必须手动添加 [Yazi shell wrapper](https://yazi-rs.github.io/docs/quick-start/#shell-wrapper)。
 
 ## 更新
+
+替换文件前，安装程序会确认托管会话的 scope 已停止。如果无法查询状态，安装将终止；请恢复用户管理器连接后重试。
 
 ```bash
 git pull --ff-only

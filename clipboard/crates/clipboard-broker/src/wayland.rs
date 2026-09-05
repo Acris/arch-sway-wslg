@@ -12,7 +12,7 @@ use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use clipboard_core::MAX_TEXT_BYTES;
 use rustix::pipe::{PipeFlags, pipe_with};
 use wayland_client::backend::ObjectId;
-use wayland_client::protocol::{wl_registry, wl_seat};
+use wayland_client::protocol::{wl_callback, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
@@ -51,6 +51,7 @@ pub enum WaylandEvent {
         generation: u64,
         error: Option<String>,
     },
+    PublicationSynchronized,
     DeviceLost,
 }
 
@@ -137,6 +138,15 @@ impl WaylandState {
             source.offer((*mime).into());
         }
         device.set_selection(Some(&source));
+        // Fence the resulting selection events without a blocking roundtrip.
+        // The broker keeps delivery serialized until the current offer is read.
+        let connection = Connection::from_backend(
+            device
+                .backend()
+                .upgrade()
+                .ok_or("Wayland connection is gone")?,
+        );
+        connection.display().sync(qh, ());
         // The previous source keeps serving until its `cancelled` arrives.
         if let Some(previous) = self.active_source.replace(ActiveSource {
             proxy: source,
@@ -339,6 +349,21 @@ impl Dispatch<wl_registry::WlRegistry, ()> for BrokerState {
                 _ => return,
             }
             broker.wayland.initialize_device(qh);
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for BrokerState {
+    fn event(
+        broker: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            broker.handle_wayland_event(WaylandEvent::PublicationSynchronized);
         }
     }
 }
