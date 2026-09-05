@@ -1,50 +1,134 @@
 # AGENTS.md
 
-## Project overview
+## Scope and project
 
-`arch-sway-wslg` installs a Wayland-first Sway session that runs as a nested compositor in Arch Linux on WSL2/WSLg. It
-is not a bare-metal Sway distribution. A supported environment has WSLg, systemd with a working user manager, and a
-normal default user with `sudo` and `paru`. The installer neither checks nor changes locales.
+These instructions apply throughout this repository. Inspect `git status --short` before editing, preserve unrelated
+changes, and do not commit unless asked. Preserve the behavioral contracts below unless the user explicitly changes
+them; implementations may change freely within those contracts.
 
-`README.md` is the user-facing contract: install, use, customise, update, uninstall, troubleshoot. It describes
-behaviour the user can observe and stays free of implementation detail. Keep `README_CN.md` section-for-section
-equivalent with it and update the English document first. Contributor material lives here and in
-`clipboard/README.md`; do not put it into the user documents.
+`arch-sway-wslg` installs a nested, Wayland-first Sway session on Arch Linux under WSL2/WSLg. It requires systemd with
+a working user manager and a normal default user with `sudo` and `paru`. Do not add bare-metal, non-systemd, or
+other-distribution fallbacks. The installer neither checks nor changes locales.
 
-The project uses CalVer `YYYY.M.RELEASE`: the release counter starts at `1` for the first release in each month and
-increments for subsequent releases in that month. Keep this policy consistent in `VERSION` and both READMEs.
+## Repository map
 
-## Repository layout
+| Path | Responsibility |
+| --- | --- |
+| `install.sh` | Package lists, prompts, oo7 setup, backups, payload staging/replacement, GSettings |
+| `.local/bin/arch-sway-wslg` | Lifecycle launcher, `status`, `doctor`, `logs`, internal clipboard startup |
+| `.config/` | Managed Sway, Waybar, SwayNC, swaynag, Foot, Fuzzel, and Yazi configuration |
+| `.local/libexec/arch-sway-wslg/` | Checked-in Linux broker, Windows agent, and `clipboard.sha256` |
+| `clipboard/crates/clipboard-core/` | Shared protocol, text normalization, and echo-suppression state |
+| `clipboard/crates/clipboard-broker/` | Linux Wayland transport, synchronization, agent supervision |
+| `clipboard/crates/clipboard-agent-win/` | Native Windows clipboard access |
+| `clipboard/README.md` | Clipboard validation and exact release-payload rebuild commands |
+| `extras/desktop-overrides/` | Optional desktop-entry masks |
+| `.github/workflows/clipboard.yml` | Linux/Windows checks and builds; verifies payload, uploads nothing |
+| `VERSION`, `README.md`, `README_CN.md`, `LICENSE` | Release, user documentation, project and wallpaper notices |
 
-| Path                             | Contents                                                                    |
-|----------------------------------|-----------------------------------------------------------------------------|
-| `install.sh`                     | Prompts, package lists, oo7 setup, backups, payload staging, and GSettings  |
-| `.local/bin/arch-sway-wslg`      | Public launcher: session lifecycle, `status`, `doctor`, and `logs`          |
-| `.local/libexec/arch-sway-wslg/` | Prebuilt Linux clipboard broker, Win32 agent, and `clipboard.sha256`        |
-| `clipboard/`                     | Rust workspace for the clipboard data plane; see `clipboard/README.md`      |
-| `.config/`                       | Configuration payload installed into the user's configuration home          |
-| `extras/desktop-overrides/`      | Optional desktop entry masks                                                |
-| `.github/workflows/`             | CI for the Rust workspace; verifies the checked-in payload, uploads nothing |
-| `VERSION`                        | Release version rendered into the installed launcher                        |
-| `LICENSE`                        | Project and wallpaper notices                                               |
+Package lists live in `install.sh`; do not duplicate transitive dependencies. Configuration and launcher files contain
+installation markers such as `__ARCH_SWAY_WSLG_VERSION__`: edit the templates, preserving staged rendering.
 
-There is no separate package manifest: the package lists live in `install.sh`, and dependencies pacman resolves on its
-own are not listed. The installer replaces markers such as `__ARCH_SWAY_WSLG_VERSION__` in the staged payload, so the
-files under `.config/` and `.local/` are templates rather than the installed result.
+## Installer and managed configuration
 
-## Setup commands
+- Run installation as the normal user; delegate packages to `paru`. Preflight installation prerequisites, including
+  paru's. Refresh package databases without upgrading installed packages; confirm when the system is behind.
+- Preserve the single browser prompt, installed-browser detection, and recorded `BROWSER` choice; choosing none clears
+  the record. Skip package installation for browsers already installed. Ask once for scale `1`–`4`, default `1`;
+  do not infer Windows scaling from WSLg.
+- Keep oo7 user-unit setup and optional encrypted user credentials, using the user manager's configuration home and
+  skipping credentials on older systemd. Bind every bus call explicitly to the persistent user bus.
+- Finish prompts and package work before taking the control lock. Hold it through backup, payload replacement, browser
+  recording, and GSettings; never hold it across `paru`.
+- Stage the whole payload on the destination filesystems, preserve overrides, render markers, and check required files,
+  launcher syntax, executables, and clipboard checksums before replacing anything. Clean staging on every exit.
+- `replace_path` moves the old path aside and restores it if the new path's rename fails. Replacement is per path,
+  **not an atomic transaction across the installation**. Keep the default-yes timestamped backup and `RESTORE-INFO.txt`
+  as the documented recovery route. Helpers called in conditions must explicitly propagate every write failure.
+- Support absolute `XDG_CONFIG_HOME`, including spaces and dollar signs; reject paths Sway cannot express. Validate
+  destructive targets against the resolved per-user roots. Never remove user-owned overrides or WSLg-owned paths.
+- Preserve and seed these user extension points, read last: `sway/config.d/*.conf`, `foot/local.ini`, `fuzzel/local.ini`,
+  `waybar/local.css`, `swaync/local.css`. Both CSS overrides must always exist or GTK discards the importing stylesheet.
+- Keep Waybar/SwayNC layouts, swaynag, and Yazi fully managed. Declining desktop-entry masks leaves existing files alone.
+  Apply approved GSettings only after payload replacement, then read them back.
+- Prefer upstream sizes; retain deliberate font, color, and pill styling. Remove settings that merely repeat upstream
+  defaults. Where no default exists, use common Sway conventions and multiples of four. Start Sway children directly;
+  `swaybar_command` accepts no shell syntax.
+- Sway expands variables when parsing each use: late overrides can add or rebind settings, but cannot retune values
+  already consumed. Do not promise otherwise in documentation.
 
-- Shell checks need `bash` and `shellcheck`; on a non-Arch host use a disposable Arch container (see below).
-- Rust checks need the stable toolchain with `clippy` and `rustfmt`, plus the `x86_64-pc-windows-msvc` target.
-- Rebuilding the Windows agent needs `cargo-xwin`: `cargo install cargo-xwin --locked`.
-- There is no automated end-to-end WSLg test and no Sway configuration validation; do not add either unless asked.
+## WSLg lifecycle
 
-## Testing instructions
+- Treat `arch-sway-wslg-session.scope` as authoritative session state; use Sway IPC for messages and readiness.
+- Use `/run/user/$UID` and explicitly bind `/run/user/$UID/bus`. Address WSLg through
+  `/mnt/wslg/runtime-dir/wayland-0` and `/mnt/wslg/PulseServer`. Never publish nested activation environments to the
+  shared bus or persistent user manager; session children inherit their environment directly.
+- Use sudo only for the private X11 mount namespace, immediately returning managed processes to the normal user.
+  Preserve WSLg's `/tmp/.X11-unix` mapping and lazy XWayland startup. Do not hard-code `/mnt/c` paths.
+- Override inherited environment only where the session must own it; fill toolkit/browser defaults only when unset.
+  Validate both `--outputs` and `ARCH_SWAY_WSLG_OUTPUTS` as counts from one through four.
+- Keep `status` and `doctor` read-only: no sudo, control lock, or mutations. Keep command lists aligned with launcher
+  and Sway usage; probe both clipboard binaries and report shared-bus names without guessing ownership. Media commands
+  supplied only by dependencies are advisory. `logs` must work without systemd, the bus, or a running session.
+- Bound all waits, including locks, user-bus calls, WSLg, IPC, and shutdown. Portal scope is GTK file choosers in separate
+  WSLg windows; Flatpak integration, screenshot/screen-sharing portals, moving WSLg windows, and automatic WSLg recovery
+  are out of scope.
 
-Run every command below and report the results. All of them must pass; `shellcheck -S warning` and Clippy must stay
-clean. The only intentional ShellCheck `-S info` findings are `SC1003` and `SC2016`.
+## Windows clipboard bridge
+
+- The Linux broker connects directly to nested Sway's `ext-data-control-v1`; one persistent Win32 agent uses the native
+  clipboard API and a message-only window. They communicate through inherited pipes, never the parent Wayland socket.
+  Nothing is installed on Windows; clipboard contents stay in memory and never enter files or logs.
+- Forward UTF-8 plain text only, at most 16 MiB. Reject malformed text, embedded NUL, and empty/unreadable selections
+  without clearing the other clipboard. Exclude the KDE password-manager sensitivity hint unless
+  `ARCH_SWAY_WSLG_SYNC_SENSITIVE=1`; do not claim arbitrary sensitivity detection. Normalize line endings in one pass:
+  CRLF toward Windows, LF toward Sway, lone CR treated as a line break.
+- Preserve `SyncSlots` serialization and `MirrorState` sequence/hash echo suppression. Commit Windows writes after ACK;
+  commit Wayland publishes when announced and read back through the same bounded offer path. Never rely on timing or
+  client order. Keep replaced sources serving pending paste requests until canceled.
+- Give existing Windows text priority at startup, including changes during Wayland initialization. The agent's startup
+  snapshot must pair the sequence number with the text it read. Queue undelivered text, retry refused access once, and
+  let newer selections supersede retries. Agent restarts must not overwrite a Windows change with stale Sway text.
+- `degraded` indicates transport failure. Rejected selections and superseded writes do not degrade health; a second
+  refusal of the same text degrades health only if no newer selection has superseded it. Rewrite status only when its
+  content changes.
+- Bound frames, allocations, transfers, Hello, heartbeats, restarts, and shutdown; reset restart budgets after stable
+  operation. Fail immediately after registry discovery if `ext_data_control_manager_v1` or a seat is missing; treat
+  Hello/heartbeat timeouts and exhausted restart budgets as errors. Keep `BrokerError::exit_code` aligned with launcher
+  `RestartPreventExitStatus`: permanent failures exit `3`, a vanished data-control device exits `1`, and compositor
+  disconnection exits cleanly.
+- Sway invokes only `__start_clipboard`; the broker runs as a transient user service bound to the session scope.
+  Close the agent's stdin first, wait a bounded grace period, then kill if needed and reap it on every broker exit.
+- Any frame layout change (including the 28-byte header or payload layout), or message-set change, requires a
+  `PROTOCOL_VERSION` bump. After any clipboard workspace change, rebuild and replace **both** release binaries and
+  regenerate/verify `clipboard.sha256` using `clipboard/README.md`. Never leave checked-in payloads built from older
+  source.
+
+## Code style and documentation
+
+- Target current Arch Bash with `set -Eeuo pipefail`, `umask 077`, four-space indentation, quoted expansions, arrays,
+  `[[ ... ]]`, and function-local variables. Match surrounding comments and explain why.
+- Use stable Rust, edition 2024. Keep platform APIs in `wayland.rs` and `windows.rs`, shared logic in `clipboard-core`,
+  and Win32 unsafe blocks small. Reuse `clipboard/crates/clipboard-broker/src/io.rs` for bounded pipe I/O; set each
+  descriptor nonblocking once when acquired.
+- Update user-visible behavior in `README.md` first, then keep `README_CN.md` section-for-section equivalent. Keep
+  contributor details here or in `clipboard/README.md`; remove stale documentation.
+- Use CalVer `YYYY.M.RELEASE`, starting at `1` each month. Package-list changes require a `VERSION` bump and matching
+  uninstall lists in both READMEs.
+- When a commit is authorized, always use Conventional Commits: `<type>[optional scope]: <imperative description>`,
+  lowercase after the colon, no trailing period, at most 72 characters. Types: `feat`, `fix`, `refactor`, `perf`, `docs`,
+  `style`, `chore`.
+  Explain why in a wrapped body; mark broken contracts with `!` or a `BREAKING CHANGE:` footer and migration action.
+
+## Setup and validation
+
+Use Arch Bash/ShellCheck, a C compiler/linker (Arch `base-devel`), and stable Rust with `rustfmt`, `clippy`,
+and target `x86_64-pc-windows-msvc`.
+Rebuilding the Windows payload also needs `cargo install cargo-xwin --locked`; build the Linux payload on Linux.
+Run every check below and report results, including blockers, before finishing or opening a PR:
 
 ```bash
+# From the repository root, on Arch Linux:
 bash -n install.sh
 bash -n .local/bin/arch-sway-wslg
 shellcheck -S warning install.sh .local/bin/arch-sway-wslg
@@ -56,11 +140,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check -p clipboard-agent-win --target x86_64-pc-windows-msvc
 ```
 
-On a non-Arch host run the shell checks in a disposable Arch container. Pacman's download user has to be disabled
-inside that container, and only there:
+On a non-Arch host, run shell checks in a disposable Arch container (explicit x86-64 also supports ARM hosts):
 
 ```bash
-docker run --rm -v "$PWD:/workspace:ro" -w /workspace archlinux:latest bash -lc '
+docker run --rm --platform linux/amd64 -v "$PWD:/workspace:ro" -w /workspace archlinux:latest bash -lc '
+  set -eu
   bash -n install.sh
   bash -n .local/bin/arch-sway-wslg
   sed -i "s/^#\?DownloadUser.*/#DownloadUser = alpm/" /etc/pacman.conf
@@ -68,167 +152,8 @@ docker run --rm -v "$PWD:/workspace:ro" -w /workspace archlinux:latest bash -lc 
   shellcheck -S warning install.sh .local/bin/arch-sway-wslg'
 ```
 
-Whenever any Rust file under `clipboard/` changes, rebuild both release binaries, replace the files under
-`.local/libexec/arch-sway-wslg/`, regenerate `clipboard.sha256`, and run `sha256sum -c` before finishing. The exact
-commands are in `clipboard/README.md`. Never leave a payload built from older source in the worktree.
-
-## Behavioural contracts
-
-Implementations may change freely as long as these hold. Preserve them unless the user changes them explicitly.
-
-### Session
-
-- Systemd and its user manager are required; there is no fallback for a session without them.
-- `arch-sway-wslg-session.scope` is the authoritative session state. Sway IPC only carries messages and readiness.
-- The session runtime is `/run/user/$UID`. The parent Wayland socket is `/mnt/wslg/runtime-dir/wayland-0` and the audio
-  endpoint is `/mnt/wslg/PulseServer`, both addressed by absolute path.
-- The session shares the persistent user bus at `/run/user/$UID/bus`, because Arch activates services such as the Secret
-  Service through the systemd user manager. Bind that address explicitly in every launcher and installer bus call, and
-  publish nothing back to the bus or the user manager: the session's own children inherit the nested values already.
-- Sudo is used only to create the private X11 mount namespace. Never alter WSLg's `/tmp/.X11-unix` mapping; managed
-  processes return to the normal user immediately, and XWayland stays lazy.
-- Override an inherited environment value only where the session must own it. Toolkit, Java, VS Code and browser
-  defaults are filled in only when the user has set nothing.
-- Validate the nested output count wherever it enters, `--outputs` and `ARCH_SWAY_WSLG_OUTPUTS` alike; one through four
-  outputs are supported, and an inherited count never reaches the compositor unchecked.
-- Keep `status` and `doctor` truthful, and keep both of them observers: they never ask for sudo, take the control lock,
-  or change anything, because the installer also runs `status` while holding that lock. `doctor` covers the commands the
-  session needs, the applications the Sway configuration starts, and both clipboard binaries, and it reports names on
-  the shared bus as they are instead of inferring who owns them. A command no installed package provides directly is
-  reported without failing the check.
-- `logs` reads an ordinary file, and a session that refuses to start is exactly when it is needed, so it must not depend
-  on systemd, the bus, or any other part of the session.
-- Bound every wait around systemd, the user bus, WSLg, IPC, locks, and the clipboard.
-- Portal support is limited to GTK file choosers shown as separate WSLg windows. Flatpak integration, screenshot
-  portals, screen sharing, moving WSLg windows, and recovering automatically after WSLg itself fails are out of scope.
-
-### Installer
-
-- Run as the normal user and delegate package changes to `paru`. Preflight the commands an installation run depends on,
-  `paru`'s own included; it is not an audit of every call the script makes.
-- Refresh the package databases only; upgrading installed packages belongs to the user's own schedule. Arch does not
-  support partial upgrades, so ask for confirmation when the refresh shows the installed system is behind.
-- Ask for a browser once, mark the ones already installed, do not reinstall those, record the choice for `BROWSER`, and
-  remove a previously recorded choice when the user declines a browser.
-- When `oo7` is present, enable and start its user unit and offer to store the keyring password as an encrypted systemd
-  user credential, resolved against the user manager's own configuration home and skipped on older systemd.
-- Accept an absolute `XDG_CONFIG_HOME`, including spaces and dollar signs, and render the resolved paths into the staged
-  payload. Reject a configuration root the Sway configuration cannot express instead of mangling it.
-- Ask once for a scale from `1` to `4`, defaulting to `1`. Do not try to detect Windows scaling: WSLg performs it on the
-  Windows side and reports a scale of 1.
-- Stage and check the whole payload on the same filesystem before replacing any managed directory, and remove the
-  staging directories on every exit, an interrupt included. The check covers the files the session cannot start without,
-  the imported override stylesheets among them. Preserve the user override paths and seed them on a first installation.
-  Declining the optional desktop-entry masks leaves any existing same-named files unchanged.
-- Report a failed write instead of continuing: a helper called in a condition runs without `errexit`, so every step in
-  it reports its own failure.
-- Offer a timestamped backup on every run, default to yes, and keep it the single documented way back: it replaces the
-  removed rollback machinery.
-- Apply approved GSettings through the explicitly bound persistent user bus after the payload commits, then read the
-  values back.
-- Take the control lock once the questions and the package installation are done, and hold it to the end of the run: the
-  backup, the replacement and the recorded choices have to describe one installation. Never hold it across `paru`.
-
-### Clipboard
-
-- Synchronise UTF-8 plain text only; images, HTML, and file lists are out of scope. Text over 16 MiB, malformed UTF-8,
-  embedded NUL, and empty selections are never forwarded: an empty or unreadable selection on one side leaves the other
-  side untouched. Selections carrying the KDE password-manager sensitivity hint stay excluded unless the user opts in
-  with `ARCH_SWAY_WSLG_SYNC_SENSITIVE=1`. Do not claim detection of arbitrary hints.
-- Line endings are normalised in one pass: CRLF towards Windows, LF towards Sway, a lone CR becomes a line break. The
-  conversion is documented in the READMEs; keep them in step.
-- The Linux broker talks directly to Sway's `ext-data-control-v1` protocol and the single persistent Win32 agent uses
-  the native Windows clipboard API; neither direction visits the parent WSLg Wayland socket, and the agent creates only
-  a message-only window. Nothing is installed on the Windows side.
-- The broker fails fast instead of waiting forever: a compositor without `ext_data_control_manager_v1` or a seat, an
-  agent that never sends `Hello` within `HELLO_TIMEOUT`, a missed heartbeat, and an exhausted restart budget are all
-  errors. Failures another start would only repeat (a configuration error, a compositor without the globals, an
-  exhausted restart budget) exit with status `3`, which the launcher lists in `RestartPreventExitStatus` so the
-  clipboard stays down for the rest of the session instead of cycling; a vanished data-control device exits `1` and is
-  retried within the unit's start limit; the compositor closing the connection (Sway exiting) is a clean exit. Keep
-  `BrokerError::exit_code` and the launcher property in step.
-- Both directions are serialised in the broker state machine with `SyncSlots` (one pending text per direction) and
-  `MirrorState` (echo suppression). A Windows write commits only after its request ACK. A Wayland publish commits when
-  the compositor announces and serves the selection back to it, which wlroots does for every data-control device
-  including the one that set it. Every offer follows the same bounded read path, and its SHA-256 identifies a publish
-  without assuming an order between clients. Echoes are suppressed by sequence numbers and committed hashes, never by
-  wall-clock comparisons, and clipboard payloads never touch the disk or the log.
-- Cold startup gives an existing Windows text selection priority, including a Windows change that arrives while the
-  Wayland side is still initialising; the agent's startup snapshot pairs the sequence number with the text it read.
-- Text that cannot be delivered is queued, not dropped: a Sway selection made while the agent is unavailable is sent
-  once it is back, a refused Windows write is retried once after a short delay unless a newer selection on either side
-  has superseded it, and an agent restart cannot push an old Sway selection over a Windows change made while it was
-  unavailable. The agent likewise reads a Windows update it could not open once more before reporting the selection
-  unavailable.
-- `degraded` means a transport failure (agent or Wayland). Rejecting a single selection, and a refused write that a
-  newer selection replaces anyway, is logged but does not change the health; only the second refusal of the same text
-  does. The status file under the clipboard state directory is rewritten only when its content changes.
-- Bound clipboard access, IPC payloads, heartbeats, transfers, shutdown, and restarts. The restart budget resets after
-  stable operation. A replaced data source keeps serving `send` requests until the compositor cancels it, so a paste
-  that races a new copy never receives empty data.
-- Sway starts only the short-lived internal launcher command (`__start_clipboard`) that knows the nested display. The
-  broker itself is a transient systemd user service bound to the session scope, and the Win32 agent exits when its
-  inherited pipe closes: shutdown closes the agent's stdin first, waits a bounded grace period, and only then kills.
-  The broker reaps the agent the same way before it exits itself, whichever way its loop ended.
-- The agent pipe carries length-prefixed frames with a 28-byte header (`PROTOCOL_VERSION` in `clipboard-core`). Any
-  change to the frame layout or message set must bump the version, and both binaries must be rebuilt and deployed
-  together. The installer refuses a payload that fails `clipboard.sha256`, and `doctor` runs `--probe` on both binaries.
-
-### Configuration
-
-- The user extension points are `sway/config.d/*.conf`, `foot/local.ini`, `fuzzel/local.ini`, `waybar/local.css`, and
-  `swaync/local.css`. Preserve them, seed them once, and keep them read last so the user's values win. GTK drops a whole
-  stylesheet whose import is missing, so the two CSS files have to exist after every installation.
-- The Waybar and SwayNC layouts, swaynag, and Yazi stay fully managed, because their include behaviour cannot offer a
-  safe extension point; only the two stylesheets take overrides.
-- Sizes are the upstream defaults of each component. Fonts, colours, and the bar's pill styling are the deliberate
-  deviations; a value that only restates an upstream default is dropped instead of repeated. Where upstream states no
-  default, follow common Sway configurations and prefer multiples of four so fractional output scales stay on whole
-  pixels.
-- Start Sway's children directly. `swaybar_command` is executed without a shell, so it takes no shell syntax, and
-  nothing publishes an activation environment: on the shared user bus that would outlive the session.
-- Sway expands a variable while it parses the line that uses it, so `config.d` can add and re-bind, but it cannot retune
-  a value the managed configuration has already consumed. Do not document it as if it could.
-- This project does not validate Sway configuration; runtime errors belong in the managed session log.
-
-## Code style
-
-- Target the Bash that current Arch ships, not POSIX `sh` or the Bash on macOS. Keep `set -Eeuo pipefail` and
-  `umask 077` in every script.
-- Use four-space indentation, quoted expansions, arrays for argument lists, `[[ ... ]]` for tests, and `local` variables
-  in functions. Prefer built-ins and small, targeted `grep` and `sed` calls.
-- Match the surrounding comment density and explain why, not what.
-- Keep the compatibility surface small: no code for unsupported distributions or shells, and no fixed `/mnt/c` paths.
-- Rust targets stable edition 2024. Keep platform APIs behind target-specific modules (`wayland.rs`, `windows.rs`),
-  share protocol, text, and state logic through `clipboard-core`, deny Clippy warnings in validation, bound every
-  allocation derived from IPC, and keep `unsafe` Win32 blocks as small as practical.
-- Bounded pipe I/O goes through `clipboard-broker/src/io.rs`; do not add a second deadline helper. Its callers make a
-  descriptor non-blocking once, when they obtain it, rather than per call.
-
-## Safety
-
-- Before a destructive operation, validate the exact target and derive paths from the fixed per-user state, runtime, and
-  configuration roots.
-- Never remove or recreate paths that belong to WSLg or to the user's own configuration.
-- Do not commit unless the user asks.
-
-## Change checklist
-
-- Inspect the worktree first and preserve unrelated changes.
-- Keep the launcher's command lists aligned with what `start`, `stop`, the clipboard, and `doctor` really use.
-- After changing anything under `clipboard/`, rebuild both binaries and refresh `clipboard.sha256` as described in
-  "Testing instructions".
-- Bump `VERSION` when the package list changes, and update the uninstall list in both READMEs at the same time.
-- Update `README.md` for user-visible behaviour first, then translate it into `README_CN.md`. Delete stale documentation
-  instead of describing behaviour the code no longer has, and keep implementation detail out of both.
-- Preserve the contracts above unless the user changes them explicitly, and report the validation commands you ran.
-
-## PR instructions
-
-- Use Conventional Commits: `<type>[optional scope]: <imperative description>`, lower case after the colon, no trailing
-  period, and no more than 72 characters in the subject.
-- The project types are `feat`, `fix`, `refactor`, `perf`, `docs`, `style`, and `chore`; scopes follow the affected
-  subsystem, for example `installer` or `clipboard`.
-- Explain why in a wrapped body. Mark a broken contract with `!` or a `BREAKING CHANGE:` footer that states the action
-  the user has to take.
-- Run the full "Testing instructions" list before opening a pull request and mention the results.
+Disable pacman's download user only inside that container. Run broker checks on Linux; with a read-only repository
+mount, set `CARGO_TARGET_DIR` to a writable container directory. ShellCheck warnings and Clippy must stay clean;
+the only intentional ShellCheck info findings are `SC1003` and `SC2016`. There is no automated WSLg end-to-end test or
+Sway configuration validation; do not add either unless asked. Sway configuration runtime errors belong in the managed
+session log. Report runtime validation separately from static checks.
