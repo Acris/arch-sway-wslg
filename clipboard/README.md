@@ -26,7 +26,8 @@ cargo check -p clipboard-agent-win --target x86_64-pc-windows-msvc
 
 The repository carries both release binaries under
 `.local/libexec/arch-sway-wslg/`; users never build them. After changing
-anything in this workspace, install the stable Rust toolchain and `cargo-xwin`
+anything in this workspace, install the toolchain pinned in
+`rust-toolchain.toml` (rustup does so on first use) and `cargo-xwin`
 (`cargo install cargo-xwin --locked`), then run from the repository root:
 
 ```bash
@@ -41,9 +42,24 @@ install -m 0755 clipboard/target/x86_64-pc-windows-msvc/release/arch-sway-wslg-c
 (cd .local/libexec/arch-sway-wslg && \
   sha256sum arch-sway-wslg-clipboard arch-sway-wslg-clipboard-agent.exe > clipboard.sha256 && \
   sha256sum -c clipboard.sha256)
+.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard --probe
+.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard-agent.exe --probe
 ```
 
-The GitHub Actions workflow runs the checks, builds both targets, and verifies
-the checked-in payload against `clipboard.sha256`, but it does not upload
-artifacts or write back to the repository. Commit the rebuilt binaries and the
-checksum together.
+The two probe lines must be identical apart from the program name. Each build
+script (`build-support/source_digest.rs`) embeds a SHA-256 digest of every
+`.rs`, `.toml`, and `Cargo.lock` file in this workspace, ignoring carriage
+returns, and `--probe` prints it as `source=`. The digest identifies the
+source, not the bytes: linker output is not reproducible, so a rebuild may
+change the binary checksums without changing the digest.
+
+The GitHub Actions workflow runs on every change. It runs the shell checks and
+the installer tests in an Arch container, runs the checks above, builds both
+targets, and fails when the checked-in binaries do not match
+`clipboard.sha256` or report a different digest than a build of the current
+tree. It does not upload artifacts or write back to the repository. Commit the
+rebuilt binaries and the checksum together.
+
+A change to the frame layout or the message set, including a new flag such as
+`TEXT_SENSITIVE`, requires a `PROTOCOL_VERSION` bump; `arch-sway-wslg doctor`
+reports a broker and agent that disagree.

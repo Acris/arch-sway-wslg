@@ -64,7 +64,7 @@ SESSION_OUTPUTS="${ARCH_SWAY_WSLG_OUTPUTS:-1}"
 
 # Everything the managed session cannot start without, minus what a minimal Arch
 # install already provides through util-linux, coreutils and systemd. The
-# The clipboard data plane is bundled, so only its systemd launcher belongs in
+# clipboard data plane is bundled, so only its systemd launcher belongs in
 # the external command list.
 SESSION_COMMANDS=(sway Xwayland swaymsg systemd-run sudo timeout)
 
@@ -126,8 +126,53 @@ systemd_user_usable() {
     systemctl_user show-environment >/dev/null 2>&1
 }
 
+# Prints the scope's ActiveState and fails when the manager cannot say. The
+# installer applies the same classification: only inactive and failed mean the
+# session is gone, so a scope still deactivating keeps its name and its files.
+session_scope_state() {
+    local state
+    state="$(systemctl_user show --property=ActiveState --value "$SESSION_SCOPE" 2>/dev/null)" || \
+        return 1
+    case "$state" in
+        inactive|failed|active|activating|deactivating|reloading|refreshing|maintenance)
+            printf '%s\n' "$state"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# An unknown state is never read as stopped: callers remove session files or
+# start a scope of the same name once this reports the session gone.
 session_scope_active() {
-    systemctl_user is-active --quiet "$SESSION_SCOPE" >/dev/null 2>&1
+    local state
+    state="$(session_scope_state)" || \
+        die "cannot determine the state of $SESSION_SCOPE; check the systemd user manager and retry"
+    [[ "$state" != inactive && "$state" != failed ]]
+}
+
+# Bounded wait until the scope has fully left the manager, not merely begun to
+# deactivate. A transient bus failure keeps waiting instead of ending early.
+wait_for_scope_gone() {
+    local deadline=$((SECONDS + $1)) state
+
+    while (( SECONDS < deadline )); do
+        if state="$(session_scope_state)" && [[ "$state" == inactive || "$state" == failed ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+# Everything started from inside Sway shares its scope, so stopping the session
+# from there also terminates the caller before it can do anything afterwards.
+running_inside_session() {
+    local cgroup_file="${1:-/proc/self/cgroup}" line
+    [[ -r "$cgroup_file" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" == */"$SESSION_SCOPE" || "$line" == */"$SESSION_SCOPE"/* ]] && return 0
+    done < "$cgroup_file"
+    return 1
 }
 
 session_requirements() {
@@ -320,9 +365,8 @@ cleanup_session_state() {
     rm -rf -- "$X11_PRIVATE_DIR" "$CLIPBOARD_STATE_DIR"
 }
 
-# Destructive, so it must never run while the session is alive. An unreachable
-# bus reports the scope as inactive, which is why every caller goes through
-# ensure_dirs first: that dies when the bus cannot be reached at all.
+# Destructive, so it must never run while the session is alive.
+# session_scope_active dies instead of guessing when the state is unknown.
 cleanup_stale_state() {
     if ! session_scope_active; then
         stop_clipboard_service
@@ -476,11 +520,15 @@ run_session() {
 }
 
 wait_for_start() {
-    local deadline=$((SECONDS + START_TIMEOUT)) scope_seen=0
+    local deadline=$((SECONDS + START_TIMEOUT)) scope_seen=0 state
 
     while (( SECONDS < deadline )); do
         ipc_ready && return 0
-        if session_scope_active; then
+        # An unknown state is neither progress nor failure; the deadline bounds it.
+        state="$(session_scope_state)" || state=unknown
+        if [[ "$state" == unknown ]]; then
+            :
+        elif [[ "$state" != inactive && "$state" != failed ]]; then
             scope_seen=1
         elif (( scope_seen )); then
             return 1
@@ -497,6 +545,8 @@ cleanup_failed_start() {
     local deadline
     stop_clipboard_service
     systemctl_user stop "$SESSION_SCOPE" >/dev/null 2>&1 || true
+    wait_for_scope_gone "$STOP_TIMEOUT" || \
+        warn "$SESSION_SCOPE has not finished stopping; check '$NAME status' before starting again"
     if [[ "$NAMESPACE_LAUNCH_PID" =~ ^[0-9]+$ ]] && \
        kill -0 "$NAMESPACE_LAUNCH_PID" 2>/dev/null; then
         kill -TERM "$NAMESPACE_LAUNCH_PID" 2>/dev/null || true
@@ -514,7 +564,7 @@ cleanup_failed_start() {
 # `start` and `status` describe the same running session, so both report it the
 # same way. Only reached with the session scope active.
 report_running_session() {
-    note "Systemd scope: active ($SESSION_SCOPE)"
+    note "Systemd scope: $(session_scope_state || printf 'unknown') ($SESSION_SCOPE)"
     note "D-Bus: $USER_BUS_ADDRESS (shared user bus)"
     if ipc_ready; then
         note "IPC: ready ($SWAYSOCK_PATH)"
@@ -592,52 +642,56 @@ stop_session() {
         return 0
     fi
 
-    local deadline
     note "Stopping Sway..."
 
     if ipc_ready; then
         swaymsg -s "$SWAYSOCK_PATH" exit >/dev/null 2>&1 || true
 
-        deadline=$((SECONDS + STOP_TIMEOUT))
-        while (( SECONDS < deadline )); do
-            if ! session_scope_active; then
-                stop_clipboard_service
-                cleanup_session_state
-                note "Sway stopped."
-                return 0
-            fi
-            sleep 0.1
-        done
+        # Sway leaving IPC is not enough: the scope keeps its name and its
+        # remaining processes until it is inactive, and only then may the
+        # installer or a new start take over.
+        if wait_for_scope_gone "$STOP_TIMEOUT"; then
+            stop_clipboard_service
+            cleanup_session_state
+            note "Sway stopped."
+            return 0
+        fi
     fi
 
     warn "Sway did not exit cleanly; stopping its systemd scope."
     systemctl_user stop "$SESSION_SCOPE" >/dev/null 2>&1 || true
-    if session_scope_active; then
+    wait_for_scope_gone "$STOP_TIMEOUT" || \
         die "systemd scope is still active after its stop timeout: $SESSION_SCOPE"
-    fi
     stop_clipboard_service
     cleanup_session_state
     note "Sway stopped."
 }
 
 # Observation only. Removing stale state here would race a start that has not
-# entered its scope yet, and the installer calls this while holding the control
-# lock, so it must neither take that lock nor change anything.
+# entered its scope yet, so it must neither take the control lock nor change
+# anything.
 status_session() {
+    local state
     systemd_user_usable || \
         die "systemd user runtime is unavailable: $SYSTEMD_RUNTIME_DIR"
+    state="$(session_scope_state)" || \
+        die "cannot determine the state of $SESSION_SCOPE"
 
-    if ! session_scope_active; then
-        note "Sway: stopped"
-        return 1
-    fi
-
-    note "Sway: running"
+    case "$state" in
+        inactive|failed)
+            note "Sway: stopped"
+            return 1
+            ;;
+        active) note "Sway: running" ;;
+        *) note "Sway: $state" ;;
+    esac
     report_running_session
 }
 
 restart_session() {
     parse_session_options "$@"
+    running_inside_session && \
+        die "restart stops the session this command runs in; run it from a WSL terminal outside Sway"
     session_requirements
     stop_session
     start_session --outputs "$SESSION_OUTPUTS"
@@ -650,8 +704,19 @@ show_logs() {
     exec tail -F "$LOG_FILE"
 }
 
+# Prints one `key=value` field of a `--probe` line.
+probe_field() {
+    local line="$1" wanted="$2" word
+    for word in $line; do
+        [[ "$word" == "$wanted="* ]] || continue
+        printf '%s\n' "${word#*=}"
+        return 0
+    done
+    return 1
+}
+
 doctor() {
-    local failed=0 cmd path_launcher bus_names=""
+    local failed=0 cmd path_launcher bus_names="" broker_probe="" agent_probe=""
     parse_outputs "$SESSION_OUTPUTS"
     note "Sway WSLg launcher diagnostics"
     note "-----------------------------"
@@ -757,7 +822,7 @@ doctor() {
 
     if [[ -x "$CLIPBOARD_BROKER" ]]; then
         note "OK   clipboard broker: $CLIPBOARD_BROKER"
-        if timeout 5s "$CLIPBOARD_BROKER" --probe >/dev/null 2>&1; then
+        if broker_probe="$(timeout 5s "$CLIPBOARD_BROKER" --probe 2>/dev/null)"; then
             note "OK   clipboard broker probe"
         else
             note "FAIL clipboard broker probe failed"
@@ -768,7 +833,7 @@ doctor() {
         failed=1
     fi
     if [[ -x "$CLIPBOARD_AGENT" ]]; then
-        if timeout 5s "$CLIPBOARD_AGENT" --probe >/dev/null 2>&1; then
+        if agent_probe="$(timeout 5s "$CLIPBOARD_AGENT" --probe 2>/dev/null | tr -d '\r')"; then
             note "OK   Windows clipboard agent: $CLIPBOARD_AGENT"
         else
             note "FAIL Windows clipboard agent cannot run through WSL interop: $CLIPBOARD_AGENT"
@@ -777,6 +842,19 @@ doctor() {
     else
         note "FAIL Windows clipboard agent is missing or not executable: $CLIPBOARD_AGENT"
         failed=1
+    fi
+    # Both binaries print the protocol they speak and the source digest they
+    # were built from; a pair from different builds cannot talk reliably.
+    if [[ -n "$broker_probe" && -n "$agent_probe" ]]; then
+        if [[ "$(probe_field "$broker_probe" protocol || true)" != "$(probe_field "$agent_probe" protocol || printf 'unknown')" ]]; then
+            note "FAIL clipboard broker and Windows agent speak different protocol versions"
+            failed=1
+        elif [[ "$(probe_field "$broker_probe" source || true)" != "$(probe_field "$agent_probe" source || printf 'unknown')" ]]; then
+            note "FAIL clipboard broker and Windows agent were built from different sources"
+            failed=1
+        else
+            note "OK   clipboard binaries match (protocol $(probe_field "$broker_probe" protocol))"
+        fi
     fi
 
     if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then

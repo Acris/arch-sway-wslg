@@ -77,9 +77,11 @@ cd arch-sway-wslg
 
 The installer asks about desktop entry masks, a browser, the output scale, and a backup, then installs the packages.
 Keyring unlocking and GTK appearance are asked afterwards, so the run needs attention again once the packages are in
-place. Existing configuration is replaced only after everything has been prepared and checked, so an interrupted run
-leaves it untouched. Declining the desktop entry masks leaves any existing same-named files unchanged; remove old masks
-as described under [Uninstalling](#uninstalling). Review AUR PKGBUILDs shown by `paru` before accepting them.
+place. Existing configuration is replaced only after everything has been prepared and checked, and Ctrl+C is held back
+while the paths are swapped; each path is replaced on its own, so the backup is the way back. On later runs the browser
+question defaults to the recorded choice. Declining the desktop entry masks leaves any existing same-named files
+unchanged; remove old masks as described under [Uninstalling](#uninstalling). Review AUR PKGBUILDs shown by `paru`
+before accepting them.
 
 The installer refreshes the package databases but does not upgrade the system. Arch does not support partial upgrades,
 so when the refresh shows that the system is behind, the installer says so and stops unless continuing is confirmed;
@@ -211,8 +213,11 @@ Text copied in Sway can be pasted in Windows, and text copied in Windows can be 
 with the session.
 
 - Only plain text is shared: images, HTML, and file lists are not.
-- Selections carrying KDE's password-manager sensitivity hint are skipped by default. Other private sensitivity hints
-  cannot be detected.
+- Selections carrying KDE's password-manager sensitivity hint in Sway, or the Windows clipboard formats password
+  managers set (`ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`, or
+  `CanIncludeInClipboardHistory` set to 0), are skipped by default. Other private sensitivity hints cannot be detected.
+- With `ARCH_SWAY_WSLG_SYNC_SENSITIVE=1`, such text is shared but keeps its hint: in Windows it stays out of the
+  clipboard history and cloud clipboard.
 - Text larger than 16 MiB, malformed Unicode, and text containing an embedded NUL are rejected.
 - An empty selection is not shared, so clearing or losing the clipboard on one side leaves the other side as it was.
 - Line endings are converted: text arriving in Windows uses CRLF, text arriving in Sway uses LF, and a lone CR becomes a
@@ -283,8 +288,10 @@ project does not edit shell startup files.
 
 ## Updating
 
-Before replacing files, the installer confirms that the managed session scope has stopped. If its state cannot be
-queried, installation stops; restore access to the user manager and retry.
+Run the installer from a WSL terminal outside Sway: it has to stop the session, which would end a terminal inside it,
+so it refuses to run there. The same applies to `arch-sway-wslg restart`. Before replacing files, the installer
+confirms that the managed session scope has stopped. If its state cannot be queried, installation stops; restore access
+to the user manager and retry.
 
 ```bash
 git pull --ff-only
@@ -292,8 +299,8 @@ git pull --ff-only
 ```
 
 An update can add packages, so answer the installer's questions again, then run `arch-sway-wslg restart`. Every run
-offers a timestamped backup of the managed files before replacing them; backups include `RESTORE-INFO.txt` and are never
-deleted automatically.
+offers a timestamped backup of the managed files before replacing them; backups include `RESTORE-INFO.txt`, which lists
+one ready-to-paste restore command per path and the previous GTK values, and are never deleted automatically.
 
 `arch-sway-wslg version` prints the installed release. Releases use the calendar-based `YYYY.M.RELEASE` format:
 `RELEASE` starts at `1` for the first release in a month and increments for later releases in that month, so `2026.9.1`

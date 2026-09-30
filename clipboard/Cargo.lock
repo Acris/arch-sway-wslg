@@ -63,6 +63,7 @@ name = "clipboard-agent-win"
 version = "0.1.0"
 dependencies = [
  "clipboard-core",
+ "sha2",
  "thiserror",
  "windows-sys",
 ]
@@ -75,6 +76,7 @@ dependencies = [
  "calloop-wayland-source",
  "clipboard-core",
  "rustix",
+ "sha2",
  "thiserror",
  "wayland-client",
  "wayland-protocols",

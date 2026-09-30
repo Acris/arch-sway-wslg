@@ -11,6 +11,10 @@ const MAX_CONTROL_BYTES: usize = 1024;
 pub const HELLO_HAS_TEXT: u32 = 1;
 /// The agent could not obtain a stable startup snapshot.
 pub const HELLO_READ_ERROR: u32 = 1 << 1;
+/// The text carries a password-manager hint. On `Hello` and `WindowsText` the
+/// Windows clipboard marked it; on `SetWindowsText` the agent marks it so that
+/// Windows keeps it out of clipboard history, cloud sync and other monitors.
+pub const TEXT_SENSITIVE: u32 = 1 << 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]

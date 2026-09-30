@@ -80,9 +80,10 @@ installation markers such as `__ARCH_SWAY_WSLG_VERSION__`: edit the templates, p
   clipboard API and a message-only window. They communicate through inherited pipes, never the parent Wayland socket.
   Nothing is installed on Windows; clipboard contents stay in memory and never enter files or logs.
 - Forward UTF-8 plain text only, at most 16 MiB. Reject malformed text, embedded NUL, and empty/unreadable selections
-  without clearing the other clipboard. Exclude the KDE password-manager sensitivity hint unless
-  `ARCH_SWAY_WSLG_SYNC_SENSITIVE=1`; do not claim arbitrary sensitivity detection. Normalize line endings in one pass:
-  CRLF toward Windows, LF toward Sway, lone CR treated as a line break.
+  without clearing the other clipboard. Exclude the KDE password-manager hint and the documented Windows exclusion
+  formats unless `ARCH_SWAY_WSLG_SYNC_SENSITIVE=1`; when shared, carry the hint across with `TEXT_SENSITIVE` so Windows
+  keeps the text out of history and cloud sync. Do not claim arbitrary sensitivity detection. Normalize line endings in
+  one pass: CRLF toward Windows, LF toward Sway, lone CR treated as a line break.
 - Preserve `SyncSlots` serialization and `MirrorState` sequence/hash echo suppression. Commit Windows writes after ACK;
   commit Wayland publishes when announced and read back through the same bounded offer path. Never rely on timing or
   client order. Keep replaced sources serving pending paste requests until canceled.
@@ -122,8 +123,8 @@ installation markers such as `__ARCH_SWAY_WSLG_VERSION__`: edit the templates, p
 
 ## Setup and validation
 
-Use Arch Bash/ShellCheck, a C compiler/linker (Arch `base-devel`), and stable Rust with `rustfmt`, `clippy`,
-and target `x86_64-pc-windows-msvc`.
+Use Arch Bash/ShellCheck, a C compiler/linker (Arch `base-devel`), and the Rust release pinned in
+`clipboard/rust-toolchain.toml` with `rustfmt`, `clippy`, and target `x86_64-pc-windows-msvc`.
 Rebuilding the Windows payload also needs `cargo install cargo-xwin --locked`; build the Linux payload on Linux.
 Run every check below and report results, including blockers, before finishing or opening a PR:
 
@@ -131,7 +132,8 @@ Run every check below and report results, including blockers, before finishing o
 # From the repository root, on Arch Linux:
 bash -n install.sh
 bash -n .local/bin/arch-sway-wslg
-shellcheck -S warning install.sh .local/bin/arch-sway-wslg
+bash -n tests/install-session.sh
+shellcheck -S warning -x install.sh .local/bin/arch-sway-wslg tests/install-session.sh
 git diff --check
 bash tests/install-session.sh
 cd clipboard
@@ -150,7 +152,8 @@ docker run --rm --platform linux/amd64 -v "$PWD:/workspace:ro" -w /workspace arc
   bash -n .local/bin/arch-sway-wslg
   sed -i "s/^#\?DownloadUser.*/#DownloadUser = alpm/" /etc/pacman.conf
   pacman -Sy --noconfirm shellcheck >/dev/null
-  shellcheck -S warning install.sh .local/bin/arch-sway-wslg'
+  shellcheck -S warning -x install.sh .local/bin/arch-sway-wslg tests/install-session.sh
+  bash tests/install-session.sh'
 ```
 
 Disable pacman's download user only inside that container. Run broker checks on Linux; with a read-only repository

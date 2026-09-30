@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, LoopSignal};
 use calloop_wayland_source::WaylandSource;
-use clipboard_core::protocol::{Frame, HELLO_HAS_TEXT, HELLO_READ_ERROR, MessageKind};
+use clipboard_core::protocol::{
+    Frame, HELLO_HAS_TEXT, HELLO_READ_ERROR, MessageKind, TEXT_SENSITIVE,
+};
 use clipboard_core::state::{MirrorState, TextHash};
 use clipboard_core::text::validate_utf8;
 use thiserror::Error;
@@ -18,7 +20,7 @@ use crate::status::{Health, StatusWriter};
 use crate::wayland::{WaylandEvent, WaylandState};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 // A first start of the unsigned agent can sit in a security scan for a while;
 // counting that against the restart budget would take the clipboard down for good.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
@@ -62,6 +64,7 @@ pub struct BrokerConfig {
 
 pub(crate) struct BrokerState {
     mode: ClipboardMode,
+    sync_sensitive: bool,
     mirror: MirrorState,
     pub(crate) wayland: WaylandState,
     qh: QueueHandle<BrokerState>,
@@ -86,21 +89,34 @@ pub(crate) struct BrokerState {
     // here until the retry timer fires or something newer supersedes it.
     in_flight: Option<WindowsWrite>,
     retry_scheduled: bool,
+    // The Sway text whose transfer to the agent failed once already. A second
+    // failure of the same text drops it instead of spending the restart budget.
+    failed_transfer: Option<TextHash>,
     fatal: Option<BrokerError>,
     stop: LoopSignal,
 }
 
-/// A text and its digest, computed once when the text enters the broker.
+/// A text and its digest, computed once when the text enters the broker, and
+/// whether its source marked it with a password-manager hint.
 #[derive(Debug, Eq, PartialEq)]
 struct HashedText {
     text: Vec<u8>,
     hash: TextHash,
+    sensitive: bool,
 }
 
 impl HashedText {
     fn new(text: Vec<u8>) -> Self {
+        Self::with_sensitivity(text, false)
+    }
+
+    fn with_sensitivity(text: Vec<u8>, sensitive: bool) -> Self {
         let hash = MirrorState::hash(&text);
-        Self { text, hash }
+        Self {
+            text,
+            hash,
+            sensitive,
+        }
     }
 }
 
@@ -275,6 +291,7 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
 
     let mut state = BrokerState {
         mode: config.mode,
+        sync_sensitive: config.sync_sensitive,
         mirror: MirrorState::default(),
         wayland: WaylandState::new(handle.clone(), config.sync_sensitive),
         qh,
@@ -296,6 +313,7 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         slots: SyncSlots::default(),
         in_flight: None,
         retry_scheduled: false,
+        failed_transfer: None,
         fatal: None,
         stop: event_loop.get_signal(),
     };
@@ -373,12 +391,17 @@ impl BrokerState {
                 // offer is still being read.
                 self.slots.wayland_non_text();
             }
-            WaylandEvent::Text { generation, text } => {
+            WaylandEvent::Text {
+                generation,
+                text,
+                sensitive,
+            } => {
                 if generation != self.latest_wayland_generation {
                     return;
                 }
                 match accept_wayland_text(text) {
-                    Ok(text) => {
+                    Ok(mut text) => {
+                        text.sensitive = sensitive;
                         // Every offer is read, including the announcement of a
                         // selection this broker published. The text hash, not
                         // cross-client event order, identifies an echo.
@@ -524,7 +547,7 @@ impl BrokerState {
         if let Some(write) = self.in_flight.take()
             && write.generation == self.latest_wayland_generation
         {
-            self.slots.requeue_windows_write(write.text);
+            self.requeue_after_transport_failure(write.text);
         }
         self.degrade(&reason);
         if self.restart_scheduled {
@@ -559,7 +582,12 @@ impl BrokerState {
             return false;
         };
         match agent.send(frame) {
-            Ok(()) => true,
+            // A large write can keep the loop busy for seconds; the agent read
+            // all of it, so that time is not silence.
+            Ok(()) => {
+                self.last_agent_response = Instant::now();
+                true
+            }
             Err(error) => {
                 self.lose_agent(format!("Windows clipboard agent write failed: {error}"));
                 false
@@ -602,12 +630,20 @@ impl BrokerState {
             MessageKind::WindowsText | MessageKind::WindowsUnavailable
                 if self.mode == ClipboardMode::Both =>
             {
-                let selection =
-                    if frame.kind == MessageKind::WindowsText && !frame.payload.is_empty() {
-                        WindowsSelection::Text(HashedText::new(frame.payload), frame.sequence)
-                    } else {
-                        WindowsSelection::Unavailable(frame.sequence)
-                    };
+                let sensitive = frame.flags & TEXT_SENSITIVE != 0;
+                // A hinted Windows text is treated like a non-text selection:
+                // it stays out of Sway without clearing Sway's clipboard.
+                let selection = if frame.kind == MessageKind::WindowsText
+                    && !frame.payload.is_empty()
+                    && (self.sync_sensitive || !sensitive)
+                {
+                    WindowsSelection::Text(
+                        HashedText::with_sensitivity(frame.payload, sensitive),
+                        frame.sequence,
+                    )
+                } else {
+                    WindowsSelection::Unavailable(frame.sequence)
+                };
                 self.slots.windows_selection(selection);
                 self.drain();
             }
@@ -617,6 +653,7 @@ impl BrokerState {
                     .commit_windows_write(frame.request_id, frame.sequence)
                 {
                     self.in_flight = None;
+                    self.failed_transfer = None;
                     self.slots.windows_write_committed(frame.sequence);
                     self.write_status(Health::Running, None);
                     self.drain();
@@ -641,6 +678,7 @@ impl BrokerState {
     fn handle_hello(&mut self, frame: Frame) {
         let has_text = frame.flags & HELLO_HAS_TEXT != 0;
         let read_error = frame.flags & HELLO_READ_ERROR != 0;
+        let sensitive = frame.flags & TEXT_SENSITIVE != 0;
         let pid = u32::try_from(frame.request_id).ok();
         if pid.is_none()
             || self.agent_ready
@@ -653,7 +691,8 @@ impl BrokerState {
         self.agent_pid = pid;
         self.agent_ready = true;
         let sequence = frame.sequence;
-        let text = (has_text && !frame.payload.is_empty()).then(|| HashedText::new(frame.payload));
+        let text = (has_text && !frame.payload.is_empty() && (self.sync_sensitive || !sensitive))
+            .then(|| HashedText::with_sensitivity(frame.payload, sensitive));
         let windows_changed = self.mirror.windows_changed_since(sequence)
             || text
                 .as_ref()
@@ -718,7 +757,10 @@ impl BrokerState {
         }
         // The compositor serves the selection back through the ordinary offer
         // path, whose text hash commits it without relying on event order.
-        match self.wayland.publish_text(text.text, &self.qh) {
+        match self
+            .wayland
+            .publish_text(text.text, text.sensitive, &self.qh)
+        {
             Ok(()) => {
                 self.publication = Some(Publication {
                     hash: text.hash,
@@ -737,11 +779,15 @@ impl BrokerState {
         let pending = self.mirror.begin_windows_write(text.hash);
         let mut frame = Frame::new(MessageKind::SetWindowsText);
         frame.request_id = pending.request_id;
+        if text.sensitive {
+            frame.flags |= TEXT_SENSITIVE;
+        }
         frame.payload = text.text;
         let sent = self.send_frame(&frame);
         let text = HashedText {
             text: frame.payload,
             hash: text.hash,
+            sensitive: text.sensitive,
         };
         if sent {
             self.in_flight = Some(WindowsWrite {
@@ -750,8 +796,19 @@ impl BrokerState {
                 generation: self.latest_wayland_generation,
             });
         } else {
-            self.slots.requeue_windows_write(text);
+            self.requeue_after_transport_failure(text);
         }
+    }
+
+    // A text that fails to reach the agent twice is dropped: queueing it again
+    // would only spend the restart budget on the same write, whereas a newer
+    // selection still gets its own two attempts.
+    fn requeue_after_transport_failure(&mut self, text: HashedText) {
+        if transfer_already_failed(&mut self.failed_transfer, text.hash) {
+            self.reject("dropped a Sway selection after two failed transfers to Windows");
+            return;
+        }
+        self.slots.requeue_windows_write(text);
     }
 
     // Win32 refuses the clipboard while another process holds it open, which is
@@ -871,6 +928,17 @@ fn startup_windows_selection(
     }
 }
 
+/// Records a failed transfer of `hash` and reports whether it had failed before.
+fn transfer_already_failed(failed: &mut Option<TextHash>, hash: TextHash) -> bool {
+    if *failed == Some(hash) {
+        *failed = None;
+        true
+    } else {
+        *failed = Some(hash);
+        false
+    }
+}
+
 fn write_failure(retried: bool, slots: &SyncSlots) -> WriteFailure {
     if !slots.is_empty() {
         WriteFailure::Superseded
@@ -892,7 +960,7 @@ mod tests {
     use super::{
         Delivery, HashedText, SyncSlots, WaylandTextDisposition, WindowsSelection, WriteFailure,
         accept_wayland_text, observe_wayland_text, sequence_is_newer, startup_windows_selection,
-        write_failure,
+        transfer_already_failed, write_failure,
     };
 
     fn text(bytes: &[u8]) -> HashedText {
@@ -901,6 +969,20 @@ mod tests {
 
     fn windows_text(bytes: &[u8], sequence: u32) -> WindowsSelection {
         WindowsSelection::Text(text(bytes), sequence)
+    }
+
+    #[test]
+    fn same_text_is_dropped_after_its_second_transfer_failure() {
+        let mut failed = None;
+        let first = MirrorState::hash(b"large");
+        let second = MirrorState::hash(b"newer");
+        assert!(!transfer_already_failed(&mut failed, first));
+        assert!(transfer_already_failed(&mut failed, first));
+        // The drop resets the record, so a later copy of it gets two attempts.
+        assert!(!transfer_already_failed(&mut failed, first));
+        // A different text replaces the record instead of inheriting it.
+        assert!(!transfer_already_failed(&mut failed, second));
+        assert!(!transfer_already_failed(&mut failed, first));
     }
 
     #[test]
@@ -1066,6 +1148,7 @@ mod regression_tests {
         let handle = event_loop.handle();
         let state = BrokerState {
             mode: ClipboardMode::Both,
+            sync_sensitive: false,
             mirror: MirrorState::default(),
             wayland: WaylandState::new(handle.clone(), false),
             qh: queue.handle(),
@@ -1095,6 +1178,7 @@ mod regression_tests {
             slots: SyncSlots::default(),
             in_flight: None,
             retry_scheduled: false,
+            failed_transfer: None,
             fatal: None,
             stop: event_loop.get_signal(),
         };
@@ -1131,6 +1215,7 @@ mod regression_tests {
             state.handle_wayland_event(WaylandEvent::Text {
                 generation: 2,
                 text: b"A".to_vec(),
+                sensitive: false,
             });
             assert!(state.slots.to_windows.is_none());
             if !sync_first {
@@ -1158,8 +1243,62 @@ mod regression_tests {
         state.handle_wayland_event(WaylandEvent::Text {
             generation: 2,
             text: b"A".to_vec(),
+            sensitive: false,
         });
         assert!(state.slots.to_windows.is_none());
+    }
+
+    #[test]
+    fn hinted_windows_text_stays_out_of_sway_unless_enabled() {
+        for sync_sensitive in [false, true] {
+            let (mut state, _event_loop, _server) = state();
+            state.sync_sensitive = sync_sensitive;
+            // Hold delivery so the queued selection can be inspected.
+            state.agent_ready = false;
+            let mut frame = Frame::new(MessageKind::WindowsText);
+            frame.sequence = 5;
+            frame.flags = TEXT_SENSITIVE;
+            frame.payload = b"password".to_vec();
+            state.handle_agent_frame(frame);
+            let expected = if sync_sensitive {
+                WindowsSelection::Text(HashedText::with_sensitivity(b"password".to_vec(), true), 5)
+            } else {
+                WindowsSelection::Unavailable(5)
+            };
+            assert_eq!(state.slots.take(), Some(Delivery::ToWayland(expected)));
+        }
+    }
+
+    #[test]
+    fn hinted_sway_text_keeps_its_hint_toward_windows() {
+        let (mut state, _event_loop, _server) = state();
+        state.agent_ready = false;
+        state.handle_wayland_event(WaylandEvent::SelectionStarted(2));
+        state.handle_wayland_event(WaylandEvent::Text {
+            generation: 2,
+            text: b"secret text".to_vec(),
+            sensitive: true,
+        });
+        assert_eq!(
+            state.slots.take(),
+            Some(Delivery::ToWindows(HashedText::with_sensitivity(
+                b"secret text".to_vec(),
+                true
+            )))
+        );
+    }
+
+    #[test]
+    fn failed_transfer_of_the_same_text_is_requeued_only_once() {
+        let (mut state, _event_loop, _server) = state();
+        state.agent_ready = false;
+        state.requeue_after_transport_failure(HashedText::new(b"big".to_vec()));
+        assert_eq!(
+            state.slots.take(),
+            Some(Delivery::ToWindows(HashedText::new(b"big".to_vec())))
+        );
+        state.requeue_after_transport_failure(HashedText::new(b"big".to_vec()));
+        assert!(state.slots.is_empty());
     }
 
     #[test]

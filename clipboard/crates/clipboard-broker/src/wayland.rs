@@ -32,6 +32,8 @@ const SENSITIVE_MIME_TYPES: [&str; 2] = [
     "application/x-kde-passwordManagerHint",
     "x-kde-passwordManagerHint",
 ];
+// What KDE's clipboard and password managers serve for the hint.
+const SENSITIVE_HINT_VALUE: &[u8] = b"secret";
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_ACTIVE_TRANSFERS: usize = 8;
 // A replaced source is kept until the compositor cancels it. Two publishes in
@@ -45,6 +47,8 @@ pub enum WaylandEvent {
     Text {
         generation: u64,
         text: Vec<u8>,
+        /// The offer carried the password-manager hint.
+        sensitive: bool,
     },
     /// The selection carries nothing to forward; `error` names a failed read.
     Unusable {
@@ -77,6 +81,7 @@ pub struct WaylandState {
 struct ActiveSource {
     proxy: ext_data_control_source_v1::ExtDataControlSourceV1,
     text: Arc<Vec<u8>>,
+    sensitive: bool,
 }
 
 #[derive(Default)]
@@ -87,6 +92,7 @@ struct OfferInfo {
 
 struct OfferRead {
     generation: u64,
+    sensitive: bool,
     buffer: Vec<u8>,
     reader: RegistrationToken,
     deadline: RegistrationToken,
@@ -120,9 +126,13 @@ impl WaylandState {
         }
     }
 
+    /// Publishes `text` as the Sway selection. A sensitive text also offers the
+    /// password-manager hint, so clipboard managers inside Sway treat it the way
+    /// Windows was asked to.
     pub fn publish_text(
         &mut self,
         text: Vec<u8>,
+        sensitive: bool,
         qh: &QueueHandle<BrokerState>,
     ) -> Result<(), String> {
         let manager = self
@@ -136,6 +146,11 @@ impl WaylandState {
         let source = manager.create_data_source(qh, ());
         for mime in &TEXT_MIME_TYPES[..3] {
             source.offer((*mime).into());
+        }
+        if sensitive {
+            for mime in SENSITIVE_MIME_TYPES {
+                source.offer(mime.into());
+            }
         }
         device.set_selection(Some(&source));
         // Fence the resulting selection events without a blocking roundtrip.
@@ -151,6 +166,7 @@ impl WaylandState {
         if let Some(previous) = self.active_source.replace(ActiveSource {
             proxy: source,
             text: Arc::new(text),
+            sensitive,
         }) {
             self.retiring_sources.push(previous);
             if self.retiring_sources.len() > MAX_RETIRING_SOURCES {
@@ -202,6 +218,7 @@ impl WaylandState {
         &mut self,
         offer: &ext_data_control_offer_v1::ExtDataControlOfferV1,
         mime: &'static str,
+        sensitive: bool,
         generation: u64,
     ) -> Result<(), String> {
         let (reader, writer) = pipe_with(PipeFlags::CLOEXEC).map_err(|error| error.to_string())?;
@@ -242,6 +259,7 @@ impl WaylandState {
         offer.receive(mime.into(), writer.as_fd());
         self.offer_read = Some(OfferRead {
             generation,
+            sensitive,
             buffer: Vec::new(),
             reader,
             deadline,
@@ -268,6 +286,7 @@ impl WaylandState {
             None => WaylandEvent::Text {
                 generation,
                 text: read.buffer,
+                sensitive: read.sensitive,
             },
             Some(error) => WaylandEvent::Unusable {
                 generation,
@@ -294,15 +313,24 @@ impl WaylandState {
         }
     }
 
-    fn source_text(
+    /// What `source` serves for `mime`: its text, or the hint value when a
+    /// sensitive source is asked for the password-manager hint.
+    fn source_payload(
         &self,
         source: &ext_data_control_source_v1::ExtDataControlSourceV1,
+        mime: &str,
     ) -> Option<Arc<Vec<u8>>> {
-        self.active_source
+        let candidate = self
+            .active_source
             .iter()
             .chain(&self.retiring_sources)
-            .find(|candidate| candidate.proxy.id() == source.id())
-            .map(|candidate| Arc::clone(&candidate.text))
+            .find(|candidate| candidate.proxy.id() == source.id())?;
+        if is_sensitive_mime(mime) {
+            return candidate
+                .sensitive
+                .then(|| Arc::new(SENSITIVE_HINT_VALUE.to_vec()));
+        }
+        Some(Arc::clone(&candidate.text))
     }
 
     fn forget_source(&mut self, source: &ext_data_control_source_v1::ExtDataControlSourceV1) {
@@ -421,7 +449,11 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for Broker
                     .filter(|_| broker.wayland.sync_sensitive || !info.sensitive)
                     .map(|rank| TEXT_MIME_TYPES[rank]);
                 let result = match mime {
-                    Some(mime) => broker.wayland.start_offer_read(&offer, mime, generation),
+                    Some(mime) => {
+                        broker
+                            .wayland
+                            .start_offer_read(&offer, mime, info.sensitive, generation)
+                    }
                     None => Ok(()),
                 };
                 offer.destroy();
@@ -467,8 +499,8 @@ impl Dispatch<ext_data_control_source_v1::ExtDataControlSourceV1, ()> for Broker
         _: &QueueHandle<Self>,
     ) {
         match event {
-            ext_data_control_source_v1::Event::Send { fd, .. } => {
-                let Some(text) = broker.wayland.source_text(source) else {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                let Some(text) = broker.wayland.source_payload(source, &mime_type) else {
                     return;
                 };
                 let slots = Arc::clone(&broker.wayland.transfer_slots);

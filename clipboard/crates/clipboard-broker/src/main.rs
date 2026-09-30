@@ -21,9 +21,11 @@ fn run() -> Result<(), BrokerError> {
     let mut args = std::env::args_os();
     let _program = args.next();
     if matches!(args.next().as_deref(), Some(value) if value == "--probe") {
+        // build.rs embeds the workspace source digest; the agent prints the same
+        // value when both payloads come from one tree.
         println!(
-            "arch-sway-wslg-clipboard protocol={} arch=x86_64",
-            PROTOCOL_VERSION
+            "arch-sway-wslg-clipboard protocol={PROTOCOL_VERSION} source={} arch=x86_64",
+            env!("ARCH_SWAY_WSLG_SOURCE_DIGEST")
         );
         return Ok(());
     }

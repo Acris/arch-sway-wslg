@@ -10,6 +10,9 @@ repository.workspace = true
 name = "arch-sway-wslg-clipboard"
 path = "src/main.rs"
 
+[build-dependencies]
+sha2.workspace = true
+
 [dependencies]
 clipboard-core.workspace = true
 thiserror.workspace = true

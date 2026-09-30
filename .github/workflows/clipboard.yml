@@ -1,21 +1,31 @@
 name: clipboard
 
+# Every change runs every job: the installer and launcher gate the payloads,
+# and a payload built from older source has to fail here, not on a user's
+# machine.
 on:
   push:
-    paths:
-      - "clipboard/**"
-      - ".local/libexec/arch-sway-wslg/**"
-      - ".github/workflows/clipboard.yml"
   pull_request:
-    paths:
-      - "clipboard/**"
-      - ".local/libexec/arch-sway-wslg/**"
-      - ".github/workflows/clipboard.yml"
 
 permissions:
   contents: read
 
 jobs:
+  shell:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools
+        run: |
+          sed -i "s/^#\?DownloadUser.*/#DownloadUser = alpm/" /etc/pacman.conf
+          pacman -Sy --noconfirm --needed git shellcheck >/dev/null
+      - run: bash -n install.sh
+      - run: bash -n .local/bin/arch-sway-wslg
+      - run: bash -n tests/install-session.sh
+      - run: shellcheck -S warning -x install.sh .local/bin/arch-sway-wslg tests/install-session.sh
+      - run: bash tests/install-session.sh
+
   linux:
     runs-on: ubuntu-latest
     defaults:
@@ -23,32 +33,49 @@ jobs:
         working-directory: clipboard
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
+      # rust-toolchain.toml pins the release, its components and targets.
+      - run: rustup toolchain install
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --release --locked -p clipboard-broker
-      - name: verify checked-in Linux payload
+      - name: verify checked-in payloads come from this tree
         run: |
           (cd ../.local/libexec/arch-sway-wslg && sha256sum -c clipboard.sha256)
-          ../.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard --probe
+          built="$(target/release/arch-sway-wslg-clipboard --probe)"
+          shipped="$(../.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard --probe)"
+          printf 'built:   %s\nshipped: %s\n' "$built" "$shipped"
+          if [ "$built" != "$shipped" ]; then
+            echo "::error::the checked-in Linux payload was not built from this source; rebuild it with clipboard/README.md"
+            exit 1
+          fi
+          # The agent embeds the same digest as a literal, so the checked-in
+          # executable can be matched here without running it.
+          digest="${built#*source=}"
+          digest="${digest%% *}"
+          if ! grep -aqF "$digest" ../.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard-agent.exe; then
+            echo "::error::the checked-in Windows payload was not built from this source; rebuild it with clipboard/README.md"
+            exit 1
+          fi
 
   windows:
     runs-on: windows-latest
     defaults:
       run:
         working-directory: clipboard
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
-          targets: x86_64-pc-windows-msvc
+      - run: rustup toolchain install
       - run: cargo check --locked -p clipboard-agent-win --target x86_64-pc-windows-msvc
       - run: cargo clippy --locked -p clipboard-agent-win --target x86_64-pc-windows-msvc -- -D warnings
       - run: cargo build --release --locked -p clipboard-agent-win --target x86_64-pc-windows-msvc
-      - run: target/x86_64-pc-windows-msvc/release/arch-sway-wslg-clipboard-agent.exe --probe
-      - name: verify checked-in Windows payload
-        run: ..\.local\libexec\arch-sway-wslg\arch-sway-wslg-clipboard-agent.exe --probe
+      - name: verify checked-in payload comes from this tree
+        run: |
+          built="$(target/x86_64-pc-windows-msvc/release/arch-sway-wslg-clipboard-agent.exe --probe | tr -d '\r')"
+          shipped="$(../.local/libexec/arch-sway-wslg/arch-sway-wslg-clipboard-agent.exe --probe | tr -d '\r')"
+          printf 'built:   %s\nshipped: %s\n' "$built" "$shipped"
+          if [ "$built" != "$shipped" ]; then
+            echo "::error::the checked-in Windows payload was not built from this source; rebuild it with clipboard/README.md"
+            exit 1
+          fi

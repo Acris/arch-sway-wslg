@@ -16,7 +16,12 @@ use crate::io::{set_nonblocking, write_with_deadline};
 pub const RESTART_LIMIT: usize = 5;
 pub const RESTART_RESET_AFTER: Duration = Duration::from_secs(60);
 pub const RESTART_DELAY: Duration = Duration::from_secs(1);
+// WSL interop moves the full 16 MiB in about a second on an idle system. The
+// allowance per started 2 MiB keeps a loaded one from looking like a lost
+// agent, while the largest frame (12 s) still ends before the heartbeat timeout.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+const WRITE_TIMEOUT_PER_CHUNK: Duration = Duration::from_secs(1);
+const WRITE_TIMEOUT_CHUNK: usize = 2 * 1024 * 1024;
 const EXIT_GRACE: Duration = Duration::from_secs(1);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const READ_CHUNK: usize = 64 * 1024;
@@ -93,7 +98,8 @@ impl AgentProcess {
     pub fn send(&mut self, frame: &Frame) -> io::Result<()> {
         let mut encoded = Vec::new();
         frame.write_to(&mut encoded).map_err(io::Error::other)?;
-        write_with_deadline(&mut self.input, &encoded, WRITE_TIMEOUT)
+        let timeout = write_timeout(encoded.len());
+        write_with_deadline(&mut self.input, &encoded, timeout)
     }
 
     /// Closes the agent's pipe, which is its shutdown signal, and reaps it off the
@@ -111,6 +117,11 @@ impl AgentProcess {
     }
 }
 
+fn write_timeout(len: usize) -> Duration {
+    let chunks = u32::try_from(len.div_ceil(WRITE_TIMEOUT_CHUNK)).unwrap_or(u32::MAX);
+    WRITE_TIMEOUT + WRITE_TIMEOUT_PER_CHUNK.saturating_mul(chunks)
+}
+
 // The interop stub only gets killed when the agent ignores its closed pipe.
 fn reap(mut child: Child, input: ChildStdin) {
     drop(input);
@@ -122,4 +133,21 @@ fn reap(mut child: Child, input: ChildStdin) {
     // a stubborn or unpollable child from lingering as a zombie.
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use clipboard_core::MAX_TEXT_BYTES;
+
+    use super::*;
+    use crate::broker::HEARTBEAT_TIMEOUT;
+
+    #[test]
+    fn write_timeout_grows_with_size_but_stays_below_the_heartbeat() {
+        assert_eq!(write_timeout(0), WRITE_TIMEOUT);
+        assert_eq!(write_timeout(1), WRITE_TIMEOUT + WRITE_TIMEOUT_PER_CHUNK);
+        let largest = write_timeout(MAX_TEXT_BYTES + 64);
+        assert!(largest > write_timeout(MAX_TEXT_BYTES / 2));
+        assert!(largest < HEARTBEAT_TIMEOUT);
+    }
 }

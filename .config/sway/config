@@ -12,9 +12,8 @@
 
 include catppuccin-mocha
 
-# Reserve the nested X11 display during startup, but launch XWayland only when
-# the first X11 client connects. Native Wayland remains preferred by toolkits.
-xwayland enable
+# Sway's default `xwayland enable` reserves the nested X11 display during
+# startup and launches XWayland only when the first X11 client connects.
 
 # -----------------------------------------------------------------------------
 # Variables
@@ -30,8 +29,10 @@ set $right l
 set $term foot
 set $menu fuzzel
 set $files foot -e yazi
-# install.sh replaces this marker with the resolved absolute configuration path.
-set $wallpaper "__ARCH_SWAY_WSLG_WALLPAPER__"
+# Relative to this file's directory. Sway joins it with that directory only
+# after its word expansion, so a configuration root containing $ or quotes
+# never reaches that expansion.
+set $wallpaper wallpapers/arch-black-4k.png
 
 # -----------------------------------------------------------------------------
 # Appearance
@@ -70,7 +71,6 @@ seat * xcursor_theme Adwaita 24
 # -----------------------------------------------------------------------------
 # Behaviour
 # -----------------------------------------------------------------------------
-focus_follows_mouse yes
 mouse_warping container
 floating_modifier $mod normal
 workspace_auto_back_and_forth yes

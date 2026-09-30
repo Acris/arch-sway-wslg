@@ -1,0 +1,7 @@
+[toolchain]
+# A fixed stable release keeps rebuilt payloads comparable between machines and
+# CI. Update it deliberately, together with a rebuild of both payloads.
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+profile = "minimal"

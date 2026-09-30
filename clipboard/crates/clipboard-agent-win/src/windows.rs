@@ -6,7 +6,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use clipboard_core::protocol::{Frame, HELLO_HAS_TEXT, HELLO_READ_ERROR, MessageKind};
+use clipboard_core::protocol::{
+    Frame, HELLO_HAS_TEXT, HELLO_READ_ERROR, MessageKind, TEXT_SENSITIVE,
+};
 use clipboard_core::text::{utf8_to_utf16, utf16_to_utf8, validate_utf8};
 use clipboard_core::{MAX_TEXT_BYTES, PROTOCOL_VERSION};
 use thiserror::Error;
@@ -16,7 +18,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
     GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
-    RemoveClipboardFormatListener, SetClipboardData,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{
@@ -39,6 +41,36 @@ const CLIPBOARD_RETRIES: usize = 8;
 const READ_RETRY_TIMER: usize = 1;
 const READ_RETRY_DELAY_MS: u32 = 250;
 const MAX_WINDOWS_TEXT_BYTES: usize = (MAX_TEXT_BYTES + 1) * size_of::<u16>();
+// Source digest embedded by build.rs; `--probe` prints it so that a payload can
+// be matched against the tree it was built from.
+const SOURCE_DIGEST: &str = env!("ARCH_SWAY_WSLG_SOURCE_DIGEST");
+
+/// The registered formats Windows documents for keeping a text out of clipboard
+/// monitors, the clipboard history and cloud synchronization. Password managers
+/// set them; nothing else about a text is taken as a sign of sensitivity.
+struct HintFormats {
+    exclude_from_monitors: u32,
+    viewer_ignore: u32,
+    history: u32,
+    cloud: u32,
+}
+
+impl HintFormats {
+    fn register() -> Result<Self, AgentError> {
+        Ok(Self {
+            exclude_from_monitors: register_format("ExcludeClipboardContentFromMonitorProcessing")?,
+            viewer_ignore: register_format("Clipboard Viewer Ignore")?,
+            history: register_format("CanIncludeInClipboardHistory")?,
+            cloud: register_format("CanUploadToCloudClipboard")?,
+        })
+    }
+}
+
+/// Clipboard text in UTF-8, and whether Windows marked it as sensitive.
+struct ClipboardText {
+    text: Vec<u8>,
+    sensitive: bool,
+}
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -60,13 +92,13 @@ pub fn run() -> Result<(), AgentError> {
     let argument = args.next();
     if matches!(argument.as_deref(), Some(value) if value == "--probe") {
         println!(
-            "arch-sway-wslg-clipboard-agent protocol={} arch=x86_64",
-            PROTOCOL_VERSION
+            "arch-sway-wslg-clipboard-agent protocol={PROTOCOL_VERSION} source={SOURCE_DIGEST} arch=x86_64"
         );
         return Ok(());
     }
     let write_only = matches!(argument.as_deref(), Some(value) if value == "--write-only");
 
+    let formats = HintFormats::register()?;
     let (sender, receiver) = mpsc::channel();
     let window = create_message_window()?;
     let reader_window = window as usize;
@@ -85,7 +117,7 @@ pub fn run() -> Result<(), AgentError> {
     let (initial_sequence, initial_text, initial_read_error) = if write_only {
         (unsafe { GetClipboardSequenceNumber() }, None, false)
     } else {
-        match clipboard_snapshot(window) {
+        match clipboard_snapshot(window, &formats) {
             Ok((sequence, text)) => (sequence, text, false),
             Err(_) => (unsafe { GetClipboardSequenceNumber() }, None, true),
         }
@@ -95,14 +127,17 @@ pub fn run() -> Result<(), AgentError> {
     hello.sequence = initial_sequence;
     if let Some(text) = initial_text {
         hello.flags |= HELLO_HAS_TEXT;
-        hello.payload = text;
+        if text.sensitive {
+            hello.flags |= TEXT_SENSITIVE;
+        }
+        hello.payload = text.text;
     }
     if initial_read_error {
         hello.flags |= HELLO_READ_ERROR;
     }
     hello.write_to(&mut writer)?;
 
-    let result = message_loop(window, receiver, &mut writer, initial_sequence);
+    let result = message_loop(window, &formats, receiver, &mut writer, initial_sequence);
     if !write_only {
         unsafe {
             RemoveClipboardFormatListener(window);
@@ -131,6 +166,7 @@ fn read_commands(window: HWND, sender: Sender<Frame>) {
 
 fn message_loop(
     window: HWND,
+    formats: &HintFormats,
     receiver: Receiver<Frame>,
     writer: &mut BufWriter<impl io::Write>,
     mut last_sequence: u32,
@@ -151,7 +187,7 @@ fn message_loop(
                 if unsafe { GetClipboardSequenceNumber() } == last_sequence {
                     continue;
                 }
-                match clipboard_snapshot(window) {
+                match clipboard_snapshot(window, formats) {
                     Ok((sequence, text)) => {
                         unsafe { KillTimer(window, READ_RETRY_TIMER) };
                         last_sequence = report_selection(writer, sequence, text)?;
@@ -171,7 +207,7 @@ fn message_loop(
                 // Unsupported or still unavailable clipboard data must not take down
                 // the listener. Advance the sequence and let the broker treat this
                 // selection as unavailable.
-                let (sequence, text) = match clipboard_snapshot(window) {
+                let (sequence, text) = match clipboard_snapshot(window, formats) {
                     Ok(snapshot) => snapshot,
                     Err(_) => (unsafe { GetClipboardSequenceNumber() }, None),
                 };
@@ -181,7 +217,13 @@ fn message_loop(
                 while let Ok(frame) = receiver.try_recv() {
                     match frame.kind {
                         MessageKind::SetWindowsText => {
-                            let mut response = match write_clipboard_text(window, &frame.payload) {
+                            let sensitive = frame.flags & TEXT_SENSITIVE != 0;
+                            let mut response = match write_clipboard_text(
+                                window,
+                                formats,
+                                &frame.payload,
+                                sensitive,
+                            ) {
                                 Ok(sequence) => {
                                     last_sequence = sequence;
                                     let mut response = Frame::new(MessageKind::SetWindowsOk);
@@ -225,24 +267,32 @@ fn message_loop(
 fn report_selection(
     writer: &mut BufWriter<impl io::Write>,
     sequence: u32,
-    text: Option<Vec<u8>>,
+    text: Option<ClipboardText>,
 ) -> Result<u32, AgentError> {
     let mut frame = Frame::new(match text {
         Some(_) => MessageKind::WindowsText,
         None => MessageKind::WindowsUnavailable,
     });
     frame.sequence = sequence;
-    frame.payload = text.unwrap_or_default();
+    if let Some(text) = text {
+        if text.sensitive {
+            frame.flags |= TEXT_SENSITIVE;
+        }
+        frame.payload = text.text;
+    }
     frame.write_to(writer)?;
     Ok(sequence)
 }
 
 /// Reads the clipboard text together with the sequence number it belongs to; a
 /// change between the two reads would otherwise pair a number with newer text.
-fn clipboard_snapshot(window: HWND) -> Result<(u32, Option<Vec<u8>>), AgentError> {
+fn clipboard_snapshot(
+    window: HWND,
+    formats: &HintFormats,
+) -> Result<(u32, Option<ClipboardText>), AgentError> {
     for _ in 0..CLIPBOARD_RETRIES {
         let before = unsafe { GetClipboardSequenceNumber() };
-        let text = read_clipboard_text(window)?;
+        let text = read_clipboard_text(window, formats)?;
         let after = unsafe { GetClipboardSequenceNumber() };
         if before == after {
             return Ok((after, text));
@@ -251,19 +301,60 @@ fn clipboard_snapshot(window: HWND) -> Result<(u32, Option<Vec<u8>>), AgentError
     Err(AgentError::MalformedClipboard)
 }
 
-fn read_clipboard_text(window: HWND) -> Result<Option<Vec<u8>>, AgentError> {
+fn read_clipboard_text(
+    window: HWND,
+    formats: &HintFormats,
+) -> Result<Option<ClipboardText>, AgentError> {
     unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
             return Ok(None);
         }
     }
-    with_open_clipboard(window, || unsafe {
+    let text = with_open_clipboard(window, || {
+        let text = read_open_clipboard_text()?;
+        Ok(text.map(|text| ClipboardText {
+            text,
+            sensitive: open_clipboard_is_sensitive(formats),
+        }))
+    })?;
+    Ok(text)
+}
+
+/// Must run with the clipboard open, so the hint belongs to the text read.
+fn open_clipboard_is_sensitive(formats: &HintFormats) -> bool {
+    let excluded = unsafe {
+        IsClipboardFormatAvailable(formats.exclude_from_monitors) != 0
+            || IsClipboardFormatAvailable(formats.viewer_ignore) != 0
+    };
+    excluded || open_clipboard_dword(formats.history) == Some(0)
+}
+
+fn open_clipboard_dword(format: u32) -> Option<u32> {
+    unsafe {
+        let handle = GetClipboardData(format);
+        if handle.is_null() || GlobalSize(handle as HANDLE) < size_of::<u32>() {
+            return None;
+        }
+        let pointer = GlobalLock(handle as HANDLE) as *const u32;
+        if pointer.is_null() {
+            return None;
+        }
+        let value = pointer.read_unaligned();
+        GlobalUnlock(handle as HANDLE);
+        Some(value)
+    }
+}
+
+fn read_open_clipboard_text() -> Result<Option<Vec<u8>>, AgentError> {
+    unsafe {
         let handle = GetClipboardData(CF_UNICODETEXT);
         if handle.is_null() {
             return Err(last_error("GetClipboardData"));
         }
         let size = GlobalSize(handle as HANDLE);
-        if size < size_of::<u16>() || size > MAX_WINDOWS_TEXT_BYTES || size % size_of::<u16>() != 0
+        if size < size_of::<u16>()
+            || size > MAX_WINDOWS_TEXT_BYTES
+            || !size.is_multiple_of(size_of::<u16>())
         {
             return Err(AgentError::MalformedClipboard);
         }
@@ -284,40 +375,87 @@ fn read_clipboard_text(window: HWND) -> Result<Option<Vec<u8>>, AgentError> {
         };
         GlobalUnlock(handle as HANDLE);
         result.map_err(AgentError::from)
-    })
+    }
 }
 
-fn write_clipboard_text(window: HWND, bytes: &[u8]) -> Result<u32, AgentError> {
+/// Writes the text and, for a sensitive one, the hints that keep it out of the
+/// clipboard history, cloud synchronization and other clipboard monitors.
+fn write_clipboard_text(
+    window: HWND,
+    formats: &HintFormats,
+    bytes: &[u8],
+    sensitive: bool,
+) -> Result<u32, AgentError> {
     validate_utf8(bytes)?;
     let wide = utf8_to_utf16(bytes)?;
-    let byte_len = wide.len() * size_of::<u16>();
-    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
+    let mut items: Vec<(u32, HANDLE)> = Vec::with_capacity(4);
+    let mut transferred = 0;
+    let result = prepare_items(&mut items, formats, &wide, sensitive).and_then(|()| {
+        with_open_clipboard(window, || unsafe {
+            if EmptyClipboard() == 0 {
+                return Err(last_error("EmptyClipboard"));
+            }
+            for (format, handle) in &items {
+                if SetClipboardData(*format, *handle).is_null() {
+                    return Err(last_error("SetClipboardData"));
+                }
+                // The clipboard owns the memory from here on.
+                transferred += 1;
+            }
+            Ok(GetClipboardSequenceNumber())
+        })
+    });
+    for (_, handle) in &items[transferred..] {
+        unsafe { GlobalFree(*handle) };
+    }
+    result
+}
+
+fn prepare_items(
+    items: &mut Vec<(u32, HANDLE)>,
+    formats: &HintFormats,
+    wide: &[u16],
+    sensitive: bool,
+) -> Result<(), AgentError> {
+    items.push((CF_UNICODETEXT, global_copy(wide)?));
+    if sensitive {
+        // Windows reads a DWORD 0 as "no" for the two Can* formats; the monitor
+        // exclusion only has to be present.
+        for format in [
+            formats.exclude_from_monitors,
+            formats.history,
+            formats.cloud,
+        ] {
+            items.push((format, global_copy(&[0_u32])?));
+        }
+    }
+    Ok(())
+}
+
+fn global_copy<T: Copy>(data: &[T]) -> Result<HANDLE, AgentError> {
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, size_of_val(data)) };
     if handle.is_null() {
         return Err(last_error("GlobalAlloc"));
     }
-    let pointer = unsafe { GlobalLock(handle) as *mut u16 };
+    let pointer = unsafe { GlobalLock(handle) as *mut T };
     if pointer.is_null() {
+        let error = last_error("GlobalLock");
         unsafe { GlobalFree(handle) };
-        return Err(last_error("GlobalLock"));
+        return Err(error);
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
+        std::ptr::copy_nonoverlapping(data.as_ptr(), pointer, data.len());
         GlobalUnlock(handle);
     }
+    Ok(handle as HANDLE)
+}
 
-    let result = with_open_clipboard(window, || unsafe {
-        if EmptyClipboard() == 0 {
-            return Err(last_error("EmptyClipboard"));
-        }
-        if SetClipboardData(CF_UNICODETEXT, handle as HANDLE).is_null() {
-            return Err(last_error("SetClipboardData"));
-        }
-        Ok(GetClipboardSequenceNumber())
-    });
-    if result.is_err() {
-        unsafe { GlobalFree(handle) };
+fn register_format(name: &str) -> Result<u32, AgentError> {
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    match unsafe { RegisterClipboardFormatW(wide.as_ptr()) } {
+        0 => Err(last_error("RegisterClipboardFormatW")),
+        format => Ok(format),
     }
-    result
 }
 
 fn with_open_clipboard<T>(

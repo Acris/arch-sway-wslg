@@ -4,7 +4,8 @@ umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 NAME="arch-sway-wslg"
-VERSION="$(<"$ROOT/VERSION")"
+# Read leniently here so that preflight, not errexit, reports a missing file.
+VERSION="$(cat -- "$ROOT/VERSION" 2>/dev/null || true)"
 
 if [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
     CONFIG_HOME="$XDG_CONFIG_HOME"
@@ -41,7 +42,8 @@ LOCAL_OVERRIDE_PATHS=(sway/config.d foot/local.ini fuzzel/local.ini waybar/local
 # stylesheet whose import is missing, so these two have to exist after every
 # installation, not only after the first one.
 LOCAL_STYLESHEETS=(waybar/local.css swaync/local.css)
-# Bundled wallpaper, relative to the managed configuration root.
+# Bundled wallpaper, relative to the managed configuration root. The Sway
+# configuration names it relative to its own directory.
 WALLPAPER_RELATIVE="sway/wallpapers/arch-black-4k.png"
 # Bundled syntax highlighting theme for the Yazi file preview.
 YAZI_THEME_RELATIVE="yazi/Catppuccin-mocha.tmTheme"
@@ -103,6 +105,7 @@ declare -A BROWSER_COMMANDS=(
 )
 BROWSER_CHOICE="firefox"
 declare -A BROWSER_INSTALLED=()
+SESSION_SCOPE="${NAME}-session.scope"
 
 SWAY_SCALE=1
 SYSTEMD_RUNTIME_DIR="/run/user/$EUID"
@@ -176,10 +179,34 @@ detect_installed_browsers() {
     done
 }
 
+# The recorded choice is the default, so pressing Enter on a reinstallation
+# keeps it. A previous installation without a record chose no browser.
+default_browser_index() {
+    local recorded="" index key
+
+    if [[ -r "$BROWSER_FILE" ]]; then
+        IFS= read -r recorded < "$BROWSER_FILE" || recorded=""
+        for index in "${!BROWSER_KEYS[@]}"; do
+            key="${BROWSER_KEYS[$index]}"
+            [[ "$key" != none && "${BROWSER_COMMANDS[$key]}" == "$recorded" ]] || continue
+            printf '%d\n' $((index + 1))
+            return 0
+        done
+    elif [[ -e "$LOCAL_BIN_DIR/$NAME" ]]; then
+        for index in "${!BROWSER_KEYS[@]}"; do
+            [[ "${BROWSER_KEYS[$index]}" == none ]] || continue
+            printf '%d\n' $((index + 1))
+            return 0
+        done
+    fi
+    printf '1\n'
+}
+
 prompt_browser() {
-    local index key answer marker
+    local index key answer marker default_index
 
     detect_installed_browsers
+    default_index="$(default_browser_index)"
 
     note ""
     note "Web browser (sets BROWSER inside the Sway session):"
@@ -197,12 +224,13 @@ prompt_browser() {
     done
 
     while true; do
-        printf 'Choose a browser [1-%d, default: 1]: ' "${#BROWSER_KEYS[@]}" >&2
+        printf 'Choose a browser [1-%d, default: %d (%s)]: ' "${#BROWSER_KEYS[@]}" \
+            "$default_index" "${BROWSER_LABELS[${BROWSER_KEYS[$((default_index - 1))]}]}" >&2
         if ! IFS= read -r answer; then
             printf '\n' >&2
             die "input closed before the browser was chosen"
         fi
-        [[ -n "$answer" ]] || answer=1
+        [[ -n "$answer" ]] || answer="$default_index"
         if [[ "$answer" =~ ^[0-9]+$ ]] && \
            (( answer >= 1 && answer <= ${#BROWSER_KEYS[@]} )); then
             BROWSER_CHOICE="${BROWSER_KEYS[$((answer - 1))]}"
@@ -237,21 +265,81 @@ gsettings_user() {
     user_bus_command gsettings "$@"
 }
 
+# Everything started from inside Sway shares its scope. Stopping the session to
+# replace it would also terminate this installer, after the package work and
+# before any file is installed.
+running_inside_session() {
+    local cgroup_file="${1:-/proc/self/cgroup}" line
+    [[ -r "$cgroup_file" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" == */"$SESSION_SCOPE" || "$line" == */"$SESSION_SCOPE"/* ]] && return 0
+    done < "$cgroup_file"
+    return 1
+}
+
+# Foot and Fuzzel include their local files by absolute path and Yazi reads its
+# theme from a quoted TOML string; none of them can express these characters.
+check_config_root_expressible() {
+    case "$CONFIG_HOME" in
+        *'"'*|*'\'*|*$'\n'*|*$'\r'*)
+            die "configuration root contains a quote, backslash, or newline: $CONFIG_HOME"
+            ;;
+    esac
+}
+
+# Each managed path is moved aside and deleted once its replacement is in
+# place, so the roots holding them are checked against the resolved home first:
+# a root that is the home directory itself, /, or a WSLg-owned tree would turn
+# that deletion onto unrelated files.
+validate_install_roots() {
+    local home_real label root real
+
+    home_real="$(realpath -e -- "$HOME" 2>/dev/null)" || die "home directory is not accessible: $HOME"
+    [[ "$home_real" != / && -d "$home_real" && -O "$home_real" ]] || \
+        die "home directory must be a directory you own other than /: $home_real"
+
+    for label in CONFIG_HOME DATA_HOME STATE_HOME; do
+        root="${!label}"
+        real="$(realpath -m -- "$root" 2>/dev/null)" || die "cannot resolve $label: $root"
+        case "$real" in
+            /|"$home_real"|"$home_real/.local")
+                die "$label resolves to $real, which is not a dedicated per-user directory"
+                ;;
+            /mnt/wslg|/mnt/wslg/*|/tmp/.X11-unix|/tmp/.X11-unix/*|"$SYSTEMD_RUNTIME_DIR"|"$SYSTEMD_RUNTIME_DIR"/*)
+                die "$label resolves to $real, which belongs to WSLg or the user runtime"
+                ;;
+        esac
+        if [[ -e "$real" ]] && ! [[ -d "$real" && -O "$real" ]]; then
+            die "$label is not a directory owned by you: $real"
+        fi
+    done
+}
+
 preflight() {
     (( EUID != 0 )) || die "run this installer as your normal Arch user, not as root"
+    running_inside_session && \
+        die "the installer has to stop the managed Sway session it is running in; run it from a WSL terminal outside Sway"
 
     local command_name config_name
-    for command_name in paru pacman flock sha256sum sudo systemctl timeout; do
+    for command_name in paru pacman flock sha256sum sudo systemctl timeout realpath; do
         command -v "$command_name" >/dev/null 2>&1 || \
             die "required command not found: $command_name"
     done
+    # Paru builds AUR packages such as maplemono-nf-cn-unhinted with makepkg,
+    # which needs base-devel. Without it the failure would only appear after
+    # the bootstrap packages were already installed.
+    pacman -T base-devel >/dev/null 2>&1 || \
+        die "base-devel is required to build AUR packages; install it with 'sudo pacman -S --needed base-devel'"
 
     grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || \
         die "this installer is only supported inside WSL2"
     systemd_user_usable || \
         die "systemd and its user manager are required; restart this Arch WSL distribution with systemd"
+    validate_install_roots
+    check_config_root_expressible
 
-    [[ -s "$ROOT/VERSION" ]] || die "version file is missing or empty: $ROOT/VERSION"
+    [[ "$VERSION" =~ ^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]*$ ]] || \
+        die "version file is missing or not YYYY.M.RELEASE: $ROOT/VERSION"
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
         [[ -d "$ROOT/.config/$config_name" ]] || \
             die "managed configuration payload is missing: $ROOT/.config/$config_name"
@@ -347,7 +435,9 @@ install_packages() {
     note "Installing ${#selected_bootstrap[@]} bootstrap packages..."
     paru -S --needed "${selected_bootstrap[@]}"
 
-    if paru -T org.freedesktop.secrets >/dev/null 2>&1; then
+    # oo7 provides org.freedesktop.secrets itself, so on a reinstallation it
+    # must not be mistaken for a different provider.
+    if ! paru -Qq oo7 >/dev/null 2>&1 && paru -T org.freedesktop.secrets >/dev/null 2>&1; then
         selected_main=()
         for package in "${MAIN_PACKAGES[@]}"; do
             [[ "$package" == oo7 ]] || selected_main+=("$package")
@@ -477,8 +567,8 @@ store_oo7_credential() {
 # -----------------------------------------------------------------------------
 # Session protection
 # -----------------------------------------------------------------------------
-# Query the authority directly: launcher status also fails when the bus is
-# unreachable, which must never be mistaken for permission to replace files.
+# Query the authority directly: an unreachable bus must never be mistaken for
+# permission to replace files. The launcher classifies ActiveState the same way.
 managed_session_running() {
     local state
     state="$(systemctl_user show --property=ActiveState --value "${NAME}-session.scope")" || \
@@ -558,16 +648,24 @@ backup_existing_files() {
     chmod 700 "$BACKUP_BASE"
     BACKUP_DIR="$(mktemp -d "$BACKUP_BASE/$(date +%Y%m%d-%H%M%S).XXXXXX")"
 
+    local -a restore_commands=()
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
         backup_item "$CONFIG_HOME/$config_name" "config/$config_name"
+        restore_commands+=("$(restore_command "config/$config_name" "$CONFIG_HOME/$config_name")")
     done
+    backup_item "$BROWSER_FILE" "config/$NAME/browser"
+    restore_commands+=("$(restore_command "config/$NAME/browser" "$BROWSER_FILE")")
     backup_item "$LOCAL_BIN_DIR/$NAME" "local/bin/$NAME"
+    restore_commands+=("$(restore_command "local/bin/$NAME" "$LOCAL_BIN_DIR/$NAME")")
     backup_item "$LOCAL_LIBEXEC_DIR" "local/libexec/$NAME"
+    restore_commands+=("$(restore_command "local/libexec/$NAME" "$LOCAL_LIBEXEC_DIR")")
 
     if (( include_desktop_overrides )); then
         for source_file in "${DESKTOP_OVERRIDE_FILES[@]}"; do
             basename="${source_file##*/}"
             backup_item "$APPLICATIONS_DIR/$basename" "data/applications/$basename"
+            restore_commands+=("$(restore_command "data/applications/$basename" \
+                "$APPLICATIONS_DIR/$basename")")
         done
     fi
 
@@ -579,16 +677,44 @@ backup_existing_files() {
         return 0
     fi
 
+    write_restore_info "${restore_commands[@]}"
+}
+
+# One shell line per backed-up path. Every path is quoted with %q, because a
+# configuration root may contain spaces or dollar signs, and a pasted line must
+# never delete anything other than its own target. Paths that did not exist
+# before this installation are listed for removal instead.
+restore_command() {
+    local relative="$1" target="$2"
+    if [[ -e "$BACKUP_DIR/$relative" || -L "$BACKUP_DIR/$relative" ]]; then
+        printf 'rm -rf -- %q && cp -a -- %q %q' "$target" "$BACKUP_DIR/$relative" "$target"
+    else
+        printf 'rm -rf -- %q' "$target"
+    fi
+}
+
+write_restore_info() {
+    local line index
     {
         printf 'Created: %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)"
         printf 'Version: %s\n' "$VERSION"
         printf 'Original config root: %s\n' "$CONFIG_HOME"
         printf 'Original data root: %s\n' "$DATA_HOME"
         printf 'Original launcher root: %s\n' "$LOCAL_BIN_DIR"
-        printf '\nRestore a directory with:\n'
-        printf '  rm -rf "%s/sway" && cp -a "%s/config/sway" "%s/sway"\n' \
-            "$CONFIG_HOME" "$BACKUP_DIR" "$CONFIG_HOME"
-    } > "$BACKUP_DIR/RESTORE-INFO.txt"
+        printf '\nStop the session first (%s stop), then run the lines you need.\n' "$NAME"
+        printf 'Each line restores one path exactly as it was before the installation:\n\n'
+        for line in "$@"; do
+            printf '  %s\n' "$line"
+        done
+        if (( APPEARANCE_REQUESTED )); then
+            printf '\nGTK appearance values before the installation:\n\n'
+            for index in "${!APPEARANCE_KEYS[@]}"; do
+                [[ -n "${APPEARANCE_PREVIOUS[$index]:-}" ]] || continue
+                printf '  gsettings set %q %q %q\n' "$APPEARANCE_SCHEMA" \
+                    "${APPEARANCE_KEYS[$index]}" "${APPEARANCE_PREVIOUS[$index]}"
+            done
+        fi
+    } > "$BACKUP_DIR/RESTORE-INFO.txt" || die "failed to write $BACKUP_DIR/RESTORE-INFO.txt"
     BACKUP_SUMMARY="$BACKUP_DIR"
     note "Backup: $BACKUP_DIR"
 }
@@ -625,6 +751,12 @@ replace_path() {
         warn "a leftover replacement path is in the way: $previous"
         return 1
     fi
+    # A symbolic link is moved and removed as a link; anything else has to be
+    # the user's own before it is deleted.
+    if [[ -e "$target" && ! -L "$target" && ! -O "$target" ]]; then
+        warn "refusing to replace a path owned by another user: $target"
+        return 1
+    fi
     if [[ -e "$target" || -L "$target" ]] && ! mv -- "$target" "$previous"; then
         return 1
     fi
@@ -659,21 +791,6 @@ render_marker() {
     fi
     content="$(<"$file")"
     printf '%s\n' "${content//"$marker"/"$value"}" > "$file"
-}
-
-# The Sway config quotes this value, which covers spaces, and doubles a dollar
-# sign to keep it literal. A quote, backslash, or newline cannot be expressed
-# there at all, so such a configuration root is rejected instead of mangled.
-sway_wallpaper_value() {
-    local path="$CONFIG_HOME/$WALLPAPER_RELATIVE"
-
-    case "$path" in
-        *'"'*|*'\'*|*$'\n'*|*$'\r'*)
-            warn "configuration root contains a quote, backslash, or newline unsupported by the Sway config"
-            return 1
-            ;;
-    esac
-    printf '%s\n' "${path//\$/\$\$}"
 }
 
 # Reports its own failure, because the caller runs inside a condition, which
@@ -739,18 +856,14 @@ stage_local_overrides() {
 }
 
 render_staged_payload() {
-    local wallpaper
-
     render_marker "$STAGE_LOCAL/bin/$NAME" "__ARCH_SWAY_WSLG_VERSION__" "$VERSION" || return 1
     render_marker "$STAGE_CONFIG/sway/config" "__ARCH_SWAY_WSLG_SCALE__" "$SWAY_SCALE" || return 1
-    wallpaper="$(sway_wallpaper_value)" || return 1
-    render_marker "$STAGE_CONFIG/sway/config" "__ARCH_SWAY_WSLG_WALLPAPER__" "$wallpaper" || return 1
     render_marker "$STAGE_CONFIG/foot/foot.ini" "__ARCH_SWAY_WSLG_FOOT_LOCAL__" \
         "$CONFIG_HOME/foot/local.ini" || return 1
     render_marker "$STAGE_CONFIG/fuzzel/fuzzel.ini" "__ARCH_SWAY_WSLG_FUZZEL_LOCAL__" \
         "$CONFIG_HOME/fuzzel/local.ini" || return 1
-    # The wallpaper value above already rejected a configuration root a quoted
-    # path cannot express, which is what this TOML string needs as well.
+    # Preflight already rejected a configuration root this quoted TOML string
+    # cannot express.
     render_marker "$STAGE_CONFIG/yazi/theme.toml" "__ARCH_SWAY_WSLG_YAZI_THEME__" \
         "$CONFIG_HOME/$YAZI_THEME_RELATIVE" || return 1
 }
@@ -833,6 +946,10 @@ install_payload() {
     render_staged_payload || payload_fail "failed to render the staged payload"
     check_staged_payload || payload_fail "staged payload check failed"
 
+    # Between the two renames of replace_path a target is briefly absent. An
+    # interrupt there would end the run with nothing to put it back, so the
+    # usual terminal signals wait until every path has been replaced.
+    trap '' INT TERM HUP
     for config_name in "${MANAGED_CONFIG_DIRS[@]}"; do
         replace_path "$STAGE_CONFIG/$config_name" "$CONFIG_HOME/$config_name" || \
             payload_fail "failed to replace config/$config_name"
@@ -850,6 +967,7 @@ install_payload() {
                 payload_fail "failed to install $basename"
         done
     fi
+    trap - INT TERM HUP
 
     cleanup_staging
     if (( include_desktop_overrides )); then
@@ -878,6 +996,8 @@ APPEARANCE_VALUES=("'adw-gtk3-dark'" "'prefer-dark'" "'Papirus-Dark'" \
                    "'Sarasa UI SC 11'" "'Adwaita'" '24')
 APPEARANCE_REQUESTED=0
 APPEARANCE_SUMMARY="not requested"
+# Values read before the change, recorded in RESTORE-INFO.txt.
+APPEARANCE_PREVIOUS=()
 
 prompt_appearance_defaults() {
     local current index
@@ -893,6 +1013,7 @@ prompt_appearance_defaults() {
         if current="$(gsettings_user get "$APPEARANCE_SCHEMA" \
             "${APPEARANCE_KEYS[$index]}" 2>&1)"; then
             printf '  %-14s %s\n' "${APPEARANCE_KEYS[$index]}:" "$current"
+            APPEARANCE_PREVIOUS[index]="$current"
         else
             printf '  %-14s unavailable (%s)\n' "${APPEARANCE_KEYS[$index]}:" "$current"
         fi
