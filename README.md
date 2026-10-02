@@ -171,8 +171,10 @@ the bundled files, and are never replaced:
 | `~/.config/waybar/local.css`     | Waybar styling |
 | `~/.config/swaync/local.css`     | SwayNC styling |
 
-The installer creates them with commented examples on the first installation and keeps them afterwards. Settings there
-win:
+The installer creates them with commented examples on the first installation and keeps them afterwards. They can add
+settings or rebind existing shortcuts. Sway expands variables while parsing each use: redefining `$mod`, `$term`, or
+another variable in these late overrides does not change bindings already parsed above. Change a binding explicitly,
+and use `unbindsym` first when removing an old shortcut. For example:
 
 ```
 # ~/.config/sway/config.d/10-local.conf
@@ -225,6 +227,10 @@ with the session.
 
 Rapid updates are serialized through Sway publication and readback so an older echo cannot replace newer Windows text.
 A newer Sway selection cancels retries of older text, including when the new selection cannot be shared.
+
+Registry discovery, agent startup, heartbeats, and write acknowledgements have bounded waits. An agent that stops
+replying is restarted within a limited budget; sending data alone does not count as a response. Each old agent is
+reaped before a replacement starts or the broker exits.
 
 Sharing is event driven and normally completes immediately. Nothing is installed on the Windows side, no window appears
 there, and focus is never taken. Sway 1.11 or newer is required. `arch-sway-wslg status` shows whether sharing is
@@ -392,7 +398,10 @@ If WSLg stops responding after sleep, a display change, or an update, the Sway s
 If an X11 application fails, run `echo "$DISPLAY"` in a Foot terminal and inspect `arch-sway-wslg logs`. The X11 path
 can be tested with `GDK_BACKEND=x11 nwg-look`.
 
-If a session is stuck, `arch-sway-wslg stop` always ends it. Never delete `/tmp/.X11-unix`.
+If a session is stuck, `arch-sway-wslg stop` times out unresponsive IPC calls and falls back to stopping its systemd
+scope. If the user manager cannot confirm that the scope has stopped, the command reports failure and preserves the
+session files. Restore access to the user manager and retry; the same protection applies after a failed start.
+Never delete `/tmp/.X11-unix`.
 
 ## Limitations
 

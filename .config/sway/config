@@ -224,5 +224,6 @@ bindsym --locked XF86AudioStop exec playerctl stop
 # Local overrides
 # -----------------------------------------------------------------------------
 # config.d/ is yours: the installer creates it once and never replaces it.
-# These files are read last, so they override everything above.
+# These files can add settings and rebind shortcuts. Redefining a variable here
+# cannot change bindings that already consumed its earlier value.
 include config.d/*.conf

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-# Fault injection for the installer guards; no real bus, packages or user files.
+# Fault injection for installer and launcher guards; no real bus or user files.
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 # CI containers can inherit a mounted HOME owned by the host user. Give the
@@ -120,3 +120,77 @@ LOCAL_BIN_DIR="$TEST_DIR/bin"
 LOCAL_BIN_DIR="$TEST_DIR/missing"
 [[ "$(default_browser_index)" == 1 ]] || fail "first installation does not default to Firefox"
 printf 'Installer browser default: passed\n'
+
+# Source the launcher's functions in isolation; command dispatch only runs when
+# it is executed directly. The fake IPC client models a blocking connect or exit.
+(
+    # shellcheck source=SCRIPTDIR/../.local/bin/arch-sway-wslg
+    source "$(dirname -- "${BASH_SOURCE[0]}")/../.local/bin/arch-sway-wslg"
+    mkdir -p "$TEST_DIR/ipc-bin"
+    cat > "$TEST_DIR/ipc-bin/swaymsg" <<'IPC'
+#!/usr/bin/env bash
+if [[ "$TEST_IPC_MODE" == exit-hangs && "${*: -1}" != exit ]]; then
+    exit 0
+fi
+exec sleep 30
+IPC
+    chmod 755 "$TEST_DIR/ipc-bin/swaymsg"
+    export PATH="$TEST_DIR/ipc-bin:$PATH"
+    export TEST_IPC_MODE=connect-hangs
+    IPC_TIMEOUT=1
+    START_TIMEOUT=1
+    SWAYSOCK_PATH="$TEST_DIR/live-session/ipc"
+    X11_PRIVATE_DIR="$TEST_DIR/live-session/x11"
+    CLIPBOARD_STATE_DIR="$TEST_DIR/live-session/clipboard"
+    NAMESPACE_LAUNCH_PID=""
+    ipc_ready() { sway_ipc "${1:-$IPC_TIMEOUT}" -t get_version >/dev/null 2>&1; }
+    started="$SECONDS"
+    if wait_for_start; then
+        fail "a stalled IPC client was reported ready"
+    else
+        [[ "$?" == 2 ]] || fail "startup did not report its deadline"
+    fi
+    (( SECONDS - started <= 2 )) || fail "IPC bypassed the startup deadline"
+    printf 'Launcher IPC startup deadline: passed\n'
+
+    ensure_dirs() { :; }
+    take_control_lock() { :; }
+    cleanup_stale_state() { :; }
+    session_scope_active() { return 0; }
+    stop_clipboard_service() { :; }
+    systemctl_user() {
+        [[ "$*" == "stop $SESSION_SCOPE" ]] || return 99
+        touch "$TEST_DIR/scope-stopped"
+    }
+    wait_for_scope_gone() { [[ -e "$TEST_DIR/scope-stopped" ]]; }
+    for TEST_IPC_MODE in connect-hangs exit-hangs; do
+        rm -f -- "$TEST_DIR/scope-stopped"
+        stop_session >"$TEST_DIR/output" 2>&1 || fail "IPC prevented scope shutdown"
+        [[ -e "$TEST_DIR/scope-stopped" ]] || fail "scope shutdown fallback was skipped"
+    done
+    printf 'Launcher IPC shutdown fallback: passed\n'
+
+    systemd_user_usable() { return 0; }
+    session_scope_state() { printf 'active\n'; }
+    clipboard_state() { printf 'fixture\n'; }
+    TEST_IPC_MODE=connect-hangs
+    started="$SECONDS"
+    status_session >"$TEST_DIR/output" || fail "status failed for an active scope"
+    (( SECONDS - started <= 2 )) || fail "IPC blocked status indefinitely"
+    printf 'Launcher IPC status deadline: passed\n'
+
+    mkdir -p "$X11_PRIVATE_DIR" "$CLIPBOARD_STATE_DIR"
+    touch "$SWAYSOCK_PATH" "$X11_PRIVATE_DIR/X0" "$CLIPBOARD_STATE_DIR/status"
+    systemctl_user() { return 1; }
+    wait_for_scope_gone() { return 1; }
+    if cleanup_failed_start >"$TEST_DIR/output" 2>&1; then
+        fail "failed cleanup accepted an unconfirmed shutdown"
+    fi
+    [[ -e "$SWAYSOCK_PATH" && -e "$X11_PRIVATE_DIR/X0" && \
+       -e "$CLIPBOARD_STATE_DIR/status" ]] || fail "live session state was deleted"
+    wait_for_scope_gone() { return 0; }
+    cleanup_failed_start || fail "confirmed shutdown was not cleaned"
+    [[ ! -e "$SWAYSOCK_PATH" && ! -e "$X11_PRIVATE_DIR" && \
+       ! -e "$CLIPBOARD_STATE_DIR" ]] || fail "stopped session state was left behind"
+    printf 'Launcher failed-start cleanup guards: passed\n'
+)

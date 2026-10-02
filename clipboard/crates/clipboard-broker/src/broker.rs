@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, LoopHandle, LoopSignal};
 use calloop_wayland_source::WaylandSource;
@@ -24,6 +25,8 @@ pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 // A first start of the unsigned agent can sit in a security scan for a while;
 // counting that against the restart budget would take the clipboard down for good.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(6);
+const WINDOWS_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const PUBLICATION_TIMEOUT: Duration = Duration::from_secs(6);
 const WINDOWS_WRITE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -78,6 +81,11 @@ pub(crate) struct BrokerState {
     agent_restarts: usize,
     restart_scheduled: bool,
     last_agent_response: Instant,
+    // Discount only time the broker itself spent sending, not successful Ping
+    // writes: agent replies cannot be dispatched during a large pipe transfer.
+    agent_send_duration: Duration,
+    pending_ack: Option<Instant>,
+    registry_ready: bool,
     wayland_ready: bool,
     latest_wayland_generation: u64,
     ever_synced: bool,
@@ -281,13 +289,31 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
 
     let connection =
         Connection::connect_to_env().map_err(|error| BrokerError::Wayland(error.to_string()))?;
-    let mut event_queue = connection.new_event_queue::<BrokerState>();
+    run_connected(config, connection, status, REGISTRY_TIMEOUT)
+}
+
+fn run_connected(
+    config: BrokerConfig,
+    connection: Connection,
+    status: StatusWriter,
+    registry_timeout: Duration,
+) -> Result<(), BrokerError> {
+    let event_queue = connection.new_event_queue::<BrokerState>();
     let qh = event_queue.handle();
     connection.display().get_registry(&qh, ());
+    connection.display().sync(&qh, crate::wayland::RegistrySync);
 
     let mut event_loop: EventLoop<'static, BrokerState> =
         EventLoop::try_new().map_err(|error| BrokerError::EventLoop(error.to_string()))?;
     let handle = event_loop.handle();
+    // The service receives SIGTERM on scope shutdown. Route it through the loop
+    // before spawning the agent or transfer threads so every normal shutdown
+    // reaches the same close-stdin, grace, kill and reap path.
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])
+        .map_err(|error| BrokerError::EventLoop(error.to_string()))?;
+    handle
+        .insert_source(signals, |_, _, state: &mut BrokerState| state.stop.stop())
+        .map_err(|error| BrokerError::EventLoop(error.error.to_string()))?;
 
     let mut state = BrokerState {
         mode: config.mode,
@@ -305,6 +331,9 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         agent_restarts: 0,
         restart_scheduled: false,
         last_agent_response: Instant::now(),
+        agent_send_duration: Duration::ZERO,
+        pending_ack: None,
+        registry_ready: false,
         wayland_ready: false,
         latest_wayland_generation: 0,
         ever_synced: false,
@@ -318,20 +347,15 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         stop: event_loop.get_signal(),
     };
 
-    // A compositor without the globals would otherwise leave the broker in
-    // `starting` forever; fail here so systemd and `status` can tell.
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|error| BrokerError::Wayland(error.to_string()))?;
-    if let Some(missing) = state.wayland.missing_global() {
-        return Err(BrokerError::Wayland(format!(
-            "compositor does not provide {missing}"
-        )));
-    }
-
     WaylandSource::new(connection, event_queue)
         .insert(handle.clone())
         .map_err(|error| BrokerError::EventLoop(error.to_string()))?;
+    handle
+        .insert_source(Timer::from_duration(registry_timeout), |_, _, state| {
+            state.registry_timeout();
+            TimeoutAction::Drop
+        })
+        .map_err(|error| BrokerError::EventLoop(error.error.to_string()))?;
     handle
         .insert_source(Timer::from_duration(HEARTBEAT_INTERVAL), |_, _, state| {
             state.heartbeat();
@@ -339,12 +363,11 @@ pub fn run(config: BrokerConfig) -> Result<(), BrokerError> {
         })
         .map_err(|error| BrokerError::EventLoop(error.error.to_string()))?;
 
-    state.start_agent();
     let result = event_loop.run(None, &mut state, |_| {});
     // Reap the agent before the exit status tells systemd the broker is gone,
     // whichever way the loop ended.
     if let Some(agent) = state.agent.take() {
-        agent.shutdown_now(&state.handle);
+        agent.shutdown(&state.handle);
     }
     if let Some(error) = state.fatal.take() {
         return Err(error);
@@ -378,6 +401,25 @@ fn compositor_closed(error: &calloop::Error) -> bool {
 }
 
 impl BrokerState {
+    pub(crate) fn registry_discovered(&mut self) {
+        if let Some(missing) = self.wayland.missing_global() {
+            self.fail(BrokerError::Wayland(format!(
+                "compositor does not provide {missing}"
+            )));
+            return;
+        }
+        self.registry_ready = true;
+        self.start_agent();
+    }
+
+    fn registry_timeout(&mut self) {
+        if !self.registry_ready {
+            self.fail(BrokerError::EventLoop(
+                "Wayland registry discovery timed out".into(),
+            ));
+        }
+    }
+
     pub(crate) fn handle_wayland_event(&mut self, event: WaylandEvent) {
         match event {
             WaylandEvent::SelectionStarted(generation) => {
@@ -487,6 +529,7 @@ impl BrokerState {
         self.restart_scheduled = false;
         self.agent_started = Instant::now();
         self.last_agent_response = Instant::now();
+        self.agent_send_duration = Duration::ZERO;
         match AgentProcess::spawn(
             &self.agent_executable,
             self.mode == ClipboardMode::ToWindows,
@@ -542,6 +585,7 @@ impl BrokerState {
         }
         self.agent_pid = None;
         self.agent_ready = false;
+        self.pending_ack = None;
         self.slots.agent_lost();
         self.mirror.reset_windows_transport();
         if let Some(write) = self.in_flight.take()
@@ -581,13 +625,11 @@ impl BrokerState {
         let Some(agent) = self.agent.as_mut() else {
             return false;
         };
-        match agent.send(frame) {
-            // A large write can keep the loop busy for seconds; the agent read
-            // all of it, so that time is not silence.
-            Ok(()) => {
-                self.last_agent_response = Instant::now();
-                true
-            }
+        let started = Instant::now();
+        let result = agent.send(frame);
+        self.agent_send_duration += started.elapsed();
+        match result {
+            Ok(()) => true,
             Err(error) => {
                 self.lose_agent(format!("Windows clipboard agent write failed: {error}"));
                 false
@@ -609,14 +651,22 @@ impl BrokerState {
         if self.agent.is_none() {
             return;
         }
-        let silence = self.last_agent_response.elapsed();
+        let silence = self
+            .last_agent_response
+            .elapsed()
+            .saturating_sub(self.agent_send_duration);
         if self.agent_ready {
-            if silence >= HEARTBEAT_TIMEOUT {
+            if self
+                .pending_ack
+                .is_some_and(|started| started.elapsed() >= WINDOWS_ACK_TIMEOUT)
+            {
+                self.lose_agent("Windows clipboard agent write acknowledgement timed out".into());
+            } else if silence >= HEARTBEAT_TIMEOUT {
                 self.lose_agent("Windows clipboard agent heartbeat timed out".into());
             } else {
                 self.send_frame(&Frame::new(MessageKind::Ping));
             }
-        } else if silence >= HELLO_TIMEOUT {
+        } else if self.agent_started.elapsed() >= HELLO_TIMEOUT {
             self.lose_agent("Windows clipboard agent did not report its startup state".into());
         }
     }
@@ -624,7 +674,15 @@ impl BrokerState {
     // Agent frames
 
     fn handle_agent_frame(&mut self, frame: Frame) {
+        if matches!(
+            frame.kind,
+            MessageKind::Ping | MessageKind::SetWindowsText | MessageKind::ProtocolError
+        ) {
+            self.lose_agent("Windows clipboard agent sent an unexpected frame".into());
+            return;
+        }
         self.last_agent_response = Instant::now();
+        self.agent_send_duration = Duration::ZERO;
         match frame.kind {
             MessageKind::Hello => self.handle_hello(frame),
             MessageKind::WindowsText | MessageKind::WindowsUnavailable
@@ -652,6 +710,7 @@ impl BrokerState {
                     .mirror
                     .commit_windows_write(frame.request_id, frame.sequence)
                 {
+                    self.pending_ack = None;
                     self.in_flight = None;
                     self.failed_transfer = None;
                     self.slots.windows_write_committed(frame.sequence);
@@ -661,6 +720,7 @@ impl BrokerState {
             }
             MessageKind::SetWindowsError => {
                 if self.mirror.fail_windows_write(frame.request_id) {
+                    self.pending_ack = None;
                     self.windows_write_failed(&String::from_utf8_lossy(&frame.payload));
                     self.drain();
                 }
@@ -790,6 +850,7 @@ impl BrokerState {
             sensitive: text.sensitive,
         };
         if sent {
+            self.pending_ack = Some(Instant::now());
             self.in_flight = Some(WindowsWrite {
                 text,
                 retried,
@@ -1170,6 +1231,9 @@ mod regression_tests {
             agent_restarts: 0,
             restart_scheduled: false,
             last_agent_response: Instant::now(),
+            agent_send_duration: Duration::ZERO,
+            pending_ack: None,
+            registry_ready: true,
             wayland_ready: true,
             latest_wayland_generation: 1,
             ever_synced: true,
@@ -1357,5 +1421,94 @@ mod regression_tests {
         state.publication.as_mut().unwrap().started = Instant::now() - PUBLICATION_TIMEOUT;
         state.heartbeat();
         assert!(matches!(state.fatal, Some(BrokerError::EventLoop(_))));
+    }
+
+    #[test]
+    fn outgoing_pings_do_not_keep_a_silent_agent_healthy() {
+        let (mut state, _event_loop, _server) = state();
+        state.agent = Some(
+            AgentProcess::spawn(PathBuf::from("/bin/cat").as_path(), false, &state.handle).unwrap(),
+        );
+        let last_response = Instant::now() - HEARTBEAT_INTERVAL;
+        state.last_agent_response = last_response;
+        state.heartbeat();
+        let unchanged = state.last_agent_response == last_response;
+        state.last_agent_response = Instant::now() - HEARTBEAT_TIMEOUT - Duration::from_secs(1);
+        state.heartbeat();
+        let restarted = state.agent.is_none() && state.restart_scheduled;
+        if let Some(agent) = state.agent.take() {
+            agent.shutdown(&state.handle);
+        }
+        assert!(unchanged, "sending a Ping was counted as an agent response");
+        assert!(restarted, "a silent agent was not stopped for restart");
+    }
+
+    #[test]
+    fn pong_does_not_extend_a_missing_write_acknowledgement() {
+        for superseded in [false, true] {
+            let (mut state, _event_loop, _server) = state();
+            state.agent = Some(
+                AgentProcess::spawn(PathBuf::from("/bin/cat").as_path(), false, &state.handle)
+                    .unwrap(),
+            );
+            let text = HashedText::new(b"pending".to_vec());
+            state.mirror.begin_windows_write(text.hash);
+            state.in_flight = Some(WindowsWrite {
+                generation: 1,
+                text,
+                retried: false,
+            });
+            state.pending_ack = Some(Instant::now() - WINDOWS_ACK_TIMEOUT);
+            if superseded {
+                state.handle_wayland_event(WaylandEvent::SelectionStarted(2));
+            }
+            state.handle_agent_frame(Frame::new(MessageKind::Pong));
+            state.heartbeat();
+            assert!(state.agent.is_none());
+            assert!(state.restart_scheduled);
+            assert!(state.pending_ack.is_none());
+            assert!(!state.mirror.has_pending_windows_write());
+            assert_eq!(state.slots.to_windows.is_none(), superseded);
+        }
+    }
+
+    #[test]
+    fn missing_globals_fail_as_soon_as_registry_discovery_finishes() {
+        let (mut state, _event_loop, _server) = state();
+        state.registry_ready = false;
+        state.registry_discovered();
+        let error = state.fatal.unwrap();
+        assert!(matches!(error, BrokerError::Wayland(_)));
+        assert_eq!(error.exit_code(), BrokerError::GAVE_UP);
+        assert!(state.agent.is_none());
+    }
+
+    #[test]
+    fn unresponsive_registry_is_bounded_by_the_event_loop_timer() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let runtime_dir =
+            std::env::temp_dir().join(format!("clipboard-registry-timeout-{}", std::process::id()));
+        let status = StatusWriter::new(&runtime_dir, "both").unwrap();
+        let started = Instant::now();
+        let result = run_connected(
+            BrokerConfig {
+                mode: ClipboardMode::Both,
+                sync_sensitive: false,
+                runtime_dir: runtime_dir.clone(),
+                agent: PathBuf::from("/nonexistent-agent"),
+            },
+            connection,
+            status,
+            Duration::from_millis(20),
+        );
+        assert!(matches!(result, Err(BrokerError::EventLoop(_))));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            std::fs::read_to_string(runtime_dir.join("status"))
+                .unwrap()
+                .contains("health=degraded")
+        );
+        std::fs::remove_dir_all(runtime_dir).unwrap();
     }
 }

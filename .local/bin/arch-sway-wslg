@@ -53,6 +53,7 @@ SWAY_CONFIG="$CONFIG_HOME/sway/config"
 BROWSER_FILE="$CONFIG_HOME/$NAME/browser"
 START_TIMEOUT=8
 STOP_TIMEOUT=5
+IPC_TIMEOUT=2
 CONTROL_LOCK_TIMEOUT=60
 # WSL can recreate /run/user/$UID underneath a running distribution, which
 # leaves the bus socket present but unanswered, so every call that talks to the
@@ -198,9 +199,17 @@ take_control_lock() {
         die "another $NAME command has held the control lock for more than ${CONTROL_LOCK_TIMEOUT}s"
 }
 
+# swaymsg bounds receiving a response, but connect can block before that timer
+# exists. Bound the whole command so a full IPC queue cannot defeat shutdown.
+sway_ipc() {
+    local wait_timeout="$1"
+    shift
+    timeout --kill-after=1s "$wait_timeout" swaymsg -s "$SWAYSOCK_PATH" "$@"
+}
+
 ipc_ready() {
     [[ -S "$SWAYSOCK_PATH" ]] || return 1
-    swaymsg -s "$SWAYSOCK_PATH" -t get_version >/dev/null 2>&1
+    sway_ipc "${1:-$IPC_TIMEOUT}" -t get_version >/dev/null 2>&1
 }
 
 check_wslg() {
@@ -499,7 +508,8 @@ run_session() {
 
     cleanup_session() {
         stop_clipboard_service
-        cleanup_session_state
+        # Other scope children can still be alive. The external stop command or
+        # the next start cleans files only after the manager confirms shutdown.
         # Queue cgroup cleanup last. The request also terminates this process,
         # so it must not block the EXIT trap.
         systemctl_user --no-block stop "$SESSION_SCOPE" >/dev/null 2>&1 || true
@@ -520,10 +530,13 @@ run_session() {
 }
 
 wait_for_start() {
-    local deadline=$((SECONDS + START_TIMEOUT)) scope_seen=0 state
+    local deadline=$((SECONDS + START_TIMEOUT)) scope_seen=0 state remaining
 
     while (( SECONDS < deadline )); do
-        ipc_ready && return 0
+        remaining=$((deadline - SECONDS))
+        (( remaining > IPC_TIMEOUT )) && remaining="$IPC_TIMEOUT"
+        ipc_ready "$remaining" && return 0
+        (( SECONDS < deadline )) || break
         # An unknown state is neither progress nor failure; the deadline bounds it.
         state="$(session_scope_state)" || state=unknown
         if [[ "$state" == unknown ]]; then
@@ -545,8 +558,6 @@ cleanup_failed_start() {
     local deadline
     stop_clipboard_service
     systemctl_user stop "$SESSION_SCOPE" >/dev/null 2>&1 || true
-    wait_for_scope_gone "$STOP_TIMEOUT" || \
-        warn "$SESSION_SCOPE has not finished stopping; check '$NAME status' before starting again"
     if [[ "$NAMESPACE_LAUNCH_PID" =~ ^[0-9]+$ ]] && \
        kill -0 "$NAMESPACE_LAUNCH_PID" 2>/dev/null; then
         kill -TERM "$NAMESPACE_LAUNCH_PID" 2>/dev/null || true
@@ -557,6 +568,12 @@ cleanup_failed_start() {
         done
         kill -KILL "$NAMESPACE_LAUNCH_PID" 2>/dev/null || true
         wait "$NAMESPACE_LAUNCH_PID" 2>/dev/null || true
+    fi
+    # Recheck after terminating the handoff: it could have entered the scope
+    # while the stop request was in flight. Unknown state never permits deletion.
+    if ! wait_for_scope_gone "$STOP_TIMEOUT"; then
+        warn "$SESSION_SCOPE is not confirmed stopped; session files were preserved; check '$NAME status' and retry '$NAME stop'"
+        return 1
     fi
     cleanup_session_state
 }
@@ -614,13 +631,13 @@ start_session() {
             report_running_session
             ;;
         1)
-            cleanup_failed_start
+            cleanup_failed_start || true
             printf '\nSway failed to start. Last log lines:\n\n' >&2
             tail -n 40 "$LOG_FILE" >&2 || true
             return 1
             ;;
         2)
-            cleanup_failed_start
+            cleanup_failed_start || true
             warn "Sway IPC did not become ready within ${START_TIMEOUT}s."
             note "Check: $NAME status"
             note "Logs:  $NAME logs"
@@ -645,7 +662,7 @@ stop_session() {
     note "Stopping Sway..."
 
     if ipc_ready; then
-        swaymsg -s "$SWAYSOCK_PATH" exit >/dev/null 2>&1 || true
+        sway_ipc "$IPC_TIMEOUT" exit >/dev/null 2>&1 || true
 
         # Sway leaving IPC is not enough: the scope keeps its name and its
         # remaining processes until it is inactive, and only then may the
@@ -919,24 +936,29 @@ Commands:
 EOF2
 }
 
-(( EUID != 0 )) || die "run this launcher as your normal Arch user, not as root"
+main() {
+    (( EUID != 0 )) || die "run this launcher as your normal Arch user, not as root"
+    local command="${1:-start}"
+    if (( $# )); then
+        shift
+    fi
 
-COMMAND="${1:-start}"
-if (( $# )); then
-    shift
+    case "$command" in
+        start) start_session "$@" ;;
+        stop) stop_session ;;
+        restart) restart_session "$@" ;;
+        status) status_session ;;
+        logs|log) show_logs ;;
+        doctor) doctor ;;
+        __run) run_session ;;
+        __run_from_env) run_from_environment ;;
+        __start_clipboard) start_clipboard_service ;;
+        --version|version) printf '%s %s\n' "$NAME" "$VERSION" ;;
+        -h|--help|help) usage ;;
+        *) usage >&2; return 2 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-case "$COMMAND" in
-    start) start_session "$@" ;;
-    stop) stop_session ;;
-    restart) restart_session "$@" ;;
-    status) status_session ;;
-    logs|log) show_logs ;;
-    doctor) doctor ;;
-    __run) run_session ;;
-    __run_from_env) run_from_environment ;;
-    __start_clipboard) start_clipboard_service ;;
-    --version|version) printf '%s %s\n' "$NAME" "$VERSION" ;;
-    -h|--help|help) usage ;;
-    *) usage >&2; exit 2 ;;
-esac

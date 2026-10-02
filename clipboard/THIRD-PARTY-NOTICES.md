@@ -11,6 +11,7 @@ upstream repository.
 - `rustix` and its dependencies: Apache-2.0 WITH LLVM-exception OR Apache-2.0
   OR MIT, depending on the crate
 - `thiserror`: MIT OR Apache-2.0
+- `nix` and `cfg_aliases` (calloop signal handling): MIT
 - `windows-link` and `windows-sys`: MIT OR Apache-2.0
 
 The package names above identify the dependency groups and their applicable

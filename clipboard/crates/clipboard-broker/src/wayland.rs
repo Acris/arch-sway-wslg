@@ -41,6 +41,10 @@ const MAX_ACTIVE_TRANSFERS: usize = 8;
 // realistic, so the oldest goes then.
 const MAX_RETIRING_SOURCES: usize = 2;
 
+// Keep registry completion separate from publication fences. Both are wl_sync
+// callbacks, but only the first one may start the agent and validate globals.
+pub(crate) struct RegistrySync;
+
 #[derive(Debug)]
 pub enum WaylandEvent {
     SelectionStarted(u64),
@@ -392,6 +396,21 @@ impl Dispatch<wl_callback::WlCallback, ()> for BrokerState {
     ) {
         if let wl_callback::Event::Done { .. } = event {
             broker.handle_wayland_event(WaylandEvent::PublicationSynchronized);
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, RegistrySync> for BrokerState {
+    fn event(
+        broker: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &RegistrySync,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            broker.registry_discovered();
         }
     }
 }

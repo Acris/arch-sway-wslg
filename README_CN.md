@@ -158,7 +158,9 @@ workspace 9 output WL-2
 | `~/.config/waybar/local.css`     | Waybar 样式 |
 | `~/.config/swaync/local.css`     | SwayNC 样式 |
 
-安装程序在首次安装时会创建包含注释示例的文件，并在之后保留。这些文件中的设置优先：
+安装程序在首次安装时会创建包含注释示例的文件，并在之后保留。可以在其中添加设置或重新绑定已有快捷键。Sway 在解析每次使用时
+展开变量：在这些最后加载的覆盖文件中重新定义 `$mod`、`$term` 或其他变量，不会改变前面已经解析的绑定。请明确修改绑定；
+移除旧快捷键时先使用 `unbindsym`。例如：
 
 ```
 # ~/.config/sway/config.d/10-local.conf
@@ -205,6 +207,9 @@ include 机制，属于完全托管，因此请将个人版本存放在托管目
 - 换行符会被转换：送往 Windows 的文本使用 CRLF，送往 Sway 的文本使用 LF，单独的 CR 在传输中会变成换行。
 
 连续更新会依次完成向 Sway 发布和回读，避免旧回声覆盖较新的 Windows 文本。新的 Sway 选区会取消旧文本的重试，即使新选区无法共享。
+
+注册表发现、agent 启动、心跳和写入确认均有等待期限。agent 停止回复后会在有限的重启次数内重新启动；仅发送数据成功不算收到响应。
+每个旧 agent 都会在启动替代进程或 broker 退出前被回收。
 
 共享由事件驱动，通常会立即完成。Windows 侧不会安装任何东西，不会出现窗口，也不会抢占焦点。需要 Sway 1.11 或更高版本。执行
 `arch-sway-wslg status` 可查看共享是否正常工作。
@@ -355,7 +360,8 @@ WSLg 恢复健康后再次启动会话。
 如果 X11 应用失败，请在 Foot 终端中运行 `echo "$DISPLAY"` 并检查 `arch-sway-wslg logs`。可以使用
 `GDK_BACKEND=x11 nwg-look` 测试 X11 通路。
 
-如果会话卡住，`arch-sway-wslg stop` 总能结束它。切勿删除 `/tmp/.X11-unix`。
+如果会话卡住，`arch-sway-wslg stop` 会让无响应的 IPC 调用超时，并改为停止 systemd scope。如果用户管理器无法确认 scope 已停止，
+命令会报告失败并保留会话文件。请恢复用户管理器连接后重试；启动失败后的清理也采用同样的保护。切勿删除 `/tmp/.X11-unix`。
 
 ## 限制
 

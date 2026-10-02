@@ -60,21 +60,27 @@ impl AgentProcess {
         // Both pipes are driven from the event loop: the level-triggered source
         // reads one chunk per wakeup and must never block on a pipe that only
         // looked readable, and writes are bounded by `write_with_deadline`.
-        set_nonblocking(&output)?;
-        set_nonblocking(&input)?;
-        let token = handle
-            .insert_source(
-                Generic::new(output, Interest::READ, Mode::Level),
-                |_, output, state: &mut BrokerState| {
-                    state.read_agent_output(output);
-                    Ok(PostAction::Continue)
-                },
-            )
-            .map_err(|error| {
-                let _ = child.kill();
-                let _ = child.wait();
-                io::Error::other(error.to_string())
-            })?;
+        let registration = (|| {
+            set_nonblocking(&output)?;
+            set_nonblocking(&input)?;
+            handle
+                .insert_source(
+                    Generic::new(output, Interest::READ, Mode::Level),
+                    |_, output, state: &mut BrokerState| {
+                        state.read_agent_output(output);
+                        Ok(PostAction::Continue)
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))
+        })();
+        let token = match registration {
+            Ok(token) => token,
+            Err(error) => {
+                // Even a pipe setup failure owns a running child already.
+                reap(child, input);
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             input,
@@ -102,16 +108,10 @@ impl AgentProcess {
         write_with_deadline(&mut self.input, &encoded, timeout)
     }
 
-    /// Closes the agent's pipe, which is its shutdown signal, and reaps it off the
-    /// event loop so a replacement can start right away.
+    /// Closes stdin first, waits a bounded grace period, then kills and reaps.
+    /// Finish before replacement or broker exit: a detached reaper can disappear
+    /// with the broker, leaving its Windows child behind.
     pub fn shutdown(self, handle: &LoopHandle<'static, BrokerState>) {
-        handle.remove(self.token);
-        let (child, input) = (self.child, self.input);
-        thread::spawn(move || reap(child, input));
-    }
-
-    /// The same shutdown, waited for: used once the event loop has ended.
-    pub fn shutdown_now(self, handle: &LoopHandle<'static, BrokerState>) {
         handle.remove(self.token);
         reap(self.child, self.input);
     }
@@ -149,5 +149,21 @@ mod tests {
         let largest = write_timeout(MAX_TEXT_BYTES + 64);
         assert!(largest > write_timeout(MAX_TEXT_BYTES / 2));
         assert!(largest < HEARTBEAT_TIMEOUT);
+    }
+
+    #[test]
+    fn shutdown_reaps_an_agent_that_ignores_closed_stdin() {
+        let executable =
+            std::env::temp_dir().join(format!("clipboard-stalled-agent-{}", std::process::id()));
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let event_loop = calloop::EventLoop::<BrokerState>::try_new().unwrap();
+        let handle = event_loop.handle();
+        let agent = AgentProcess::spawn(&executable, false, &handle).unwrap();
+        let pid = agent.child.id();
+        agent.shutdown(&handle);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_file(executable).unwrap();
     }
 }
